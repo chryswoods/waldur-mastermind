@@ -1,5 +1,5 @@
-import logging
 import datetime
+import logging
 from datetime import timedelta
 
 from celery import shared_task

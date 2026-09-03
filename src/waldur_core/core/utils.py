@@ -585,6 +585,12 @@ def format_homeport_link(format_str="", **kwargs):
     return link.format(**kwargs)
 
 
+# Usernames of special accounts acting on behalf of the system rather than
+# a real person. Their email is SITE_EMAIL, so user-facing notifications
+# addressed to them must be skipped.
+ROBOT_USERNAMES = ("system_robot", "openportal_robot")
+
+
 def is_robot_user(user) -> bool:
     return user.username in ROBOT_USERNAMES
 
@@ -594,21 +600,17 @@ def get_system_robot():
 
     # make sure that system_robot is always active and staff
     robot_user, created = models.User.all_objects.get_or_create(
-        username="system_robot",
-        defaults={
-            "is_staff": True,
-            "is_active": True,
-            "description": (
-                "Special user used for performing actions on behalf of a system."
-            ),
-            "first_name": "System",
-            "last_name": "Robot",
-        },
+        username="system_robot", defaults={"is_staff": True, "is_active": True}
     )
 
     if created:
         robot_user.set_unusable_password()
-        robot_user.save(update_fields=["password"])
+        robot_user.description = (
+            "Special user used for performing actions on behalf of a system."
+        )
+        robot_user.first_name = "System"
+        robot_user.last_name = "Robot"
+        robot_user.save()
     return robot_user
 
 

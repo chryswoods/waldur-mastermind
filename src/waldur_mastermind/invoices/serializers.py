@@ -1535,7 +1535,9 @@ def _optimize_customer_serializer_eager_load_for_credit(sender):
         # Store the billing-optimized method
         billing_optimized_method = sender.eager_load
         # Get the truly original method that was stored by the billing optimization
-        true_original = getattr(billing_optimized_method, "_original_eager_load", billing_optimized_method)
+        true_original = getattr(
+            billing_optimized_method, "_original_eager_load", billing_optimized_method
+        )
 
         def combined_eager_load(queryset, request=None):
             # Call the TRUE original method once
@@ -1588,19 +1590,6 @@ def _optimize_customer_serializer_eager_load_for_credit(sender):
 
     # Replace the eager_load method
     sender.eager_load = staticmethod(optimized_eager_load)
-
-
-def get_customer_unallocated_credit(serializer, customer) -> float | None:
-    # Use prefetched data if available to avoid N+1 queries for customer credit
-    if (
-        hasattr(customer, "_prefetched_objects_cache")
-        and "customercredit" in customer._prefetched_objects_cache
-    ):
-        # For OneToOneField, Django stores the related object directly, not as a list
-        credit = customer._prefetched_objects_cache.get("customercredit")
-        if not credit:
-            return None
-        customer_credit = credit.value
 
 
 def get_has_affiliate_links(serializer, customer) -> bool:

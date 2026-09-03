@@ -20,9 +20,9 @@ from waldur_core.core.utils import is_uuid_like
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
 from waldur_core.structure import filters as structure_filters
+from waldur_core.structure import managers as structure_managers
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
-from waldur_core.structure import managers as structure_managers
 from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_core.structure.permissions import IsStaffOrSupportUser
 from waldur_mastermind.common.utils import quantize_price
@@ -1271,9 +1271,7 @@ class ProjectCreditViewSet(core_views.ActionsViewSet):
             request.query_params, request=request
         )
         if not credit_filter.is_valid():
-            return Response(
-                credit_filter.errors, status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response(credit_filter.errors, status=status.HTTP_400_BAD_REQUEST)
         queryset = credit_filter.filter_queryset(queryset)
 
         page = self.paginate_queryset(queryset)
@@ -1283,6 +1281,7 @@ class ProjectCreditViewSet(core_views.ActionsViewSet):
 
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
+
 
 class CustomerAffiliateViewSet(core_views.ActionsViewSet):
     """Affiliate links are configured by staff only. Affiliate organization

@@ -1,6 +1,6 @@
 from waldur_core.core import views as core_views
 from waldur_core.structure import views
-from django.urls import path
+
 
 def register_in(router):
     router.register(
@@ -79,5 +79,6 @@ def register_in(router):
         views.ExternalLinkViewSet,
         basename="external-links",
     )
+
 
 urlpatterns = []
