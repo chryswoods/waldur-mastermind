@@ -124,8 +124,9 @@ in `tasks.py`, and the proposal-round recipient targeting in `utils.py` and
 
 This also drops three generic broadcast conveniences that came in on the same
 serializer and have no upstream equivalent: `send_to_me`,
-`additional_recipients` and `excluded_recipients`. They are worth re-adding
-deliberately if the homeport broadcast composer uses them.
+`additional_recipients` and `excluded_recipients`. Confirmed with the fork
+owner that the homeport broadcast composer does not use them, so they are gone
+for good rather than pending a decision.
 
 ### 4.4 Obsolete Dockerfile hack
 
@@ -273,7 +274,10 @@ route than the reconciled one.
    table.
 6. Write and rehearse the reconciliation script against a production dump.
 7. Run and extend the test suite.
-8. Resync waldur-homeport, driven by the removed-endpoint inventory.
+8. Resync waldur-homeport, per `homeport-resync-plan.md`. The removed-endpoint
+   inventory that step depended on is done and recorded there: every dropped
+   endpoint homeport calls sits inside `src/proposals`, which is replaced
+   wholesale, so nothing outside it needs reworking.
 
 ## 8. Testing
 
