@@ -12,3 +12,7 @@ DATABASES = {
         "PASSWORD": "postgres",
     },
 }
+
+# Building this test database takes ~15 minutes (700-odd migrations), so pass
+# --reuse-db to keep it between runs; --create-db without it drops the database
+# at teardown and the next run pays the full cost again.
