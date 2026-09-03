@@ -65,6 +65,20 @@ class OverrideConstanceSettingsTest(TestCase):
         for key, value in settings.items():
             self.assertIn(f"{key} has been set to {value}", output.getvalue())
 
+    def test_basic_support_backend_is_a_valid_choice(self):
+        """
+        Test that the basic support backend passes choice validation.
+        """
+        settings = {"WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE": "basic"}
+        settings_file = self.create_settings_file(settings)
+
+        output = StringIO()
+        call_command("override_constance_settings", settings_file, stdout=output)
+        self.assertIn(
+            "WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE has been set to basic",
+            output.getvalue(),
+        )
+
     def test_password_and_token_redaction(self):
         """
         Test that the command redacts passwords and tokens.
@@ -101,13 +115,13 @@ class OverrideConstanceSettingsTest(TestCase):
         Test that the command returns an error when the logo file does not exist.
         """
         # Set invalid logo file
-        settings = {"SITE_LOGO": "/not/a/valid/path/to/logo.png"}
+        settings = {"SIDEBAR_LOGO": "/not/a/valid/path/to/logo.png"}
         settings_file = self.create_settings_file(settings)
 
         output = StringIO()
         call_command("override_constance_settings", settings_file, stdout=output)
 
-        self.assertIn("SITE_LOGO file does not exist", output.getvalue())
+        self.assertIn("SIDEBAR_LOGO file does not exist", output.getvalue())
 
     def test_dict_field_validation_success(self):
         """

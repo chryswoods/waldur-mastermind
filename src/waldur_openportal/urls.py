@@ -3,16 +3,16 @@ from django.urls import re_path
 from . import views
 from .api import (
     access_for_email,
-    project_email_policy,
-    project_spend_info,
     customer_spend_info,
     fetch_job,
     fetch_notification,
-    whoami,
     get_api_token,
     offering_mapping,
+    project_email_policy,
     project_mapping,
+    project_spend_info,
     user_mapping,
+    whoami,
 )
 
 
@@ -163,7 +163,9 @@ urlpatterns = [
     # Custom routes for ManagedProject with composite lookup
     re_path(
         r"^api/openportal-managed-projects/(?P<identifier>[\w.-]+)/(?P<destination>[\w.-]+)/$",
-        views.ManagedProjectViewSet.as_view({"get": "retrieve_custom", "head": "retrieve_custom"}),
+        views.ManagedProjectViewSet.as_view(
+            {"get": "retrieve_custom", "head": "retrieve_custom"}
+        ),
         name="openportal-managed-project-detail",
     ),
     re_path(

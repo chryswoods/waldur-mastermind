@@ -2,9 +2,13 @@ from unittest import mock
 
 from ddt import data, ddt
 from django.core.exceptions import ObjectDoesNotExist
+from rest_framework import serializers as rf_serializers
 from rest_framework import status, test
+from rest_framework.request import Request
 
 from waldur_core.core.enums import CoreStates
+from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import utils as marketplace_utils
@@ -26,6 +30,7 @@ from waldur_mastermind.marketplace.utils import (
 from waldur_mastermind.marketplace_openstack.processors import InstanceDeleteProcessor
 from waldur_mastermind.marketplace_openstack.tests.utils import BaseOpenStackTest
 from waldur_openstack import models as openstack_models
+from waldur_openstack.exceptions import OpenStackBackendError
 from waldur_openstack.tests import factories as openstack_factories
 from waldur_openstack.tests import (
     fixtures as openstack_fixtures,
@@ -41,7 +46,7 @@ from .. import (
 )
 
 
-class TenantGetTest(test.APITransactionTestCase):
+class TenantGetTest(test.APITestCase):
     def setUp(self):
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.offering = marketplace_factories.OfferingFactory(
@@ -82,6 +87,11 @@ class TenantCreateTest(BaseOpenStackTest):
         )
         self.plan = marketplace_factories.PlanFactory(offering=self.offering)
         create_offering_components(self.offering)
+
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.ADMIN.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.MANAGER.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.MEMBER.add_permission(PermissionEnum.CREATE_ORDER)
 
     @data("staff", "owner", "manager", "admin")
     def test_order_is_created(self, user):
@@ -319,7 +329,7 @@ class TenantCreateTest(BaseOpenStackTest):
         self.assertEqual(tenant.get_quota_limit("gigabytes_ssd"), -1)
 
 
-class TenantMutateTest(test.APITransactionTestCase):
+class TenantMutateTest(test.APITestCase):
     def setUp(self):
         super().setUp()
         self.fixture = openstack_fixtures.OpenStackFixture()
@@ -371,11 +381,66 @@ class TenantDeleteTest(TenantMutateTest):
         self.tenant.refresh_from_db()
 
 
-class InstanceCreateTest(test.APITransactionTestCase):
+class InstanceCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.tenant = self.fixture.tenant
         self.service_settings = self.fixture.tenant.service_settings
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.ADMIN.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.MANAGER.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.MEMBER.add_permission(PermissionEnum.CREATE_ORDER)
+
+    def test_instance_order_via_api_does_not_require_plan(self):
+        """
+        Test that private offerings (like OpenStack instances) can be created without a plan.
+        Private offerings (shared=False) are typically auto-created and inherit plans from parent resources.
+        """
+        tenant_offering = marketplace_factories.OfferingFactory(
+            type=OPENSTACK_TENANT_OFFERING,
+            scope=self.service_settings,
+            state=OfferingStates.ACTIVE,
+            customer=self.fixture.customer,
+        )
+
+        # Create private instance offering (shared=False, no plan required)
+        instance_offering = marketplace_factories.OfferingFactory(
+            type=OPENSTACK_INSTANCE_OFFERING,
+            scope=self.tenant,
+            parent=tenant_offering,
+            state=OfferingStates.ACTIVE,
+            shared=False,
+            customer=self.fixture.customer,
+            project=self.fixture.project,
+        )
+
+        subnet_url = openstack_factories.SubNetFactory.get_url(self.fixture.subnet)
+        attributes = {
+            "flavor": openstack_factories.FlavorFactory.get_url(self.fixture.flavor),
+            "image": openstack_factories.ImageFactory.get_url(self.fixture.image),
+            "name": "virtual-machine",
+            "system_volume_size": self.fixture.image.min_disk,
+            "ports": [{"subnet": subnet_url}],
+            "ssh_public_key": structure_factories.SshPublicKeyFactory.get_url(
+                structure_factories.SshPublicKeyFactory(user=self.fixture.manager)
+            ),
+        }
+
+        # Create order WITHOUT plan - should succeed for private offerings
+        self.client.force_authenticate(self.fixture.owner)
+        url = marketplace_factories.OrderFactory.get_list_url()
+        payload = {
+            "project": structure_factories.ProjectFactory.get_url(self.fixture.project),
+            "offering": marketplace_factories.OfferingFactory.get_public_url(
+                instance_offering
+            ),
+            "attributes": attributes,
+        }
+        response = self.client.post(url, payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        order = marketplace_models.Order.objects.get(uuid=response.data["uuid"])
+        self.assertIsNone(order.plan)
 
     def test_instance_is_created_when_order_is_processed(self):
         order = self.trigger_instance_creation()
@@ -393,6 +458,15 @@ class InstanceCreateTest(test.APITransactionTestCase):
         )
         order = self.trigger_instance_creation(availability_zone=az_url)
         self.assertEqual(order.resource.scope.availability_zone, availability_zone)
+
+    def test_metadata_is_passed_to_plugin(self):
+        order = self.trigger_instance_creation(metadata={"env": "prod"})
+        self.assertEqual(order.state, OrderStates.EXECUTING, order.error_message)
+        self.assertEqual(order.resource.scope.metadata, {"env": "prod"})
+
+    def test_invalid_metadata_erreds_the_order(self):
+        order = self.trigger_instance_creation(metadata={"env": 1})
+        self.assertEqual(order.state, OrderStates.ERRED)
 
     def test_request_payload_is_validated(self):
         order = self.trigger_instance_creation(system_volume_size=100)
@@ -496,6 +570,98 @@ class InstanceCreateTest(test.APITransactionTestCase):
 
         order.refresh_from_db()
         return order
+
+
+class InstancePreFlightCheckTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = openstack_fixtures.OpenStackFixture()
+        self.tenant = self.fixture.tenant
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_ORDER)
+
+    def _build_order(self, pre_flight_check_enabled=True):
+        subnet_url = openstack_factories.SubNetFactory.get_url(self.fixture.subnet)
+        attributes = {
+            "flavor": openstack_factories.FlavorFactory.get_url(self.fixture.flavor),
+            "image": openstack_factories.ImageFactory.get_url(self.fixture.image),
+            "name": "virtual-machine",
+            "system_volume_size": self.fixture.image.min_disk,
+            "ports": [{"subnet": subnet_url}],
+            "ssh_public_key": structure_factories.SshPublicKeyFactory.get_url(
+                structure_factories.SshPublicKeyFactory(user=self.fixture.manager)
+            ),
+        }
+        plugin_options = (
+            {"pre_flight_check_enabled": True} if pre_flight_check_enabled else {}
+        )
+        offering = marketplace_factories.OfferingFactory(
+            type=OPENSTACK_INSTANCE_OFFERING,
+            scope=self.tenant,
+            plugin_options=plugin_options,
+        )
+        marketplace_factories.OfferingFactory(
+            type=OPENSTACK_VOLUME_OFFERING, scope=self.tenant
+        )
+        order = marketplace_factories.OrderFactory(
+            offering=offering,
+            attributes=attributes,
+            project=self.fixture.project,
+            state=OrderStates.EXECUTING,
+        )
+        url = marketplace_factories.OrderFactory.get_url(order)
+        request = Request(test.APIRequestFactory().post(url))
+        request.user = self.fixture.owner
+        return order, request
+
+    @mock.patch("waldur_mastermind.marketplace_openstack.processors.OpenStackBackend")
+    def test_order_is_rejected_when_no_candidates(self, mock_backend):
+        mock_backend.return_value.get_allocation_candidates.return_value = {
+            "allocation_requests": [],
+            "provider_summaries": {},
+        }
+        order, request = self._build_order()
+
+        with self.assertRaises(rf_serializers.ValidationError):
+            validate_order(order, request)
+
+        mock_backend.return_value.get_allocation_candidates.assert_called_once_with(
+            resources={"VCPU": 2, "MEMORY_MB": 2048}
+        )
+
+    @mock.patch("waldur_mastermind.marketplace_openstack.processors.OpenStackBackend")
+    def test_order_proceeds_when_candidates_exist(self, mock_backend):
+        mock_backend.return_value.get_allocation_candidates.return_value = {
+            "allocation_requests": [{"allocations": {}}],
+            "provider_summaries": {},
+        }
+        order, request = self._build_order()
+
+        validate_order(order, request)
+
+        mock_backend.return_value.get_allocation_candidates.assert_called_once()
+
+    @mock.patch("waldur_mastermind.marketplace_openstack.processors.OpenStackBackend")
+    def test_order_proceeds_when_placement_unavailable(self, mock_backend):
+        mock_backend.return_value.get_allocation_candidates.side_effect = (
+            OpenStackBackendError("Placement endpoint not found")
+        )
+        order, request = self._build_order()
+
+        with self.assertLogs(
+            "waldur_mastermind.marketplace_openstack.processors", level="WARNING"
+        ) as logs:
+            validate_order(order, request)
+
+        self.assertTrue(
+            any("Placement is unavailable" in message for message in logs.output)
+        )
+
+    @mock.patch("waldur_mastermind.marketplace_openstack.processors.OpenStackBackend")
+    def test_check_is_skipped_when_option_disabled(self, mock_backend):
+        order, request = self._build_order(pre_flight_check_enabled=False)
+
+        validate_order(order, request)
+
+        mock_backend.return_value.get_allocation_candidates.assert_not_called()
 
 
 class InstanceDeleteTest(test.APITransactionTestCase):
@@ -637,10 +803,10 @@ class InstanceDeleteTest(test.APITransactionTestCase):
                 }
             },
         )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertTrue(
-            b"Pending order for resource already exists." in response.rendered_content
-        )
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn(b"OK", response.rendered_content)
+        self.assertIn(b"Erred", response.rendered_content)
+        self.assertIn(b"pending consumer approval", response.rendered_content)
 
     def trigger_deletion(self):
         InstanceDeleteProcessor(self.order).process_order(self.fixture.staff)
@@ -673,7 +839,7 @@ class InstanceDeleteTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
 
 
-class VolumeCreateTest(test.APITransactionTestCase):
+class VolumeCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.service_settings = self.fixture.tenant.service_settings
@@ -780,7 +946,7 @@ class VolumeDeleteTest(test.APITransactionTestCase):
         self.volume.refresh_from_db()
 
 
-class TenantUpdateLimitTestBase(test.APITransactionTestCase):
+class TenantUpdateLimitTestBase(test.APITestCase):
     def setUp(self):
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.offering = marketplace_factories.OfferingFactory(

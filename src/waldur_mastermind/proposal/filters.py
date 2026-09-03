@@ -19,9 +19,12 @@ class CallResourceTemplateFilter(django_filters.FilterSet):
         field_name="call__uuid",
         label="Call",
     )
-    call_uuid = django_filters.UUIDFilter(field_name="call__uuid")
-    requested_offering_uuid = django_filters.UUIDFilter(
-        field_name="requested_offering__uuid"
+    call_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-public-call-detail", field_name="call__uuid"
+    )
+    requested_offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="requested_offering__uuid",
     )
     name = django_filters.CharFilter(lookup_expr="icontains")
     is_required = django_filters.BooleanFilter()
@@ -36,7 +39,9 @@ class CallManagingOrganisationFilter(django_filters.FilterSet):
     customer = core_filters.URLFilter(
         view_name="customer-detail", field_name="customer__uuid"
     )
-    customer_uuid = django_filters.UUIDFilter(field_name="customer__uuid")
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", field_name="customer__uuid"
+    )
     customer_keyword = django_filters.CharFilter(method="filter_customer_keyword")
     o = django_filters.OrderingFilter(fields=(("customer__name", "customer_name"),))
 
@@ -53,12 +58,24 @@ class CallManagingOrganisationFilter(django_filters.FilterSet):
 
 
 class CallFilter(django_filters.FilterSet):
+    slug = django_filters.CharFilter(
+        field_name="slug", lookup_expr="exact", label="Slug"
+    )
     customer = core_filters.URLFilter(
         view_name="customer-detail", field_name="manager__customer__uuid"
     )
-    customer_uuid = django_filters.UUIDFilter(field_name="manager__customer__uuid")
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", field_name="manager__customer__uuid"
+    )
     customer_keyword = django_filters.CharFilter(method="filter_customer_keyword")
-    offering_uuid = django_filters.UUIDFilter(method="filter_offering_uuid")
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail", method="filter_offering_uuid"
+    )
+    open_for_offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        method="filter_open_for_offering_uuid",
+        label="Calls the offering can be requested through right now",
+    )
     state = django_filters.MultipleChoiceFilter(choices=CallStates.CHOICES)
     o = django_filters.OrderingFilter(
         fields=("manager__customer__name", "created", "name")
@@ -67,8 +84,8 @@ class CallFilter(django_filters.FilterSet):
         widget=BooleanWidget, method="filter_has_active_round"
     )
     name = django_filters.CharFilter(lookup_expr="icontains")
-    offerings_provider_uuid = django_filters.UUIDFilter(
-        field_name="offerings__customer__uuid"
+    offerings_provider_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", field_name="offerings__customer__uuid"
     )
 
     class Meta:
@@ -90,14 +107,41 @@ class CallFilter(django_filters.FilterSet):
     def filter_offering_uuid(self, queryset, name, value):
         return queryset.filter(offerings__uuid=value).distinct()
 
+    def filter_open_for_offering_uuid(self, queryset, name, value):
+        """Calls a proposal for this offering can be submitted to right now.
+
+        Narrower than ``offering_uuid``, which matches every call the offering was
+        ever added to. Shares the predicate behind ``open_for_proposals``.
+        """
+        return queryset.filter(
+            id__in=models.RequestedOffering.objects.call_ids_open_for_offering(value)
+        )
+
 
 class ProposalFilter(django_filters.FilterSet):
-    round = django_filters.UUIDFilter(field_name="round__uuid")
+    slug = django_filters.CharFilter(
+        field_name="slug", lookup_expr="exact", label="Slug"
+    )
+    round = core_filters.RelatedUUIDFilter(
+        view_name="call-round-detail", field_name="round__uuid"
+    )
+    round_uuid = core_filters.RelatedUUIDFilter(
+        view_name="call-round-detail", field_name="round__uuid"
+    )
     state = django_filters.MultipleChoiceFilter(choices=ProposalStates.CHOICES)
     name = django_filters.CharFilter(lookup_expr="icontains")
-    call_uuid = django_filters.UUIDFilter(field_name="round__call__uuid")
-    organization_uuid = django_filters.UUIDFilter(
-        field_name="round__call__manager__customer__uuid"
+    call_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-public-call-detail", field_name="round__call__uuid"
+    )
+    organization_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", field_name="round__call__manager__customer__uuid"
+    )
+    created_by_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="created_by__uuid"
+    )
+    my_proposals = django_filters.BooleanFilter(
+        method="filter_my_proposals",
+        widget=BooleanWidget,
     )
     project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
     o = django_filters.OrderingFilter(
@@ -112,6 +156,15 @@ class ProposalFilter(django_filters.FilterSet):
         )
     )
 
+    def filter_my_proposals(self, queryset, name, value):
+        """Filter to show only proposals created by the current user."""
+        if not value:
+            return queryset
+        user = self.request.user
+        if not user or not user.is_authenticated:
+            return queryset.none()
+        return queryset.filter(created_by=user)
+
     class Meta:
         model = models.Proposal
         fields = []
@@ -121,16 +174,27 @@ class ReviewFilter(django_filters.FilterSet):
     proposal = core_filters.URLFilter(
         view_name="proposal-proposal-detail", field_name="proposal__uuid"
     )
-    proposal_uuid = django_filters.UUIDFilter(field_name="proposal__uuid")
+    proposal_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-proposal-detail", field_name="proposal__uuid"
+    )
     proposal_name = django_filters.CharFilter(
         field_name="proposal__name", lookup_expr="icontains"
     )
-    organization_uuid = django_filters.UUIDFilter(
-        field_name="proposal__round__call__manager__customer__uuid"
+    organization_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="proposal__round__call__manager__customer__uuid",
     )
     o = django_filters.OrderingFilter(fields=("created", "state"))
-    call_uuid = django_filters.UUIDFilter(field_name="proposal__round__call__uuid")
-    reviewer_uuid = django_filters.UUIDFilter(field_name="reviewer__uuid")
+    call_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-public-call-detail",
+        field_name="proposal__round__call__uuid",
+    )
+    round_uuid = core_filters.RelatedUUIDFilter(
+        view_name="call-round-detail", field_name="proposal__round__uuid"
+    )
+    reviewer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="reviewer-profile-detail", field_name="reviewer__uuid"
+    )
     state = django_filters.MultipleChoiceFilter(choices=models.Review.States.CHOICES)
 
     class Meta:
@@ -144,19 +208,25 @@ class RequestedOfferingFilter(django_filters.FilterSet):
         field_name="offering__uuid",
         label="Offering",
     )
-    offering_uuid = django_filters.UUIDFilter(field_name="offering__uuid")
-    provider_uuid = django_filters.UUIDFilter(
-        field_name="offering__customer__uuid", label="Provider"
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail", field_name="offering__uuid"
     )
-    organization_uuid = django_filters.UUIDFilter(
-        field_name="call__manager__customer__uuid"
+    provider_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="offering__customer__uuid",
+        label="Provider",
+    )
+    organization_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", field_name="call__manager__customer__uuid"
     )
     call = core_filters.URLFilter(
         view_name="proposal-public-call-detail",
         field_name="call__uuid",
         label="Call",
     )
-    call_uuid = django_filters.UUIDFilter(field_name="call__uuid")
+    call_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-public-call-detail", field_name="call__uuid"
+    )
     o = django_filters.OrderingFilter(
         fields=("created", "state", "offering__name", "call__name")
     )
@@ -168,41 +238,379 @@ class RequestedOfferingFilter(django_filters.FilterSet):
 
 
 class RequestedResourceFilter(django_filters.FilterSet):
+    # RequestedResource reaches the offering through RequestedOffering; it has no
+    # offering FK of its own, so the shorter path raises FieldError at query time.
     offering = core_filters.URLFilter(
         view_name="marketplace-provider-offering-detail",
-        field_name="offering__uuid",
+        field_name="requested_offering__offering__uuid",
         label="Offering",
     )
-    offering_uuid = django_filters.UUIDFilter(field_name="offering__uuid")
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="requested_offering__offering__uuid",
+    )
     resource = core_filters.URLFilter(
         view_name="marketplace-resource-detail",
         field_name="resource__uuid",
         label="Resource",
     )
-    resource_uuid = django_filters.UUIDFilter(field_name="resource__uuid")
+    resource_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-resource-detail", field_name="resource__uuid"
+    )
     proposal = core_filters.URLFilter(
         view_name="proposal-proposal-detail",
         field_name="proposal__uuid",
         label="Proposal",
     )
-    proposal_uuid = django_filters.UUIDFilter(field_name="proposal__uuid")
+    proposal_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-proposal-detail", field_name="proposal__uuid"
+    )
+    proposal_state = django_filters.MultipleChoiceFilter(
+        field_name="proposal__state",
+        choices=ProposalStates.CHOICES,
+        label="Proposal state",
+    )
+    query = django_filters.CharFilter(
+        method="filter_query",
+        label="Search by offering, proposal, call or resource name",
+    )
     o = django_filters.OrderingFilter(
         fields=(
-            "created",
-            "offering__name",
-            "resource__name",
-            "proposal__name",
+            ("created", "created"),
+            ("requested_offering__offering__name", "offering__name"),
+            ("resource__name", "resource__name"),
+            ("resource__state", "resource__state"),
+            ("proposal__name", "proposal__name"),
+            ("proposal__state", "proposal__state"),
+            ("proposal__round__call__name", "call__name"),
         )
     )
+
+    def filter_query(self, queryset, name, value):
+        # The four names a row actually shows, so the box matches what is read.
+        return queryset.filter(
+            Q(requested_offering__offering__name__icontains=value)
+            | Q(proposal__name__icontains=value)
+            | Q(proposal__round__call__name__icontains=value)
+            | Q(resource__name__icontains=value)
+        )
 
     class Meta:
         model = models.RequestedResource
         fields = ["created"]
 
 
+class CallWorkflowStepNotificationRuleFilter(django_filters.FilterSet):
+    call_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-public-call-detail",
+        field_name="workflow_step__call__uuid",
+    )
+    workflow_step_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-call-workflow_step-detail",
+        field_name="workflow_step__uuid",
+    )
+    step = django_filters.CharFilter(field_name="workflow_step__step")
+    trigger = django_filters.CharFilter()
+    is_enabled = django_filters.BooleanFilter()
+
+    class Meta:
+        model = models.CallWorkflowStepNotificationRule
+        fields = []
+
+
 class ProposalProjectRoleMappingFilter(django_filters.FilterSet):
-    call_uuid = django_filters.UUIDFilter(field_name="call__uuid")
+    call_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-public-call-detail", field_name="call__uuid"
+    )
 
     class Meta:
         model = models.ProposalProjectRoleMapping
+        fields = []
+
+
+# =============================================================================
+# Reviewer Profile Filters
+# =============================================================================
+
+
+class ExpertiseCategoryFilter(django_filters.FilterSet):
+    name = django_filters.CharFilter(lookup_expr="icontains")
+    code = django_filters.CharFilter(lookup_expr="icontains")
+    parent_uuid = core_filters.RelatedUUIDFilter(
+        view_name="expertise-category-detail", field_name="parent__uuid"
+    )
+    level = django_filters.NumberFilter()
+    o = django_filters.OrderingFilter(fields=("code", "name", "level"))
+
+    class Meta:
+        model = models.ExpertiseCategory
+        fields = []
+
+
+class ReviewerProfileFilter(django_filters.FilterSet):
+    user_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="user__uuid"
+    )
+    orcid_id = django_filters.CharFilter(lookup_expr="iexact")
+    user_email = django_filters.CharFilter(
+        field_name="user__email", lookup_expr="icontains"
+    )
+    user_name = django_filters.CharFilter(method="filter_user_name")
+    has_orcid = django_filters.BooleanFilter(
+        method="filter_has_orcid", widget=BooleanWidget
+    )
+    expertise_keyword = django_filters.CharFilter(
+        field_name="expertise_set__expertise_keyword", lookup_expr="icontains"
+    )
+    expertise_category_uuid = core_filters.RelatedUUIDFilter(
+        view_name="expertise-category-detail",
+        field_name="expertise_set__expertise_category__uuid",
+    )
+    o = django_filters.OrderingFilter(
+        fields=(
+            ("user__full_name", "user_name"),
+            ("user__email", "user_email"),
+            "created",
+        )
+    )
+
+    class Meta:
+        model = models.ReviewerProfile
+        fields = []
+
+    def filter_user_name(self, queryset, name, value):
+        return queryset.filter(
+            Q(user__first_name__icontains=value)
+            | Q(user__last_name__icontains=value)
+            | Q(user__full_name__icontains=value)
+            | Q(alternative_names__icontains=value)
+        )
+
+    def filter_has_orcid(self, queryset, name, value):
+        if value:
+            return queryset.exclude(orcid_id="").exclude(orcid_id__isnull=True)
+        return queryset.filter(Q(orcid_id="") | Q(orcid_id__isnull=True))
+
+
+# =============================================================================
+# COI Filters
+# =============================================================================
+
+
+class ConflictOfInterestFilter(django_filters.FilterSet):
+    call_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-public-call-detail", field_name="call__uuid"
+    )
+    proposal_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-proposal-detail", field_name="proposal__uuid"
+    )
+    round_uuid = core_filters.RelatedUUIDFilter(
+        view_name="call-round-detail", field_name="proposal__round__uuid"
+    )
+    reviewer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="reviewer-profile-detail", field_name="reviewer__uuid"
+    )
+    reviewer_name = django_filters.CharFilter(method="filter_reviewer_name")
+    coi_type = django_filters.MultipleChoiceFilter(
+        choices=models.ConflictOfInterest._meta.get_field("coi_type").choices
+    )
+    severity = django_filters.ChoiceFilter(
+        choices=models.ConflictOfInterest._meta.get_field("severity").choices
+    )
+    status = django_filters.MultipleChoiceFilter(
+        choices=models.ConflictOfInterest._meta.get_field("status").choices
+    )
+    detection_method = django_filters.MultipleChoiceFilter(
+        choices=models.ConflictOfInterest._meta.get_field("detection_method").choices
+    )
+    o = django_filters.OrderingFilter(
+        fields=("detected_at", "severity", "status", "created")
+    )
+
+    class Meta:
+        model = models.ConflictOfInterest
+        fields = []
+
+    def filter_reviewer_name(self, queryset, name, value):
+        return core_filters.filter_by_full_name(queryset, value, "reviewer__user")
+
+
+class COIDisclosureFormFilter(django_filters.FilterSet):
+    call_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-public-call-detail", field_name="call__uuid"
+    )
+    reviewer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="reviewer-profile-detail", field_name="reviewer__uuid"
+    )
+    is_current = django_filters.BooleanFilter(widget=BooleanWidget)
+    certified = django_filters.BooleanFilter(widget=BooleanWidget)
+    o = django_filters.OrderingFilter(
+        fields=("created", "certification_date", "valid_until")
+    )
+
+    class Meta:
+        model = models.COIDisclosureForm
+        fields = []
+
+
+class CallReviewerPoolFilter(django_filters.FilterSet):
+    call_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-public-call-detail", field_name="call__uuid"
+    )
+    reviewer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="reviewer-profile-detail", field_name="reviewer__uuid"
+    )
+    invitation_status = django_filters.MultipleChoiceFilter(
+        choices=models.CallReviewerPool._meta.get_field("invitation_status").choices
+    )
+    my_invitations = django_filters.BooleanFilter(
+        method="filter_my_invitations",
+        widget=BooleanWidget,
+    )
+    o = django_filters.OrderingFilter(
+        fields=(
+            "invited_at",
+            "expertise_match_score",
+            "current_assignments",
+            "created",
+        )
+    )
+
+    def filter_my_invitations(self, queryset, name, value):
+        """Filter to show only invitations for the current user."""
+        if not value:
+            return queryset
+        user = self.request.user
+        if not user or not user.is_authenticated:
+            return queryset.none()
+        return queryset.filter(
+            models.Q(reviewer__user=user) | models.Q(invited_email=user.email)
+        )
+
+    class Meta:
+        model = models.CallReviewerPool
+        fields = []
+
+
+class COIDetectionJobFilter(django_filters.FilterSet):
+    call_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-public-call-detail", field_name="call__uuid"
+    )
+    job_type = django_filters.ChoiceFilter(
+        choices=models.COIDetectionJob._meta.get_field("job_type").choices
+    )
+    state = django_filters.MultipleChoiceFilter(
+        choices=models.COIDetectionJob._meta.get_field("state").choices
+    )
+    o = django_filters.OrderingFilter(
+        fields=("created", "started_at", "completed_at", "state")
+    )
+
+    class Meta:
+        model = models.COIDetectionJob
+        fields = []
+
+
+class ReviewerBidFilter(django_filters.FilterSet):
+    call_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-public-call-detail", field_name="call__uuid"
+    )
+    proposal_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-proposal-detail", field_name="proposal__uuid"
+    )
+    reviewer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="reviewer-profile-detail", field_name="reviewer__uuid"
+    )
+    bid = django_filters.MultipleChoiceFilter(
+        choices=models.ReviewerBid._meta.get_field("bid").choices
+    )
+    o = django_filters.OrderingFilter(fields=("submitted_at", "modified_at", "bid"))
+
+    class Meta:
+        model = models.ReviewerBid
+        fields = []
+
+
+class ReviewerSuggestionFilter(django_filters.FilterSet):
+    call_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-public-call-detail", field_name="call__uuid"
+    )
+    reviewer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="reviewer-profile-detail", field_name="reviewer__uuid"
+    )
+    status = django_filters.MultipleChoiceFilter(
+        choices=models.ReviewerSuggestion._meta.get_field("status").choices
+    )
+    min_affinity_score = django_filters.NumberFilter(
+        field_name="affinity_score", lookup_expr="gte"
+    )
+    o = django_filters.OrderingFilter(
+        fields=("affinity_score", "created", "status", "reviewed_at")
+    )
+
+    class Meta:
+        model = models.ReviewerSuggestion
+        fields = []
+
+
+# =============================================================================
+# Assignment Batch Filters
+# =============================================================================
+
+
+class AssignmentBatchFilter(django_filters.FilterSet):
+    call_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-public-call-detail", field_name="call__uuid"
+    )
+    reviewer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="reviewer-profile-detail",
+        field_name="reviewer_pool_entry__reviewer__uuid",
+    )
+    reviewer_pool_entry_uuid = core_filters.RelatedUUIDFilter(
+        view_name="call-reviewer-pool-detail", field_name="reviewer_pool_entry__uuid"
+    )
+    status = django_filters.MultipleChoiceFilter(
+        choices=models.AssignmentBatch._meta.get_field("status").choices
+    )
+    source = django_filters.MultipleChoiceFilter(
+        choices=models.AssignmentBatch._meta.get_field("source").choices
+    )
+    sent_after = django_filters.DateTimeFilter(field_name="sent_at", lookup_expr="gte")
+    sent_before = django_filters.DateTimeFilter(field_name="sent_at", lookup_expr="lte")
+    o = django_filters.OrderingFilter(
+        fields=("created", "sent_at", "expires_at", "status")
+    )
+
+    class Meta:
+        model = models.AssignmentBatch
+        fields = []
+
+
+class AssignmentItemFilter(django_filters.FilterSet):
+    batch_uuid = core_filters.RelatedUUIDFilter(
+        view_name="assignment-batch-detail", field_name="batch__uuid"
+    )
+    call_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-public-call-detail", field_name="batch__call__uuid"
+    )
+    proposal_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-proposal-detail", field_name="proposal__uuid"
+    )
+    reviewer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="reviewer-profile-detail",
+        field_name="batch__reviewer_pool_entry__reviewer__uuid",
+    )
+    status = django_filters.MultipleChoiceFilter(
+        choices=models.AssignmentItem._meta.get_field("status").choices
+    )
+    has_coi = django_filters.BooleanFilter()
+    min_affinity_score = django_filters.NumberFilter(
+        field_name="affinity_score", lookup_expr="gte"
+    )
+    o = django_filters.OrderingFilter(
+        fields=("created", "affinity_score", "status", "responded_at")
+    )
+
+    class Meta:
+        model = models.AssignmentItem
         fields = []

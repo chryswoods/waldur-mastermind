@@ -3,8 +3,8 @@ from unittest import mock
 from ddt import data, ddt
 from rest_framework import status, test
 
+from waldur_core.logging.enums import ObservableObjectType
 from waldur_core.logging.tests import factories as logging_factories
-from waldur_core.logging.utils import ObservableObjectType
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import (
     CustomerRole,
@@ -16,7 +16,7 @@ from waldur_mastermind.marketplace.tests import factories, fixtures
 
 
 @ddt
-class BackendResourcePermissionsTest(test.APITransactionTestCase):
+class BackendResourcePermissionsTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.MarketplaceFixture()
         self.url = factories.BackendResourceFactory.get_list_url()
@@ -100,7 +100,7 @@ class BackendResourcePermissionsTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
-class BackendResourceImportTest(test.APITransactionTestCase):
+class BackendResourceImportTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -143,9 +143,68 @@ class BackendResourceImportTest(test.APITransactionTestCase):
             ).exists()
         )
 
+    def test_backend_resource_import_without_plan_fails(self):
+        """Test that importing a resource without a plan fails for shared offerings."""
+        self.client.force_login(self.fixture.staff)
+        url = factories.BackendResourceFactory.get_url(
+            self.backend_resource, "import_resource"
+        )
+        payload = {}
+        response = self.client.post(url, data=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("plan", response.data)
+        self.assertIn(
+            "Plan is required when importing resources", str(response.data["plan"])
+        )
+
+        self.assertFalse(
+            models.Resource.objects.filter(
+                backend_id=self.backend_resource.backend_id
+            ).exists()
+        )
+
+    def test_backend_resource_import_private_offering_without_plan_succeeds(self):
+        """Test that importing a resource without a plan succeeds for private offerings."""
+        private_offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            project=self.project,
+            shared=False,
+        )
+        private_backend_resource = factories.BackendResourceFactory(
+            offering=private_offering,
+            project=self.project,
+        )
+
+        self.client.force_login(self.fixture.staff)
+        url = factories.BackendResourceFactory.get_url(
+            private_backend_resource, "import_resource"
+        )
+        payload = {}
+        response = self.client.post(url, data=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            models.Resource.objects.filter(
+                backend_id=private_backend_resource.backend_id
+            ).exists()
+        )
+        resource = models.Resource.objects.get(
+            backend_id=private_backend_resource.backend_id
+        )
+        self.assertEqual(resource.offering, private_offering)
+        self.assertIsNone(resource.plan)
+        self.assertTrue(
+            models.Order.objects.filter(
+                resource=resource,
+                created_by=self.fixture.staff,
+            ).exists()
+        )
+        self.assertIsNone(models.Order.objects.get(resource=resource).plan)
+
 
 @ddt
-class BackendResourceRequestTest(test.APITransactionTestCase):
+class BackendResourceRequestTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -263,11 +322,18 @@ class BackendResourceRequestTest(test.APITransactionTestCase):
 
     @mock.patch("waldur_core.logging.tasks.publish_messages")
     def test_create_backend_resource_request(self, mock_publish_messages):
-        logging_factories.EventSubscriptionFactory(
+        event_subscription = logging_factories.EventSubscriptionFactory(
             user=self.fixture.offering_owner,
             observable_objects=[
                 {"object_type": ObservableObjectType.IMPORTABLE_RESOURCES.value}
             ],
+        )
+
+        # Create subscription queue (required for messages to be sent)
+        logging_factories.EventSubscriptionQueueFactory(
+            event_subscription=event_subscription,
+            offering_uuid=self.offering.uuid,
+            object_type=ObservableObjectType.IMPORTABLE_RESOURCES.value,
         )
 
         self.client.force_login(self.fixture.staff)

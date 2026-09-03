@@ -112,13 +112,10 @@ Reviews maintain independent state for tracking progress:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> CREATED : Review assigned
-
-    CREATED --> IN_REVIEW : Reviewer starts
-    CREATED --> REJECTED : Reviewer declines
+    [*] --> IN_REVIEW : Review assigned
 
     IN_REVIEW --> SUBMITTED : Review completed
-    IN_REVIEW --> REJECTED : Reviewer withdraws
+    IN_REVIEW --> REJECTED : Reviewer withdraws/declines
 
     SUBMITTED --> [*] : Review processed
     REJECTED --> [*] : Assignment ended
@@ -214,6 +211,31 @@ graph TB
 ```
 
 ## Review System Architecture
+
+### Conflict of Interest Detection
+
+Before assigning reviewers, the system can automatically detect potential conflicts of interest between reviewers and proposals. This ensures fair and unbiased peer review processes.
+
+The COI detection system identifies:
+
+- **Named personnel conflicts**: Reviewer appears in proposal team
+- **Institutional conflicts**: Same or former institutional affiliation
+- **Co-authorship conflicts**: Shared publications with proposal team
+
+For complete documentation on COI detection, including configuration options, detection algorithms, and management workflows, see [Conflict of Interest Detection](proposals-coi.md).
+
+### Reviewer-Proposal Matching
+
+The system includes an automated matching system that computes expertise affinity scores between reviewers and proposals. This ensures qualified reviewers are matched with proposals in their area of expertise.
+
+Key features:
+
+- **Affinity scoring**: Keyword-based and TF-IDF text similarity algorithms
+- **Reviewer discovery**: Algorithm-based suggestions from published profiles
+- **Assignment algorithms**: MinMax, FairFlow, and Hungarian optimization
+- **Bid integration**: Reviewer preferences influence assignments
+
+For complete documentation on the matching system, including configuration options, scoring algorithms, and API endpoints, see [Reviewer-Proposal Matching](proposals-matching.md).
 
 ### Review Assignment
 
@@ -567,7 +589,7 @@ sequenceDiagram
 
     alt Call has compliance checklist
         S->>PCC: Create completion tracking
-        PCC->>PCC: Initialize as incomplete
+        PCC->>PCC: Initialize incomplete state
     else No compliance checklist
         S->>S: No action needed
     end
@@ -1003,3 +1025,10 @@ def cleanup_proposal_resources(proposal):
 
 - Review progress tracking
 - Resource utilization monitoring
+
+## Related Documentation
+
+- [Call Eligibility and Applicant Attributes](./proposals-eligibility.md) - AAI-based eligibility restrictions and GDPR-compliant attribute exposure
+- [Conflict of Interest Detection](./proposals-coi.md) - COI management and detection workflows
+- [Reviewer Matching](./proposals-matching.md) - Automated reviewer assignment algorithms
+- [User Profile Attributes](../user-profile-attributes.md) - User attribute reference for AAI integration

@@ -1,10 +1,13 @@
 # OfferingUser States and Management
 
-OfferingUser represents a user account created for a specific marketplace offering. It supports a finite state machine (FSM) that tracks the lifecycle of user account creation, validation, and management.
+OfferingUser represents a user account created for a specific marketplace offering. It tracks two independent state dimensions:
 
-## States
+- **Lifecycle state** (`state`): A finite state machine (FSM) tracking where the account is in the provisioning/deletion workflow.
+- **Runtime state** (`runtime_state`): An operational flag the service provider can set freely to signal whether the user currently has access to the service (e.g. TOU accepted, account linked). This is independent of lifecycle and can be updated at any time except when the account is `DELETED`.
 
-OfferingUser has the following states:
+## Lifecycle States
+
+OfferingUser has the following lifecycle states:
 
 | State | Description |
 |-------|-------------|
@@ -33,7 +36,10 @@ stateDiagram-v2
     CREATING --> OK : set_ok()
 
     PENDING_ACCOUNT_LINKING --> OK : set_validation_complete()
+    PENDING_ACCOUNT_LINKING --> PENDING_ADDITIONAL_VALIDATION : set_pending_additional_validation()
+
     PENDING_ADDITIONAL_VALIDATION --> OK : set_validation_complete()
+    PENDING_ADDITIONAL_VALIDATION --> PENDING_ACCOUNT_LINKING : set_pending_account_linking()
 
     OK --> DELETION_REQUESTED : request_deletion()
 
@@ -89,7 +95,7 @@ Content-Type: application/json
 }
 ```
 
-**Valid transitions from:** `CREATING`, `ERROR_CREATING`
+**Valid transitions from:** `CREATING`, `ERROR_CREATING`, `PENDING_ACCOUNT_LINKING`
 
 #### Set Pending Account Linking
 
@@ -103,7 +109,7 @@ Content-Type: application/json
 }
 ```
 
-**Valid transitions from:** `CREATING`, `ERROR_CREATING`
+**Valid transitions from:** `CREATING`, `ERROR_CREATING`, `PENDING_ADDITIONAL_VALIDATION`
 
 #### Set Validation Complete
 
@@ -197,13 +203,64 @@ Content-Type: application/json
 
 Both fields are optional - you can update just the comment, just the URL, or both.
 
+#### Update Runtime State
+
+```http
+POST /api/marketplace-offering-users/{uuid}/update_runtime_state/
+Content-Type: application/json
+
+{
+  "runtime_state": "Pending account linking",
+  "service_provider_comment": "Please link your MyAccessID account",
+  "service_provider_comment_url": "https://help.example.com/linking"
+}
+```
+
+`service_provider_comment` and `service_provider_comment_url` are optional. Omit them to leave existing comments unchanged, or pass empty strings to clear them.
+
+Where `runtime_state` is one of:
+
+| Value | Meaning |
+|-------|---------|
+| `Active` | User can access the service normally |
+| `Pending account linking` | User must link an external account (e.g. MyAccessID) before access is granted |
+| `Pending additional validation` | User must complete additional validation (e.g. accept new Terms of Use) |
+
+**Valid transitions:** Any → Any (no FSM). Can be set regardless of lifecycle `state`, except when lifecycle is `DELETED`.
+
+**Permissions:** Requires `UPDATE_OFFERING_USER` permission on the offering's customer.
+
+**Key use case — backfill sync:** When a service provider syncs an external system (e.g. Puhuri), they can update `runtime_state` on users already in lifecycle `OK` without touching the provisioning FSM.
+
 ### OfferingUser Fields
 
 When retrieving or updating OfferingUser objects, the following state-related fields are available:
 
-- `state` (string, read-only): Current state of the user account
+- `state` (string, read-only): Current lifecycle state of the user account (provisioning/deletion)
+- `runtime_state` (string, read-only): Current operational/access state of the user account
 - `service_provider_comment` (string, read-only): Comment from service provider for pending states
 - `service_provider_comment_url` (string, read-only): Optional URL link for additional information or actions related to the service provider comment
+
+## Runtime States
+
+| State | Description |
+|-------|-------------|
+| `Active` | User has full access to the service |
+| `Pending account linking` | Access blocked; user must link an external account |
+| `Pending additional validation` | Access blocked; user must complete additional validation (e.g. TOU) |
+
+### Lifecycle vs Runtime State
+
+These two fields are independent:
+
+| `state` (lifecycle) | `runtime_state` | Meaning |
+|---------------------|-----------------|---------|
+| `OK` | `Active` | Account provisioned and fully accessible |
+| `OK` | `Pending account linking` | Provisioned in Waldur, but blocked in backend (e.g. MyAccessID not linked yet) |
+| `OK` | `Pending additional validation` | Provisioned in Waldur, but blocked pending TOU acceptance |
+| `Creating` | `Active` | Account being created; default runtime state |
+
+The lifecycle FSM (`state`) tracks Waldur-side provisioning. The `runtime_state` tracks operational access status as reported by the service provider. Service providers should update `runtime_state` via `update_runtime_state`, and upstream consumers should read both fields from STOMP messages.
 
 ## Backward Compatibility
 
@@ -426,3 +483,142 @@ State transitions generate:
 
 - **Event logs**: Recorded in the system event log for audit purposes
 - **Application logs**: Logged with user attribution for debugging and monitoring
+- **STOMP messages**: Published to the `offering_user` queue for external systems (see [Event-Based Order Processing](event-based-order-processing.md#offering-user-event-messages)). `OfferingUserAttributeConfig` also gates which user profile attributes are included in STOMP event payloads.
+
+## User Attribute Exposure Configuration
+
+Waldur supports GDPR-compliant per-offering configuration of which user attributes are exposed to service providers. This allows organizations to declare and control what personal data is shared with each offering.
+
+### Overview
+
+The `OfferingUserAttributeConfig` model allows service provider administrators to configure exactly which user profile attributes are exposed when retrieving OfferingUser data via the API.
+
+```mermaid
+flowchart LR
+    subgraph User Profile
+        UP[User]
+        UP --> |has| A1[username]
+        UP --> |has| A2[full_name]
+        UP --> |has| A3[email]
+        UP --> |has| A4[phone_number]
+        UP --> |has| A5[organization]
+        UP --> |has| A6[nationality]
+        UP --> |has| A7[...]
+    end
+
+    subgraph Offering Config
+        OC[OfferingUserAttributeConfig]
+        OC --> |expose_username| E1[true]
+        OC --> |expose_full_name| E2[true]
+        OC --> |expose_email| E3[true]
+        OC --> |expose_phone_number| E4[false]
+        OC --> |expose_nationality| E5[true]
+    end
+
+    subgraph API Response
+        AR[OfferingUser API]
+        AR --> |returns| R1[username ✓]
+        AR --> |returns| R2[full_name ✓]
+        AR --> |returns| R3[email ✓]
+        AR --> |filters| R4[phone_number ✗]
+        AR --> |returns| R5[nationality ✓]
+    end
+
+    UP --> OC
+    OC --> AR
+```
+
+### API Endpoints
+
+#### Get/Update Attribute Configuration
+
+**Endpoint**: `/api/marketplace-offering-user-attribute-configs/`
+
+```http
+GET /api/marketplace-offering-user-attribute-configs/?offering_uuid={uuid}
+```
+
+```http
+POST /api/marketplace-offering-user-attribute-configs/
+Content-Type: application/json
+
+{
+  "offering": "https://api.example.com/api/marketplace-offerings/{uuid}/",
+  "expose_username": true,
+  "expose_full_name": true,
+  "expose_email": true,
+  "expose_phone_number": false,
+  "expose_organization": true,
+  "expose_nationality": true,
+  "expose_civil_number": false
+}
+```
+
+#### Update Existing Configuration
+
+```http
+PATCH /api/marketplace-offering-user-attribute-configs/{uuid}/
+Content-Type: application/json
+
+{
+  "expose_phone_number": true,
+  "expose_nationality": false
+}
+```
+
+### Available Attributes
+
+| Attribute | Default | Description |
+|-----------|---------|-------------|
+| `expose_username` | `true` | User's username |
+| `expose_full_name` | `true` | User's full name |
+| `expose_email` | `true` | User's email address |
+| `expose_phone_number` | `false` | User's phone number |
+| `expose_organization` | `false` | User's organization |
+| `expose_job_title` | `false` | User's job title |
+| `expose_affiliations` | `false` | User's affiliations |
+| `expose_gender` | `false` | User's gender (ISO 5218) |
+| `expose_personal_title` | `false` | Honorific title |
+| `expose_place_of_birth` | `false` | Place of birth |
+| `expose_country_of_residence` | `false` | Country of residence |
+| `expose_nationality` | `false` | Primary nationality |
+| `expose_nationalities` | `false` | All citizenships |
+| `expose_organization_country` | `false` | Organization's country |
+| `expose_organization_type` | `false` | Organization type (SCHAC URN) |
+| `expose_eduperson_assurance` | `false` | REFEDS assurance level |
+| `expose_civil_number` | `false` | Civil/national ID number |
+| `expose_birth_date` | `false` | Date of birth |
+| `expose_identity_source` | `false` | Identity provider source |
+
+### Default Behavior
+
+When no `OfferingUserAttributeConfig` exists for an offering, the system uses the `DEFAULT_OFFERING_USER_ATTRIBUTES` Constance setting, which defaults to:
+
+```python
+["username", "full_name", "email"]
+```
+
+Staff can configure system-wide defaults via `/api-auth/override-db-settings/`:
+
+```http
+PATCH /api-auth/override-db-settings/
+Content-Type: application/json
+
+{
+  "DEFAULT_OFFERING_USER_ATTRIBUTES": ["username", "full_name", "email", "organization"]
+}
+```
+
+### Permissions
+
+- **View**: Users with `VIEW_OFFERING` permission on the offering
+- **Create/Update**: Offering owner or customer owner
+
+### GDPR Compliance
+
+This feature supports GDPR Article 13/14 compliance by:
+
+1. **Data minimization**: Only expose attributes necessary for the service
+2. **Transparency**: Configuration is accessible via API for audit
+3. **Purpose limitation**: Each offering declares its data processing needs
+4. **Consent integration**: Can be linked to `OfferingTermsOfService` to show users what data is collected

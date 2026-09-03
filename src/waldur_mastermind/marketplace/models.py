@@ -1,21 +1,30 @@
+import datetime
 import logging
 from collections.abc import Callable
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Literal, cast
 
+from constance import config as constance_config
 from dateutil.relativedelta import relativedelta
+from django.contrib.contenttypes.fields import GenericForeignKey
+from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator, RegexValidator
 from django.db import models
-from django.db.models import Index, Sum
+from django.db.models import Index, Q, Sum
+from django.db.models import signals as django_signals
 from django.db.models.constraints import UniqueConstraint
 from django.utils import timezone
 from django.utils.functional import cached_property
+from django.utils.text import slugify
 from django.utils.translation import gettext_lazy as _
 from django_fsm import FSMField, FSMIntegerField, transition
 from model_utils import FieldTracker
-from model_utils.models import TimeFramedModel, TimeStampedModel
+from model_utils.managers import SoftDeletableManager
+from model_utils.models import SoftDeletableModel, TimeFramedModel, TimeStampedModel
 from model_utils.tracker import FieldInstanceTracker
+from netfields import CidrAddressField, NetManager
 from rest_framework import exceptions as rf_exceptions
 from reversion import revisions as reversion
 
@@ -25,13 +34,14 @@ from waldur_core.core import mixins as core_mixins
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
+from waldur_core.core.enums import ReviewStates
 from waldur_core.core.models import User, generate_slug
 from waldur_core.logging.mixins import LoggableMixin
 from waldur_core.media.mixins import get_upload_path
 from waldur_core.media.validators import FileTypeValidator, ImageValidator
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.mixins import PermissionMixin
-from waldur_core.permissions.utils import get_users
+from waldur_core.permissions.utils import get_permissions, get_users
 from waldur_core.quotas import fields as quotas_fields
 from waldur_core.quotas import models as quotas_models
 from waldur_core.structure import models as structure_models
@@ -40,25 +50,32 @@ from waldur_mastermind.marketplace.enums import (
     BillingTypes,
     CategoryColumnWidget,
     CourseAccountState,
+    DiscountAggregations,
     ImpactLevel,
     LimitPeriods,
     MaintenanceState,
+    MaintenanceTimingBucket,
     MaintenanceType,
+    MissingUsagePolicies,
     OfferingStates,
+    OfferingUserRuntimeStates,
     OfferingUserStates,
     OrderStates,
     OrderTypes,
+    ResourceApiKeyStates,
     ResourceStates,
     RobotAccountStates,
     ServiceAccountState,
+    UsageLimitAction,
 )
-from waldur_mastermind.marketplace.exceptions import PolicyException
 from waldur_mastermind.notifications import models as notifications_models
 from waldur_pid import mixins as pid_mixins
 
+from ..common import formula as common_formula
 from ..common import mixins as common_mixins
-from . import managers, plugins
+from . import managers, plugins, signals
 from .attribute_types import ATTRIBUTE_TYPES
+from .secret_options import SecretOptionsField
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +120,14 @@ class ServiceProvider(
         ),
         validators=[core_validators.validate_template_syntax],
     )
+    allowed_domains = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=_(
+            "List of allowed domains for offering endpoints. "
+            "Only staff can modify this field. "
+        ),
+    )
 
     class Permissions:
         customer_path = "customer"
@@ -119,8 +144,10 @@ class ServiceProvider(
 
     @property
     def has_active_offerings(self) -> bool:
+        # Exclude auto-created infrastructure child offerings (e.g. OpenStack.Instance/Volume)
+        # which have a parent set and are not part of the provider's marketplace catalogue.
         return (
-            Offering.objects.filter(customer=self.customer)
+            Offering.objects.filter(customer=self.customer, parent__isnull=True)
             .exclude(state=OfferingStates.ARCHIVED)
             .exists()
         )
@@ -129,7 +156,11 @@ class ServiceProvider(
     def offering_count(self) -> int:
         return Offering.objects.filter(
             customer=self.customer,
-            state__in=[OfferingStates.ACTIVE, OfferingStates.PAUSED],
+            state__in=[
+                OfferingStates.ACTIVE,
+                OfferingStates.PAUSED,
+                OfferingStates.UNAVAILABLE,
+            ],
         ).count()
 
     def generate_api_secret_code(self):
@@ -165,7 +196,7 @@ class CategoryGroup(
     class Meta:
         verbose_name = _("Category group")
         verbose_name_plural = _("Category groups")
-        ordering = ("title",)
+        ordering = ["title", "id"]
 
     def __str__(self):
         return str(self.title)
@@ -173,6 +204,48 @@ class CategoryGroup(
     @classmethod
     def get_url_name(cls):
         return "marketplace-category-group"
+
+
+class OfferingGroup(
+    core_models.UuidMixin,
+    core_models.DescribableMixin,
+    TimeStampedModel,
+):
+    """
+    Logical grouping of related offerings within a single service provider.
+
+    Used to express that several offerings belong to the same backend
+    entity (e.g. a SLURM cluster whose partitions are exposed as separate
+    offerings). All offerings in a group must share the same customer.
+    """
+
+    title = models.CharField(blank=False, max_length=255)
+    icon = models.FileField(
+        upload_to="marketplace_offering_group_icons",
+        blank=True,
+        null=True,
+        validators=[ImageValidator],
+    )
+    customer = models.ForeignKey(
+        on_delete=models.CASCADE,
+        to=structure_models.Customer,
+        related_name="offering_groups",
+    )
+
+    class Permissions:
+        customer_path = "customer"
+
+    class Meta:
+        verbose_name = _("Offering group")
+        verbose_name_plural = _("Offering groups")
+        ordering = ["title", "id"]
+
+    def __str__(self):
+        return str(self.title)
+
+    @classmethod
+    def get_url_name(cls):
+        return "marketplace-offering-group"
 
 
 class Category(
@@ -217,13 +290,6 @@ class Category(
             'Set to true if this category is for OpenStack Volume. Only one category can have "true" value.'
         ),
     )
-    default_tenant_category = models.BooleanField(
-        default=False,
-        help_text=_(
-            'Set to true if this category is for OpenStack Tenant. Only one category can have "true" value.'
-        ),
-    )
-
     group = models.ForeignKey(
         CategoryGroup, blank=True, null=True, on_delete=models.SET_NULL
     )
@@ -234,7 +300,6 @@ class Category(
         for flag in [
             "default_volume_category",
             "default_vm_category",
-            "default_tenant_category",
         ]:
             if getattr(self, flag):
                 category = (
@@ -254,7 +319,7 @@ class Category(
     class Meta:
         verbose_name = _("Category")
         verbose_name_plural = _("Categories")
-        ordering = ("title",)
+        ordering = ["title", "id"]
 
     def __str__(self):
         return str(self.title)
@@ -284,7 +349,7 @@ class CategoryColumn(
     """
 
     class Meta:
-        ordering = ("category", "index")
+        ordering = ["category", "index", "id"]
 
     category = models.ForeignKey(
         on_delete=models.CASCADE, to=Category, related_name="columns"
@@ -350,7 +415,7 @@ InternalNameValidator = RegexValidator(
 # Regex validator for internal names allowing alphanumeric characters, underscores, hyphens, and slashes
 
 
-class Attribute(TimeStampedModel):
+class Attribute(TimeStampedModel, core_models.UuidMixin):
     """
     Configuration model for category attributes.
 
@@ -378,7 +443,7 @@ class Attribute(TimeStampedModel):
         return str(self.title)
 
 
-class AttributeOption(models.Model):
+class AttributeOption(core_models.UuidMixin, models.Model):
     """
     Options for choice-based attributes.
 
@@ -489,6 +554,43 @@ def offering_has_plans(offering):
     return offering.plans.count() or (offering.parent and offering.parent.plans.count())
 
 
+class OfferingProfile(
+    core_models.UuidMixin,
+    core_models.NameMixin,
+    core_models.DescribableMixin,
+    TimeStampedModel,
+):
+    """Logical grouping of offerings that share a common user-role catalog.
+
+    A profile defines a curated set of Roles (e.g. "Cluster Admin",
+    "Namespace Manager" for a Rancher-cluster profile). Offerings opt in by
+    setting their `profile` FK. The profile's roles are reconciled onto
+    every bound offering as RoleAvailability rows. Adding/removing roles
+    on the profile triggers async reconciliation across all bound offerings.
+
+    Profile catalog (the role set itself) is curated by staff via
+    OfferingProfileViewSet. Binding an offering to one of those profiles
+    is a per-offering operation: anyone with UPDATE_OFFERING on that
+    offering's customer (service-provider owner / staff) can attach or
+    detach. Distinct from Offering.type (the plugin id) — a Rancher
+    cluster delivered via site-agent and one delivered via the native
+    plugin can share the same profile.
+    """
+
+    roles = models.ManyToManyField(
+        "permissions.Role",
+        related_name="offering_profiles",
+        blank=True,
+        help_text=_(
+            "Role catalog. These roles become assignable on every offering "
+            "bound to this profile."
+        ),
+    )
+
+    class Meta:
+        ordering = ["name", "id"]
+
+
 class Offering(
     core_models.BackendMixin,
     core_models.UuidMixin,
@@ -519,11 +621,12 @@ class Offering(
     screenshots: models.Manager["Screenshot"]
     files: models.Manager["OfferingFile"]
     endpoints: models.Manager["OfferingAccessEndpoint"]
-    roles: models.Manager["OfferingUserRole"]
     software_catalogs: models.Manager["OfferingSoftwareCatalog"]
     user_consents: models.Manager["UserOfferingConsent"]
     terms_of_service_configs: models.Manager["OfferingTermsOfService"]
-    get_state_display: Callable[[], Literal["Draft", "Active", "Paused", "Archived"]]
+    get_state_display: Callable[
+        [], Literal["Draft", "Active", "Paused", "Archived", "Unavailable"]
+    ]
 
     class States(OfferingStates):
         pass
@@ -550,6 +653,16 @@ class Offering(
         related_name="offerings",
         limit_choices_to={"checklist_type": "offering_compliance"},
         help_text=_("Checklist that offering users must complete for compliance"),
+    )
+    offering_group = models.ForeignKey(
+        to=OfferingGroup,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="offerings",
+        help_text=_(
+            "Logical group this offering belongs to. Group must share the same customer."
+        ),
     )
     customer = models.ForeignKey(
         on_delete=models.CASCADE,
@@ -592,21 +705,47 @@ class Offering(
             "Public data used by specific plugin, such as storage mode for OpenStack."
         ),
     )
-    secret_options = models.JSONField(
+    secret_options = SecretOptionsField(
         blank=True,
         default=dict,
         help_text=_(
             "Private data used by specific plugin, such as credentials and hooks."
         ),
     )
+    backend_id_rules = models.JSONField(
+        blank=True,
+        default=dict,
+        help_text=_(
+            "Validation rules for resource backend_id: format regex and uniqueness scope."
+        ),
+    )
 
     privacy_policy_link = models.URLField(blank=True)
+    helpdesk_url = models.URLField(blank=True)
+    documentation_url = models.URLField(blank=True)
     country = models.CharField(max_length=2, blank=True)
     type = models.CharField(max_length=100)
     state = FSMIntegerField(default=States.DRAFT, choices=States.CHOICES)
     paused_reason = models.TextField(blank=True)
     organization_groups = models.ManyToManyField(
         structure_models.OrganizationGroup, related_name="offerings", blank=True
+    )
+    tags = models.ManyToManyField(
+        "Tag",
+        related_name="offerings",
+        blank=True,
+    )
+    profile = models.ForeignKey(
+        "OfferingProfile",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="offerings",
+        help_text=_(
+            "Service profile (logical grouping). When set, the offering's "
+            "user-role catalog is reconciled from the profile and managed "
+            "centrally by staff. Leave empty for per-offering custom roles."
+        ),
     )
 
     # If offering is not shared, it is available only to following user categories:
@@ -629,14 +768,28 @@ class Offering(
     )
 
     objects = managers.OfferingManager()
-    tracker = cast(FieldInstanceTracker, FieldTracker())
+    tracker = cast(
+        FieldInstanceTracker,
+        FieldTracker(
+            fields=[
+                "compliance_checklist",
+                "state",
+                "options",
+                "resource_options",
+                "plugin_options",
+                "secret_options",
+                "name",
+                "profile",
+            ]
+        ),
+    )
 
     class Permissions:
         customer_path = "customer"
 
     class Meta:
         verbose_name = _("Offering")
-        ordering = ["name"]
+        ordering = ["name", "id"]
         indexes = [
             Index(fields=["customer", "state"], name="mp_offering_customer_state_idx"),
             Index(fields=["name"], name="mp_offering_name_idx"),
@@ -656,7 +809,7 @@ class Offering(
 
     @transition(
         field=state,
-        source=[States.DRAFT, States.PAUSED],
+        source=[States.DRAFT, States.PAUSED, States.UNAVAILABLE],
         target=States.ACTIVE,
         conditions=[offering_has_plans],
     )
@@ -674,6 +827,14 @@ class Offering(
         conditions=[offering_has_plans],
     )
     def unpause(self):
+        pass
+
+    @transition(field=state, source=States.ACTIVE, target=States.UNAVAILABLE)
+    def make_unavailable(self):
+        pass
+
+    @transition(field=state, source=States.UNAVAILABLE, target=States.ACTIVE)
+    def make_available(self):
         pass
 
     @transition(field=state, source="*", target=States.ARCHIVED)
@@ -699,16 +860,28 @@ class Offering(
 
     @cached_property
     def is_usage_based(self) -> bool:
+        """
+        Returns True if the offering has at least one component with USAGE billing type.
+        Usage-based components are reported periodically and charged based on consumption.
+        """
         return self.components.filter(
             billing_type=BillingTypes.USAGE,
         ).exists()
 
     def get_limit_components(self) -> dict[str, "OfferingComponent"]:
-        components = self.components.filter(billing_type=BillingTypes.LIMIT)
+        components = self.components.filter(
+            models.Q(billing_type=BillingTypes.LIMIT)
+            | models.Q(billing_type=BillingTypes.ONE_TIME, is_prepaid=True)
+        )
         return {component.type: component for component in components}
 
     @cached_property
     def is_limit_based(self) -> bool:
+        """
+        Returns True if the offering has at least one component with LIMIT billing type
+        and the plugin supports updating limits. Limit-based components define a maximum
+        quota that can be dynamically adjusted by the user.
+        """
         if not plugins.manager.can_update_limits(self.type):
             return False
         if not self.components.filter(billing_type=BillingTypes.LIMIT).exists():
@@ -795,6 +968,7 @@ class UserOfferingConsent(TimeStampedModel, core_models.UuidMixin, LoggableMixin
     )
 
     class Meta:
+        ordering = ["-created", "id"]
         unique_together = (
             "user",
             "offering",
@@ -833,11 +1007,15 @@ class OfferingTermsOfService(TimeStampedModel, core_models.UuidMixin):
         default=False,
         help_text="If True, user will be asked to re-consent to the terms of service when the terms of service are updated.",
     )
+    grace_period_days = models.PositiveIntegerField(
+        default=60,
+        help_text="Number of days before outdated consents are automatically revoked. Only applies when requires_reconsent=True.",
+    )
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
     class Meta:
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
         constraints = [
             models.UniqueConstraint(
                 fields=["offering"],
@@ -845,6 +1023,170 @@ class OfferingTermsOfService(TimeStampedModel, core_models.UuidMixin):
                 name="unique_active_terms_per_offering",
             )
         ]
+
+    @property
+    def grace_period_end(self):
+        if not self.requires_reconsent or not self.is_active:
+            return None
+        return self.created + timedelta(days=self.grace_period_days)
+
+    def is_grace_period_active(self):
+        end_date = self.grace_period_end
+        if not end_date:
+            return False
+        return timezone.now() < end_date
+
+    @property
+    def collected_attributes(self):
+        """Return list of user attributes that will be collected for this offering."""
+        return OfferingUserAttributeConfig.get_exposed_fields_for_offering(
+            self.offering
+        )
+
+
+class UserAttributeConfigBase(TimeStampedModel, core_models.UuidMixin):
+    """
+    Abstract base for models that configure which user attributes are exposed/visible.
+    All common personal-data fields live here; subclasses add their FK and unique fields.
+    Defaults match the original OfferingUserAttributeConfig defaults for backward
+    compatibility (username, full_name, email, registration_method are exposed).
+    """
+
+    # Subclasses override to wire up the generic resolver.
+    SCOPE_RELATED_NAME: str = ""  # OneToOne reverse accessor name on the scope object
+    DEFAULT_CONSTANCE_KEY: str = "DEFAULT_OFFERING_USER_ATTRIBUTES"
+    DEFAULT_FALLBACK = ("username", "full_name", "email")
+    # Convention: every personal-data toggle on this base is named expose_<attr>.
+    EXPOSE_PREFIX = "expose_"
+
+    expose_full_name = models.BooleanField(default=True)
+    expose_organization = models.BooleanField(default=False)
+    expose_organization_country = models.BooleanField(default=False)
+    expose_email = models.BooleanField(default=True)
+    expose_affiliations = models.BooleanField(default=False)
+    expose_organization_type = models.BooleanField(default=False)
+    expose_nationality = models.BooleanField(default=False)
+    expose_nationalities = models.BooleanField(default=False)
+    expose_country_of_residence = models.BooleanField(default=False)
+    expose_eduperson_assurance = models.BooleanField(default=False)
+    expose_identity_source = models.BooleanField(default=False)
+    expose_username = models.BooleanField(default=True)
+    expose_registration_method = models.BooleanField(default=True)
+    expose_phone_number = models.BooleanField(default=False)
+    expose_job_title = models.BooleanField(default=False)
+    expose_gender = models.BooleanField(default=False)
+    expose_personal_title = models.BooleanField(default=False)
+    expose_place_of_birth = models.BooleanField(default=False)
+    expose_address = models.BooleanField(default=False)
+    expose_organization_registry_code = models.BooleanField(default=False)
+    expose_organization_vat_code = models.BooleanField(default=False)
+    expose_organization_address = models.BooleanField(default=False)
+    expose_civil_number = models.BooleanField(default=False)
+    expose_birth_date = models.BooleanField(default=False)
+    expose_active_isds = models.BooleanField(default=False)
+    # POSIX identity from the identity provider (used by offerings whose
+    # uid_source/gid_source is 'user_attribute').
+    expose_uid_number = models.BooleanField(default=False)
+    expose_primary_gid = models.BooleanField(default=False)
+
+    class Meta:
+        abstract = True
+
+    @classmethod
+    def _iter_expose_fields(cls):
+        """Yield every Django field on the model that follows the expose_<attr> convention."""
+        prefix = cls.EXPOSE_PREFIX
+        for field in cls._meta.fields:
+            if field.name.startswith(prefix):
+                yield field
+
+    def get_exposed_fields(self) -> list[str]:
+        """Return list of attribute names (without expose_ prefix) that are enabled."""
+        prefix = type(self).EXPOSE_PREFIX
+        return [
+            field.name[len(prefix) :]
+            for field in self._iter_expose_fields()
+            if getattr(self, field.name)
+        ]
+
+    @classmethod
+    def get_exposed_fields_for_scope(
+        cls, scope_obj, default_attributes=None
+    ) -> list[str]:
+        """Get exposed fields for a scope object (offering, call, ...).
+
+        Falls back to the subclass-configured Constance key, then to the
+        hardcoded DEFAULT_FALLBACK. When iterating many scopes, pre-fetch the
+        Constance value once and pass it as default_attributes to avoid
+        repeated DB lookups.
+        """
+        if not cls.SCOPE_RELATED_NAME:
+            raise NotImplementedError(f"{cls.__name__} must define SCOPE_RELATED_NAME")
+        try:
+            config = getattr(scope_obj, cls.SCOPE_RELATED_NAME)
+        except cls.DoesNotExist:
+            config = None
+        if config is not None:
+            return config.get_exposed_fields()
+        if default_attributes is not None:
+            return default_attributes
+        return getattr(constance_config, cls.DEFAULT_CONSTANCE_KEY) or list(
+            cls.DEFAULT_FALLBACK
+        )
+
+    @classmethod
+    def get_default_exposed_fields(cls) -> list[str]:
+        """Return the Constance-derived list of attribute names exposed by default."""
+        return getattr(constance_config, cls.DEFAULT_CONSTANCE_KEY) or list(
+            cls.DEFAULT_FALLBACK
+        )
+
+    @classmethod
+    def get_default_exposure_flags(cls) -> dict[str, bool]:
+        """Return {expose_<attr>: bool} for every expose_* field on the model,
+        with values derived from the subclass's Constance default. Used to seed
+        a freshly-created config row so unspecified booleans don't fall back to
+        model-level default=True values silently.
+        """
+        prefix = cls.EXPOSE_PREFIX
+        exposed = set(cls.get_default_exposed_fields())
+        return {
+            field.name: field.name[len(prefix) :] in exposed
+            for field in cls._iter_expose_fields()
+        }
+
+
+class OfferingUserAttributeConfig(UserAttributeConfigBase):
+    """
+    Configures which user attributes an offering exposes to its service provider.
+    Supports GDPR compliance by declaring personal data processing.
+    """
+
+    SCOPE_RELATED_NAME = "user_attribute_config"
+    DEFAULT_CONSTANCE_KEY = "DEFAULT_OFFERING_USER_ATTRIBUTES"
+
+    offering = models.OneToOneField(
+        Offering,
+        on_delete=models.CASCADE,
+        related_name="user_attribute_config",
+    )
+
+    class Meta:
+        verbose_name = _("Offering user attribute config")
+        verbose_name_plural = _("Offering user attribute configs")
+
+    def __str__(self):
+        return f"User attribute config for {self.offering}"
+
+    @classmethod
+    def get_url_name(cls):
+        return "marketplace-offering-user-attribute-config"
+
+    @classmethod
+    def get_exposed_fields_for_offering(
+        cls, offering, default_attributes=None
+    ) -> list[str]:
+        return cls.get_exposed_fields_for_scope(offering, default_attributes)
 
 
 class OfferingComponent(
@@ -866,7 +1208,7 @@ class OfferingComponent(
 
     class Meta:
         unique_together = ("type", "offering")
-        ordering = ("name",)
+        ordering = ["name", "id"]
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
     offering = models.ForeignKey(
@@ -880,7 +1222,7 @@ class OfferingComponent(
     )
     # limit_period and limit_amount fields are used if billing_type is USAGE or LIMIT
     limit_period = models.CharField(
-        choices=LimitPeriods.CHOICES, blank=True, null=True, max_length=10
+        choices=LimitPeriods.CHOICES, default=LimitPeriods.MONTH, max_length=10
     )
     limit_amount = models.IntegerField(blank=True, null=True)
     # unit_factor is for metadata only and is not involved in any computations in Mastermind
@@ -903,7 +1245,40 @@ class OfferingComponent(
     )
     min_prepaid_duration = models.IntegerField(blank=True, null=True)
     max_prepaid_duration = models.IntegerField(blank=True, null=True)
+    prepaid_duration_step = models.PositiveIntegerField(
+        blank=True,
+        null=True,
+        default=None,
+        help_text=_(
+            "Step size in months for the initial prepaid duration at order creation. "
+            "If set, only multiples of this value (starting from min_prepaid_duration) "
+            "are valid. Defaults to 1 (any value between min and max)."
+        ),
+    )
+    min_renewal_duration = models.PositiveIntegerField(
+        blank=True,
+        null=True,
+        help_text=_("Minimum number of months allowed for a renewal."),
+    )
+    max_renewal_duration = models.PositiveIntegerField(
+        blank=True,
+        null=True,
+        help_text=_("Maximum number of months allowed for a renewal."),
+    )
+    renewal_duration_step = models.PositiveIntegerField(
+        blank=True,
+        null=True,
+        help_text=_(
+            "Step size in months for renewal. Only multiples of this value "
+            "(starting from min_renewal_duration) are valid. Defaults to 1."
+        ),
+    )
     objects = managers.MixinManager("scope")
+
+    def save(self, *args, **kwargs):
+        if not self.limit_period:
+            self.limit_period = LimitPeriods.MONTH
+        super().save(*args, **kwargs)
 
     def validate_amount(self, resource, amount, date):
         if not self.limit_period or not self.limit_amount:
@@ -912,7 +1287,7 @@ class OfferingComponent(
         usages = ComponentUsage.objects.filter(resource=resource, component=self)
 
         if self.limit_period == LimitPeriods.MONTH:
-            usages = usages.filter(date=core_utils.month_start(date))
+            usages = usages.filter(billing_period=core_utils.month_start(date))
         elif self.limit_period == LimitPeriods.QUARTERLY:
             # Convert date to datetime for quarter calculations
             if isinstance(date, timezone.datetime):
@@ -926,18 +1301,23 @@ class OfferingComponent(
             quarter_start = core_utils.get_quarter_start(datetime_obj)
             quarter_end = core_utils.get_quarter_end(datetime_obj)
             usages = usages.filter(
-                date__gte=quarter_start.date(), date__lte=quarter_end.date()
+                billing_period__gte=quarter_start.date(),
+                billing_period__lte=quarter_end.date(),
             )
         elif self.limit_period == LimitPeriods.ANNUAL:
-            usages = usages.filter(date__year=date.year)
+            usages = usages.filter(billing_period__year=date.year)
 
         total = usages.aggregate(models.Sum("usage"))["usage__sum"] or 0
 
         if total + amount > self.limit_amount:
-            raise rf_exceptions.ValidationError(
-                _("Total amount exceeds limit. Total amount: %s, limit: %s.")
-                % (total + amount, self.limit_amount)
+            message = _("Total amount exceeds limit. Total amount: %s, limit: %s.") % (
+                total + amount,
+                self.limit_amount,
             )
+            if self.billing_type == BillingTypes.USAGE:
+                logger.warning(message)
+                return
+            raise rf_exceptions.ValidationError(message)
 
     @property
     def is_builtin(self) -> bool:
@@ -1001,7 +1381,7 @@ class Plan(
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
     class Meta:
-        ordering = ("name",)
+        ordering = ["name", "id"]
 
     @classmethod
     def get_url_name(cls):
@@ -1010,7 +1390,19 @@ class Plan(
     class Permissions:
         customer_path = "offering__customer"
 
-    def get_estimate(self, limits=None):
+    def get_estimate(
+        self, limits=None, start_date=None, end_date=None, duration_months=None
+    ):
+        """Estimate total cost for given limits.
+
+        For prepaid components, multiplies by the subscription's length in whole
+        months. ``duration_months`` is that length where it is known outright;
+        otherwise it is recovered from the span between the two dates. Prefer the
+        length: a span is only true relative to the day it was measured from, so
+        a subscription that starts later than today prices as the wait plus the
+        period rather than the period. With neither, a single period is returned.
+        """
+
         cost = self.unit_price
 
         if limits:
@@ -1021,11 +1413,22 @@ class Plan(
 
             factors = self.offering.component_factors
 
-            for key in components_map.keys():
+            for key, component in components_map.items():
                 price = component_prices.get(key, 0)
                 limit = limits.get(key, 0)
                 factor = factors.get(key, 1)
-                cost += Decimal(price) * limit / factor
+                per_unit = Decimal(price) * Decimal(str(limit)) / Decimal(str(factor))
+
+                if component.is_prepaid:
+                    months = duration_months
+                    if not months and start_date and end_date:
+                        months = core_utils.calculate_duration_months(
+                            start_date, end_date
+                        )
+                    if months:
+                        per_unit *= months
+
+                cost += per_unit
 
         return cost
 
@@ -1041,12 +1444,65 @@ class Plan(
         return self.sum_components(BillingTypes.ONE_TIME)
 
     @property
+    def non_prepaid_init_price(self) -> float:
+        """Activation fee excluding prepaid ONE_TIME components.
+
+        Prepaid ONE_TIME components are already accounted for in
+        get_estimate() with the duration multiplier. This avoids
+        double-counting them via init_price.
+        """
+        cached = self._cached_components()
+        if cached is not None:
+            return self._sum_prices(
+                item
+                for item in cached
+                if item.component.billing_type == BillingTypes.ONE_TIME
+                and not item.component.is_prepaid
+            )
+        components = self.components.filter(
+            component__billing_type=BillingTypes.ONE_TIME,
+            component__is_prepaid=False,
+        )
+        return (
+            components.aggregate(
+                sum=models.Sum(models.F("price") * models.F("amount"))
+            )["sum"]
+            or 0
+        )
+
+    @property
     def switch_price(self) -> float:
         return self.sum_components(BillingTypes.ON_PLAN_SWITCH)
 
     def sum_components(self, billing_type) -> float:
+        cached = self._cached_components()
+        if cached is not None:
+            return self._sum_prices(
+                item for item in cached if item.component.billing_type == billing_type
+            )
         components = self.components.filter(component__billing_type=billing_type)
-        return components.aggregate(sum=models.Sum("price"))["sum"] or 0
+        return (
+            components.aggregate(
+                sum=models.Sum(models.F("price") * models.F("amount"))
+            )["sum"]
+            or 0
+        )
+
+    def _cached_components(self):
+        """Prefetched components, or None when the caller did not prefetch.
+
+        ``.filter().aggregate()`` always issues a query, so the price
+        properties would defeat a prefetch built by
+        ``utils.get_plans_available_for_user`` and cost two queries per plan
+        during serialization.
+        """
+        return getattr(self, "_prefetched_objects_cache", {}).get("components")
+
+    @staticmethod
+    def _sum_prices(items) -> float:
+        # SUM(price * amount) skips rows where either side is NULL; treating
+        # them as zero here adds the same nothing to the total.
+        return sum((item.price or 0) * (item.amount or 0) for item in items)
 
     @property
     def has_connected_resources(self) -> bool:
@@ -1082,7 +1538,7 @@ class PlanComponent(LoggableMixin, models.Model):
 
     class Meta:
         unique_together = ("plan", "component")
-        ordering = ("component__name",)
+        ordering = ["component__name", "id"]
 
     plan = models.ForeignKey(
         on_delete=models.CASCADE, to=Plan, related_name="components"
@@ -1108,17 +1564,38 @@ class PlanComponent(LoggableMixin, models.Model):
         verbose_name=_("Price per unit for future month."),
         null=True,
     )
-    discount_threshold = models.PositiveIntegerField(
-        null=True,
+    discount_formula = models.TextField(
         blank=True,
-        help_text=_("Minimum amount to be eligible for discount."),
+        default="",
+        help_text=_(
+            "Volume discount formula evaluated with the billed quantity bound "
+            "to `usage`; returns a discount percentage (clamped to 0-100). "
+            "Empty means no discount. Example: '10 if usage >= 100 else 0'."
+        ),
     )
-    discount_rate = models.PositiveIntegerField(
-        null=True,
-        blank=True,
-        help_text=_("Discount rate in percentage."),
+    discount_aggregation = models.CharField(
+        max_length=10,
+        choices=DiscountAggregations.CHOICES,
+        default=DiscountAggregations.PER_CUSTOMER,
+        help_text=_(
+            "Whether the volume discount is computed on a single resource's "
+            "usage or aggregated across all of the customer's resources of "
+            "this offering."
+        ),
     )
     tracker = cast(FieldInstanceTracker, FieldTracker())
+
+    def get_discount_percent(self, usage) -> Decimal:
+        """Evaluate the discount formula for a billed quantity and return a
+        percentage clamped to [0, 100]. Returns 0 when no formula is set.
+
+        Raises common.formula.FormulaError on a broken formula — billing
+        callers log and skip so month close is never blocked.
+        """
+        if not self.discount_formula.strip():
+            return Decimal("0")
+        percent = common_formula.evaluate(self.discount_formula, usage=usage)
+        return max(Decimal("0"), min(Decimal("100"), percent))
 
     @property
     def has_connected_resources(self):
@@ -1192,14 +1669,74 @@ class CostEstimateMixin(models.Model):
     plan = models.ForeignKey(on_delete=models.CASCADE, to=Plan, null=True, blank=True)
     limits = models.JSONField(blank=True, default=dict)
 
+    def _get_cost_dates(self):
+        """Return (start_date, end_date) for prepaid duration calculation."""
+        start_date = getattr(self, "start_date", None) or timezone.now().date()
+        end_date = getattr(self, "end_date", None)
+        return start_date, end_date
+
+    def _prepaid_duration_months(self):
+        """The subscription's length, where whoever created this recorded one.
+
+        A proposal stores it on the request and it travels here with the rest of
+        the attributes, which lets the cost be exact before the dates are.
+        """
+        # getattr, as _get_cost_dates does for start_date: not every model that
+        # estimates a cost carries attributes.
+        attributes = getattr(self, "attributes", None) or {}
+        try:
+            months = int(attributes.get("prepaid_duration_months") or 0)
+        except (TypeError, ValueError):
+            return None
+        return months if months > 0 else None
+
     def init_cost(self):
         if not self.plan:
             return
-        try:
-            self.cost = self.plan.get_estimate(self.limits)
-        except PolicyException:
-            self.set_state_erred()
-            self.error_message = "Policy is violated."
+        start_date, end_date = self._get_cost_dates()
+        self.cost = self.plan.get_estimate(
+            self.limits, start_date, end_date, self._prepaid_duration_months()
+        )
+
+        # Proactive policy validation for new resources. PolicyException is
+        # a DRF ValidationError, so letting it propagate yields HTTP 400
+        # from OrderCreateSerializer.create and rolls back the transaction.
+        if self._should_validate_cost_policies():
+            self._validate_project_cost_policies()
+
+    def _should_validate_cost_policies(self):
+        """
+        Determine if we should proactively validate cost policies.
+
+        Returns True only for NEW Resource instances (not Orders, not updates).
+        """
+
+        # Only validate for Resource instances, not Order instances
+        if not isinstance(self, Resource):
+            return False
+
+        # Only validate for new resources (pk is None before first save)
+        if self.pk is not None:
+            return False
+
+        # Must have a calculated cost to validate
+        if self.cost is None:
+            return False
+
+        return True
+
+    def _validate_project_cost_policies(self):
+        """
+        Emit signal to allow external modules to validate resource creation.
+
+        This prevents the first resource from bypassing cost limits when policy.has_fired=False.
+        External modules (e.g., policy) can subscribe to this signal and raise PolicyException.
+        """
+        # Emit signal with resource and cost information
+        # External validators (policy module) can raise PolicyException
+        signals.resource_creation_validation.send(
+            sender=self.__class__, resource=self, cost=self.cost
+        )
 
 
 class SafeAttributesMixin(models.Model):
@@ -1263,9 +1800,26 @@ class ResourceDetailsMixin(
         null=True,
         related_name="+",
     )
+    end_date_updated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=_("Timestamp of the last end_date change."),
+    )
+
+
+# Resource.slug is a SlugField (max_length 50). When slug generation is customized
+# on the offering (via a slug template or a custom length), the slug is bounded by
+# this value to leave room for a uniqueness suffix appended on collisions.
+RESOURCE_SLUG_MAX_LENGTH = 40
+
+# Upper bound on how far a {counter} slug template will advance its counter while
+# searching for a free slug. Bounded so a pathological offering cannot loop forever;
+# beyond it we fall back to suffix-based uniqueness.
+MAX_SLUG_COUNTER_ATTEMPTS = 10000
 
 
 class Resource(
+    PermissionMixin,
     ResourceDetailsMixin,
     core_models.UuidMixin,
     core_models.BackendMixin,
@@ -1302,7 +1856,6 @@ class Resource(
     quotas: models.Manager["ComponentQuota"]
     usages: models.Manager["ComponentUsage"]
     endpoints: models.Manager["ResourceAccessEndpoint"]
-    users: models.Manager["ResourceUser"]
     get_state_display: Callable[[], str]
 
     class States(ResourceStates):
@@ -1314,7 +1867,7 @@ class Resource(
         list_permission = PermissionEnum.LIST_RESOURCES
 
     class Meta:
-        ordering = ["created"]
+        ordering = ["created", "id"]
         unique_together = ("content_type", "object_id")
         indexes = [
             Index(fields=["offering", "state"], name="mp_resource_offering_state_idx"),
@@ -1332,7 +1885,13 @@ class Resource(
     )
     report = models.JSONField(blank=True, null=True)
     options = models.JSONField(blank=True, null=True)
-    current_usages = models.JSONField(blank=True, default=dict)
+    current_usages = models.JSONField(
+        blank=True,
+        default=dict,
+        help_text="Dictionary mapping component types to their current usage amounts. "
+        "For usage-based and limit-based components, it stores the most recent reported amounts or consumed quotas. "
+        "Populated by backend synchronization tasks or explicit usage reports.",
+    )
     tracker = cast(FieldInstanceTracker, FieldTracker())
     objects = managers.ResourceManager()
     # Effective ID is used when resource is provisioned through remote Waldur
@@ -1340,6 +1899,18 @@ class Resource(
     downscaled = models.BooleanField(default=False)
     restrict_member_access = models.BooleanField(default=False)
     paused = models.BooleanField(default=False)
+    usage_limit_restriction = models.CharField(
+        max_length=10,
+        blank=True,
+        default="",
+        choices=UsageLimitAction.FLAG_CHOICES,
+        help_text=(
+            "Which restriction (paused or downscaled) was automatically applied "
+            "because reported usage reached a component limit. Empty when no such "
+            "restriction is active. Used so the automatic lift never clears a "
+            "restriction that was set for another reason."
+        ),
+    )
 
     NON_LOGGABLE_FIELDS = (
         "modified",
@@ -1355,6 +1926,151 @@ class Resource(
         "current_usages",
     )
 
+    def save(self, *args, **kwargs):
+        end_date_changed = not self._state.adding and self.tracker.has_changed(
+            "end_date"
+        )
+        super().save(*args, **kwargs)
+        if end_date_changed:
+            Resource.objects.filter(pk=self.pk).update(
+                end_date_updated_at=timezone.now()
+            )
+
+    def generate_slug(self):
+        plugin_options = (
+            (self.offering.plugin_options or {}) if self.offering_id else {}
+        )
+        template = plugin_options.get("resource_slug_template")
+        if template:
+            return self._generate_template_slug(template)
+        max_length = plugin_options.get("resource_slug_max_length")
+        if max_length:
+            return self._generate_name_slug(max_length)
+        return super().generate_slug()
+
+    def _generate_name_slug(self, max_length):
+        try:
+            max_length = int(max_length)
+        except (TypeError, ValueError):
+            return super().generate_slug()
+        max_length = max(1, min(max_length, RESOURCE_SLUG_MAX_LENGTH))
+        base_slug = core_models.clean_slug_hyphens(
+            slugify(self.name)[:max_length]
+        ).strip("-")
+        if not base_slug:
+            return super().generate_slug()
+        return self._ensure_slug_unique(base_slug)
+
+    def _generate_template_slug(self, template):
+        context = self._get_slug_context()
+
+        # Templates that embed a {counter}/{counter_padded} get their counter
+        # advanced until the rendered slug is unique. This keeps a single, clean
+        # counter (e.g. ``proj-32``) instead of letting _ensure_slug_unique append
+        # a second one (``proj-2-31``) when the count-based starting counter lands
+        # on a slug that already exists (e.g. after resource churn). For non-counter
+        # templates there is no counter to advance, so we fall back to the
+        # suffix-based uniqueness used elsewhere.
+        if "{counter}" in template or "{counter_padded}" in template:
+            return self._generate_counter_template_slug(template, context)
+
+        try:
+            raw_slug = template.format(**context)
+        except (KeyError, ValueError) as e:
+            logger.error(
+                "Failed to format resource slug template '%s' for offering %s: %s. "
+                "Falling back to default slug generation.",
+                template,
+                self.offering_id,
+                e,
+            )
+            return super().generate_slug()
+
+        base_slug = self._clean_template_slug(raw_slug)
+        if not base_slug:
+            return super().generate_slug()
+        return self._ensure_slug_unique(base_slug)
+
+    def _generate_counter_template_slug(self, template, context):
+        counter = self._calculate_slug_counter()
+        last_slug = ""
+        for _attempt in range(MAX_SLUG_COUNTER_ATTEMPTS):
+            local_context = dict(context)
+            local_context["counter"] = str(counter)
+            local_context["counter_padded"] = f"{counter:03d}"
+            try:
+                raw_slug = template.format(**local_context)
+            except (KeyError, ValueError) as e:
+                logger.error(
+                    "Failed to format resource slug template '%s' for offering %s: %s. "
+                    "Falling back to default slug generation.",
+                    template,
+                    self.offering_id,
+                    e,
+                )
+                return super().generate_slug()
+            base_slug = self._clean_template_slug(raw_slug)
+            if not base_slug:
+                return super().generate_slug()
+            if (
+                not Resource.objects.filter(slug=base_slug)
+                .exclude(pk=self.pk if self.pk else None)
+                .exists()
+            ):
+                return base_slug
+            last_slug = base_slug
+            counter += 1
+        # Exhausted the counter window — fall back to suffix-based uniqueness so a
+        # slug is still produced (degenerate templates with no {counter} variation).
+        return self._ensure_slug_unique(last_slug)
+
+    def _clean_template_slug(self, raw_slug):
+        return core_models.clean_slug_hyphens(slugify(raw_slug))[
+            :RESOURCE_SLUG_MAX_LENGTH
+        ].strip("-")
+
+    def _get_slug_context(self):
+        now = timezone.now()
+        counter = self._calculate_slug_counter()
+        return {
+            "customer_slug": self.project.customer.slug if self.project_id else "",
+            "project_slug": self.project.slug if self.project_id else "",
+            "project_name": slugify(self.project.name) if self.project_id else "",
+            "offering_slug": self.offering.slug if self.offering_id else "",
+            "year": now.strftime("%Y"),
+            "month": now.strftime("%m"),
+            "counter": str(counter),
+            "counter_padded": f"{counter:03d}",
+        }
+
+    def _calculate_slug_counter(self):
+        existing_count = (
+            Resource.objects.filter(project=self.project, offering=self.offering)
+            .exclude(pk=self.pk if self.pk else None)
+            .count()
+        )
+        return existing_count + 1
+
+    def _ensure_slug_unique(self, base_slug):
+        existing_slugs = Resource.objects.filter(
+            slug__startswith=base_slug
+        ).values_list("slug", flat=True)
+
+        if base_slug not in existing_slugs:
+            return base_slug
+
+        max_num = 1
+        for slug in existing_slugs:
+            if slug == base_slug:
+                continue
+            try:
+                num = int(slug.split("-")[-1])
+                if num > max_num:
+                    max_num = num
+            except ValueError:
+                pass
+        return f"{base_slug}-{max_num + 1}"
+
     @property
     def customer(self) -> structure_models.Customer:
         return self.project.customer
@@ -1365,6 +2081,14 @@ class Resource(
         target=States.OK,
     )
     def set_state_ok(self):
+        pass
+
+    @transition(
+        field=state,
+        source=[States.TERMINATED, States.ERRED],
+        target=States.CREATING,
+    )
+    def set_state_creating(self):
         pass
 
     @transition(field=state, source="*", target=States.ERRED)
@@ -1435,6 +2159,28 @@ class Resource(
             return False
         return self.end_date <= timezone.datetime.today().date()
 
+    @property
+    def effective_end_date(self) -> datetime.date | None:
+        """The date this resource is actually scheduled to terminate: the earliest
+        of its own end date and the project-driven termination date. The project
+        date is the raw project end date when the offering disables the grace
+        period, otherwise the effective (with-grace) end date."""
+        project = self.project
+        project_date = None
+        if project and project.end_date:
+            # Reflects this resource's own offering flag. A child resource whose
+            # parent offering (rather than its own) disables the grace period
+            # terminates with its parent on the raw date; that edge case is not
+            # reflected here.
+            if (self.offering.plugin_options or {}).get("disable_grace_period"):
+                project_date = project.end_date
+            else:
+                project_date = project.end_date_with_grace
+        candidates = [
+            date for date in (self.end_date, project_date) if date is not None
+        ]
+        return min(candidates) if candidates else None
+
     def __str__(self):
         if self.name:
             return f"{self.name} ({self.offering.name})"
@@ -1445,19 +2191,11 @@ class Resource(
 
     @property
     def creation_order(self) -> "Order | None":
-        return Order.objects.filter(resource=self, type=OrderTypes.CREATE).first()
+        return self.order_set.filter(type=OrderTypes.CREATE).first()
 
     @property
-    def order_in_progress(self):
-        order_in_progress = Order.objects.filter(
-            resource=self,
-            state__in=[
-                OrderStates.PENDING_CONSUMER,
-                OrderStates.PENDING_PROVIDER,
-                OrderStates.EXECUTING,
-            ],
-        ).first()
-        return order_in_progress
+    def order_in_progress(self) -> "Order | None":
+        return self.order_set.filter(state__in=OrderStates.PENDING_STATES).first()
 
     def get_prepaid_balance(
         self, offering_component: "OfferingComponent", excluded_ids: list | None = None
@@ -1556,13 +2294,13 @@ class Resource(
         """
         Calculates the cost for renewing a prepaid resource.
 
-        The cost is based on the plan's pricing for the prepaid components.
-        It supports both simple extensions and upgrades (increasing limits).
+        Uses the same pricing logic as Plan.get_estimate: for each prepaid
+        component, cost = price × limit / factor × months.
 
         Args:
-            extension_months (int): The number of months to extend the subscription by.
-            new_limits (dict, optional): A dictionary of new limits. If provided,
-                                         the cost will reflect the upgraded capacity.
+            extension_months: Number of months to extend the subscription.
+            new_limits: New limits for the renewal period. Defaults to
+                current resource limits.
 
         Returns:
             Decimal: The total calculated cost for the renewal.
@@ -1570,27 +2308,236 @@ class Resource(
         if not self.plan:
             return Decimal("0.0")
 
-        total_cost = Decimal("0.0")
         final_limits = new_limits or self.limits
 
-        # Find all prepaid components in the plan and sum their renewal costs
-        for plan_component in self.plan.components.filter(component__is_prepaid=True):
-            component = plan_component.component
-            if not component:
+        # Compute prepaid cost for the extension period.
+        # Use a synthetic date range so calculate_duration_months returns
+        # exactly extension_months.
+        start_date = timezone.now().date()
+        end_date = start_date + relativedelta(months=extension_months)
+
+        total = Decimal("0.0")
+        components_map = self.offering.get_limit_components()
+        component_prices = {
+            c.component.type: c.price for c in self.plan.components.all()
+        }
+        factors = self.offering.component_factors
+
+        for key, component in components_map.items():
+            if not component.is_prepaid:
                 continue
+            price = component_prices.get(key, 0)
+            limit = final_limits.get(key, 0)
+            factor = factors.get(key, 1)
 
-            # The price in a ONE_TIME prepaid component is typically per period (e.g., per month).
-            # We multiply this base price by the limit and the number of extension months.
-            # Example: Plan price is $10/GB/month.
-            # Renewal: 100GB for 12 months = 10 * 100 * 12 = $12,000
+            months = core_utils.calculate_duration_months(start_date, end_date)
+            total += (
+                Decimal(str(price))
+                * Decimal(str(limit))
+                / Decimal(str(factor))
+                * months
+            )
 
-            # This assumes a simple linear pricing model.
-            # For complex pricing, this logic would need to be more sophisticated.
-            limit_amount = final_limits.get(component.type, 0)
-            component_cost = plan_component.price * limit_amount * extension_months
-            total_cost += component_cost
+        return total
 
-        return total_cost
+    def get_renewal_estimate(
+        self, extension_months: int, new_limits: dict | None = None
+    ) -> dict:
+        """
+        Returns a detailed cost breakdown for renewal including prepaid
+        subscription components and limit-based component changes.
+        """
+        components = []
+        subscription_total = Decimal("0.0")
+        limit_change_total = Decimal("0.0")
+        final_limits = new_limits or self.limits
+
+        # Calculate new end date
+        current_end_date = self.end_date or timezone.now().date()
+        if current_end_date < timezone.now().date():
+            current_end_date = timezone.now().date()
+        new_end_date = current_end_date + relativedelta(months=extension_months)
+        remaining_days = (new_end_date - timezone.now().date()).days
+
+        if self.plan:
+            component_factors = self.offering.component_factors
+
+            # 1. Subscription items (prepaid components)
+            for plan_component in self.plan.components.filter(
+                component__is_prepaid=True
+            ):
+                component = plan_component.component
+                if not component:
+                    continue
+                limit_amount = Decimal(str(final_limits.get(component.type, 0)))
+                factor = Decimal(str(component_factors.get(component.type, 1)))
+                display_amount = limit_amount / factor
+                current_limit = Decimal(str(self.limits.get(component.type, 0)))
+                current_display = current_limit / factor
+                total = plan_component.price * display_amount * extension_months
+                components.append(
+                    {
+                        "component_type": component.type,
+                        "component_name": component.name,
+                        "billing_type": "prepaid",
+                        "billing_period": None,
+                        "current_limit": current_display,
+                        "new_limit": display_amount,
+                        "unit_price": plan_component.price,
+                        "measured_unit": component.measured_unit or "",
+                        "period_description": f"{extension_months} months",
+                        "total": total,
+                    }
+                )
+                subscription_total += total
+
+            # 2. Limit change items (billing_type='limit', where new_limit > current_limit)
+            for plan_component in self.plan.components.filter(
+                component__billing_type=BillingTypes.LIMIT,
+                component__is_prepaid=False,
+            ):
+                component = plan_component.component
+                if not component:
+                    continue
+
+                current_limit = self.limits.get(component.type, 0)
+                new_limit = final_limits.get(component.type, 0)
+                delta = new_limit - current_limit
+
+                if delta <= 0:
+                    continue
+
+                # Skip components with no periodic billing
+                limit_period = component.limit_period
+                if not limit_period or limit_period == LimitPeriods.TOTAL:
+                    continue
+
+                billing_period_days = {
+                    LimitPeriods.MONTH: 30,
+                    LimitPeriods.QUARTERLY: 91,
+                    LimitPeriods.ANNUAL: 365,
+                }.get(limit_period)
+
+                if not billing_period_days:
+                    continue
+
+                total = (
+                    plan_component.price * delta * remaining_days / billing_period_days
+                )
+
+                period_label = {
+                    LimitPeriods.MONTH: "mo",
+                    LimitPeriods.QUARTERLY: "qtr",
+                    LimitPeriods.ANNUAL: "yr",
+                }.get(limit_period, limit_period)
+
+                components.append(
+                    {
+                        "component_type": component.type,
+                        "component_name": component.name,
+                        "billing_type": "limit",
+                        "billing_period": limit_period,
+                        "current_limit": current_limit,
+                        "new_limit": new_limit,
+                        "unit_price": plan_component.price,
+                        "measured_unit": component.measured_unit or "",
+                        "period_description": f"{remaining_days}d / {billing_period_days}d ({period_label})",
+                        "total": total,
+                    }
+                )
+                limit_change_total += total
+
+        return {
+            "components": components,
+            "subscription_total": subscription_total,
+            "limit_change_total": limit_change_total,
+            "total": subscription_total + limit_change_total,
+            "remaining_days": remaining_days,
+            "new_end_date": new_end_date,
+        }
+
+
+class AccessSubnetOfferingScope(core_models.UuidMixin, LoggableMixin):
+    """Marks one of an organization's access subnets as applying to an offering.
+
+    The address, its description and its provenance live on
+    ``structure.AccessSubnet``; this table only records which offerings that
+    single entry is trusted for. Splitting it this way keeps the address list
+    unified for the consumer while leaving ``structure`` with no knowledge of
+    the marketplace — the dependency points this way only.
+
+    The scope applies to every resource the customer holds of the offering,
+    including ones created later. By default it is advisory metadata exported
+    for external firewalls guarding the backend entities those resources map to
+    (e.g. S3 buckets); Waldur does not act on it. If the offering enables the
+    ``conceal_subnet_restricted_resources`` plugin option, Waldur additionally
+    hides the customer's resources of that offering from the consumer API for
+    callers whose address is in none of the scoped subnets.
+
+    Only offerings that opt in via ``enable_resource_access_subnets`` and that
+    the customer actually consumes may be scoped; both rules are enforced in the
+    serializer.
+    """
+
+    access_subnet = models.ForeignKey(
+        structure_models.AccessSubnet,
+        on_delete=models.CASCADE,
+        # No reverse accessor, so no marketplace-shaped attribute hangs off a
+        # structure model. Callers that need an entry's offerings query this
+        # table directly.
+        related_name="+",
+    )
+    offering = models.ForeignKey(
+        Offering, on_delete=models.CASCADE, related_name="access_subnet_scopes"
+    )
+    tracker = cast(FieldInstanceTracker, FieldTracker())
+    # The concealment filter reaches the address through this table
+    # (access_subnet__inet__net_contains_or_equals), so the netfields lookups
+    # must be available from here as well.
+    objects = NetManager()
+
+    class Meta:
+        unique_together = ("access_subnet", "offering")
+        ordering = ["offering__name", "id"]
+
+    def __str__(self):
+        return f"{self.access_subnet} | {self.offering.name}"
+
+    def get_log_fields(self):
+        return "access_subnet", "offering"
+
+
+class OfferingAccessSubnet(
+    core_models.UuidMixin, core_models.DescribableMixin, LoggableMixin
+):
+    """
+    Provider-defined default access subnets for an offering.
+
+    Unlike the consumer's own access subnets (curated by them, single-host
+    unless staff widens them), these are CIDR segments of any width defined by
+    the service provider. They are shown read-only to consumers alongside their
+    own subnets, count toward the consumer-API concealment allow-list, and are
+    included in the exported firewall allow-list.
+    """
+
+    offering = models.ForeignKey(
+        Offering, on_delete=models.CASCADE, related_name="default_access_subnets"
+    )
+    inet = CidrAddressField(null=True, blank=True)
+    tracker = cast(FieldInstanceTracker, FieldTracker())
+    # NetManager enables the netfields network lookups (e.g.
+    # inet__net_contains_or_equals) used by the consumer-API concealment filter.
+    objects = NetManager()
+
+    class Meta:
+        unique_together = ("offering", "inet")
+        ordering = ["inet", "id"]
+
+    def __str__(self):
+        return self.offering.name + " | " + str(self.inet)
+
+    def get_log_fields(self):
+        return "description", "inet", "offering"
 
 
 class ResourcePlanPeriod(TimeStampedModel, TimeFramedModel, core_models.UuidMixin):
@@ -1653,15 +2600,18 @@ class Order(
         default=OrderStates.PENDING_CONSUMER, choices=OrderStates.CHOICES
     )
     output = models.TextField(blank=True)
+    output_updated_at = models.DateTimeField(editable=False, null=True, blank=True)
+    error_updated_at = models.DateTimeField(editable=False, null=True, blank=True)
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
     created_by = models.ForeignKey(
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
         to=core_models.User,
         related_name="+",
+        null=True,
     )
     consumer_reviewed_by = models.ForeignKey(
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
         to=core_models.User,
         blank=True,
         null=True,
@@ -1669,7 +2619,7 @@ class Order(
     )
     consumer_reviewed_at = models.DateTimeField(editable=False, null=True, blank=True)
     provider_reviewed_by = models.ForeignKey(
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
         to=core_models.User,
         blank=True,
         null=True,
@@ -1693,6 +2643,47 @@ class Order(
         null=True,
         validators=[FileTypeValidator(allowed_types=["application/pdf"])],
     )
+
+    # Provider-to-consumer communication
+    provider_message = models.TextField(blank=True, default="")
+    provider_message_url = models.URLField(blank=True, default="")
+    provider_message_attachment = models.FileField(
+        upload_to="marketplace_order_provider_attachments",
+        blank=True,
+        null=True,
+        validators=[FileTypeValidator(allowed_types=["application/pdf"])],
+    )
+
+    provider_message_updated_at = models.DateTimeField(
+        editable=False, null=True, blank=True
+    )
+
+    # Consumer-to-provider response
+    consumer_message = models.TextField(blank=True, default="")
+    consumer_message_attachment = models.FileField(
+        upload_to="marketplace_order_consumer_attachments",
+        blank=True,
+        null=True,
+        validators=[FileTypeValidator(allowed_types=["application/pdf"])],
+    )
+    consumer_message_updated_at = models.DateTimeField(
+        editable=False, null=True, blank=True
+    )
+
+    consumer_rejection_comment = models.TextField(blank=True, default="")
+    provider_rejection_comment = models.TextField(blank=True, default="")
+
+    auto_approved_by_rule = models.ForeignKey(
+        "ProjectOrderAutoApproval",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="approved_orders",
+    )
+    auto_approved_cost_limit_snapshot = models.DecimalField(
+        max_digits=22, decimal_places=10, null=True, blank=True
+    )
+
     get_type_display: Callable[[], str]
 
     class Permissions:
@@ -1702,18 +2693,75 @@ class Order(
 
     class Meta:
         verbose_name = _("Order")
-        ordering = ("created",)
+        ordering = ["created", "id"]
         indexes = [
             Index(fields=["state", "-created"], name="mp_order_state_created_idx"),
+            # Media downloads resolve an attachment back to its order by
+            # storage path. Partial, because the overwhelming majority of
+            # orders carry no attachment.
+            Index(
+                fields=["attachment"],
+                name="mp_order_attachment_idx",
+                condition=Q(attachment__isnull=False),
+            ),
+            Index(
+                fields=["provider_message_attachment"],
+                name="mp_order_provider_att_idx",
+                condition=Q(provider_message_attachment__isnull=False),
+            ),
+            Index(
+                fields=["consumer_message_attachment"],
+                name="mp_order_consumer_att_idx",
+                condition=Q(consumer_message_attachment__isnull=False),
+            ),
         ]
+
+    def _get_cost_dates(self):
+        """Return (start_date, end_date) for prepaid duration calculation.
+
+        For orders, end_date comes from the resource or order attributes.
+        """
+        start_date = self.start_date or timezone.now().date()
+        end_date = None
+        if self.resource_id and self.resource and self.resource.end_date:
+            end_date = self.resource.end_date
+        elif self.attributes.get("end_date"):
+            try:
+                end_date = datetime.date.fromisoformat(self.attributes["end_date"])
+            except (ValueError, TypeError):
+                pass
+        return start_date, end_date
 
     def init_cost(self):
         super().init_cost()
         if self.plan:
             if self.type == OrderTypes.CREATE:
-                self.cost += self.plan.init_price
+                self.cost += self.plan.non_prepaid_init_price
             elif self.type == OrderTypes.UPDATE:
                 self.cost += self.plan.switch_price
+        # Pre-flight check for UPDATE / plan-switch orders. CREATE orders are
+        # validated at Resource.init_cost; here we cover the case where an
+        # existing resource is scaled up or moved to a more expensive plan
+        # and the increase would push the customer/project/offering over a
+        # cost policy limit [HPCMP-484].
+        self._validate_update_cost_policies()
+
+    def _validate_update_cost_policies(self):
+        if self.pk is not None:
+            return
+        if self.type != OrderTypes.UPDATE or not self.resource_id:
+            return
+        if self.cost is None:
+            return
+        old_cost = self.resource.cost or 0
+        delta = self.cost - old_cost
+        if delta <= 0:
+            return
+        signals.resource_creation_validation.send(
+            sender=type(self.resource),
+            resource=self.resource,
+            cost=delta,
+        )
 
     @property
     def fixed_price(self) -> float:
@@ -1722,9 +2770,35 @@ class Order(
         return 0
 
     @property
+    def old_cost_estimate(self) -> float:
+        if "old_limits" not in self.attributes:
+            return 0
+        plan = self.old_plan or self.plan
+        if not plan:
+            return 0
+
+        # For renewals, include the old subscription duration
+        start_date = None
+        end_date = None
+        old_end_date_str = self.attributes.get("old_end_date")
+        if old_end_date_str:
+            try:
+                end_date = datetime.date.fromisoformat(old_end_date_str)
+            except (ValueError, TypeError):
+                pass
+        if end_date and self.resource_id and self.resource:
+            start_date = (
+                self.resource.created.date()
+                if hasattr(self.resource.created, "date")
+                else self.resource.created
+            )
+
+        return plan.get_estimate(self.attributes["old_limits"], start_date, end_date)
+
+    @property
     def activation_price(self) -> float:
         if self.type == OrderTypes.CREATE:
-            return self.plan.init_price
+            return self.plan.non_prepaid_init_price
         elif self.type == OrderTypes.UPDATE:
             return self.plan.switch_price
         return 0
@@ -1794,6 +2868,66 @@ class Order(
     def set_state_erred(self):
         pass
 
+    def save(self, *args, **kwargs):
+        # Track the latest updates for output and error details explicitly.
+        update_fields = kwargs.get("update_fields")
+        normalized_update_fields = (
+            set(update_fields) if update_fields is not None else None
+        )
+
+        output_changed = self.pk and self.tracker.has_changed("output")
+        error_message_changed = self.pk and self.tracker.has_changed("error_message")
+        error_traceback_changed = self.pk and self.tracker.has_changed(
+            "error_traceback"
+        )
+        provider_message_changed = self.pk and any(
+            self.tracker.has_changed(field)
+            for field in (
+                "provider_message",
+                "provider_message_url",
+                "provider_message_attachment",
+            )
+        )
+        consumer_message_changed = self.pk and any(
+            self.tracker.has_changed(field)
+            for field in ("consumer_message", "consumer_message_attachment")
+        )
+        if output_changed or error_message_changed or error_traceback_changed:
+            now = timezone.now()
+            if output_changed:
+                self.output_updated_at = now
+            if error_message_changed or error_traceback_changed:
+                self.error_updated_at = now
+
+            if normalized_update_fields is not None:
+                if output_changed:
+                    normalized_update_fields.add("output")
+                    normalized_update_fields.add("output_updated_at")
+                if error_message_changed:
+                    normalized_update_fields.add("error_message")
+                if error_traceback_changed:
+                    normalized_update_fields.add("error_traceback")
+                if error_message_changed or error_traceback_changed:
+                    normalized_update_fields.add("error_updated_at")
+
+        if provider_message_changed or consumer_message_changed:
+            now = timezone.now()
+            if provider_message_changed:
+                self.provider_message_updated_at = now
+            if consumer_message_changed:
+                self.consumer_message_updated_at = now
+
+            if normalized_update_fields is not None:
+                if provider_message_changed:
+                    normalized_update_fields.add("provider_message_updated_at")
+                if consumer_message_changed:
+                    normalized_update_fields.add("consumer_message_updated_at")
+
+        if normalized_update_fields is not None:
+            kwargs["update_fields"] = list(normalized_update_fields)
+
+        super().save(*args, **kwargs)
+
     def get_log_fields(self):
         return (
             "uuid",
@@ -1813,10 +2947,43 @@ class Order(
             "consumer_reviewed_at",
             "provider_reviewed_by",
             "provider_reviewed_at",
+            "output_updated_at",
+            "error_updated_at",
         )
 
     def __str__(self):
         return f"UUID: {self.uuid}, type: {self.get_type_display()}, offering: {self.offering}, created_by: {self.created_by}"
+
+
+class ProjectOrderAutoApproval(
+    core_models.UuidMixin,
+    TimeStampedModel,
+):
+    project = models.OneToOneField(
+        structure_models.Project,
+        on_delete=models.CASCADE,
+        related_name="order_auto_approval",
+    )
+    monthly_cost_limit = models.DecimalField(
+        max_digits=22, decimal_places=10, validators=[MinValueValidator(Decimal("0"))]
+    )
+    enabled = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    modified_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+
+    class Permissions:
+        customer_path = "project__customer"
+        project_path = "project"
+
+    class Meta:
+        verbose_name = _("Project order auto-approval")
+
+    def __str__(self):
+        return f"Auto-approval for {self.project} (limit={self.monthly_cost_limit}, enabled={self.enabled})"
 
 
 class ComponentQuota(TimeStampedModel):
@@ -1855,8 +3022,8 @@ class ComponentUsage(
     Detailed usage tracking for resource components.
 
     Tracks component usage with billing period and plan period associations.
-    Supports recurring usage patterns and provides detailed consumption
-    data for billing and reporting.
+    Each row carries a missing-usage policy telling Waldur what to record for
+    the following billing period if the provider reports nothing.
     """
 
     resource = models.ForeignKey(
@@ -1875,14 +3042,21 @@ class ComponentUsage(
         null=True,
     )
     billing_period = models.DateField()
-    recurring = models.BooleanField(
-        default=False, help_text="Reported value is reused every month until changed."
+    missing_usage_policy = models.CharField(
+        max_length=10,
+        choices=MissingUsagePolicies.CHOICES,
+        default=MissingUsagePolicies.NONE,
+        help_text="What to record when no usage is reported for the following billing period.",
     )
     modified_by = models.ForeignKey[User](
         to=User, related_name="+", blank=True, null=True, on_delete=models.SET_NULL
     )
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
+
+    class Permissions:
+        customer_path = ["resource__project__customer", "resource__offering__customer"]
+        project_path = "resource__project"
 
     class Meta:
         constraints = [
@@ -1905,6 +3079,53 @@ class ComponentUsage(
 
     def get_log_fields(self):
         return ("uuid", "description", "usage", "date", "resource", "component")
+
+
+class ComponentUsagePollRecord(models.Model):
+    """Tracks the latest usage poll state per resource+component for staff debugging.
+
+    One row per (resource, component) — upserted on each poll.
+    Replaces Django cache for last_poll_time tracking and provides
+    staff observability into usage-based billing accumulation.
+    """
+
+    resource = models.ForeignKey(
+        Resource, on_delete=models.CASCADE, related_name="usage_poll_records"
+    )
+    component = models.ForeignKey(OfferingComponent, on_delete=models.CASCADE)
+    last_poll_time = models.DateTimeField(
+        help_text="When this resource+component was last polled."
+    )
+    raw_usage = models.DecimalField(
+        max_digits=20,
+        decimal_places=2,
+        help_text="Raw value from the backend API at last poll.",
+    )
+    elapsed_hours = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        help_text="Hours since previous poll (capped at 24h).",
+    )
+    increment = models.DecimalField(
+        max_digits=20,
+        decimal_places=2,
+        help_text="raw_usage × elapsed_hours added to the running total.",
+    )
+    accumulated_total = models.DecimalField(
+        max_digits=20,
+        decimal_places=2,
+        help_text="Running total for the current billing period.",
+    )
+    billing_period = models.DateField(help_text="Month this accumulation belongs to.")
+
+    class Meta:
+        unique_together = ("resource", "component")
+
+    def __str__(self):
+        return (
+            f"{self.resource.name} / {self.component.type}: "
+            f"last_poll={self.last_poll_time}, total={self.accumulated_total}"
+        )
 
 
 class ComponentUserUsage(
@@ -1932,6 +3153,13 @@ class ComponentUserUsage(
     username = models.CharField(max_length=100)
     component_usage = models.ForeignKey(ComponentUsage, on_delete=models.CASCADE)
     usage = models.DecimalField(default=0, decimal_places=2, max_digits=20)
+
+    class Permissions:
+        customer_path = [
+            "component_usage__resource__project__customer",
+            "component_usage__resource__offering__customer",
+        ]
+        project_path = "component_usage__resource__project"
 
     class Meta:
         unique_together = ("username", "component_usage")
@@ -1965,6 +3193,33 @@ class ComponentUserUsageLimit(
     class Permissions:
         customer_path = ["resource__project__customer", "resource__offering__customer"]
         project_path = "resource__project"
+
+
+class ComponentUsageMonthly(models.Model):
+    """
+    Denormalized reporting table summarizing component usage and limits per month.
+    """
+
+    component = models.ForeignKey(
+        "OfferingComponent", on_delete=models.CASCADE, related_name="monthly_summaries"
+    )
+    billing_period = models.DateField(
+        help_text="Always the first day of the month (e.g., 2023-10-01)"
+    )
+
+    # Pre-calculated aggregations
+    total_consumed = models.DecimalField(max_digits=20, decimal_places=2, default=0)
+    total_allocated = models.DecimalField(max_digits=20, decimal_places=2, default=0)
+    usage_percent = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True
+    )
+
+    class Meta:
+        ordering = ["-billing_period", "id"]
+        unique_together = ("component", "billing_period")
+        indexes = [
+            models.Index(fields=["billing_period", "component"]),
+        ]
 
 
 class OfferingFile(
@@ -2021,6 +3276,15 @@ class OfferingUser(
         default=OfferingUserStates.CREATION_REQUESTED,
         choices=OfferingUserStates.CHOICES,
     )
+    runtime_state = models.CharField(
+        max_length=50,
+        default=OfferingUserRuntimeStates.ACTIVE,
+        choices=OfferingUserRuntimeStates.CHOICES,
+        help_text=_(
+            "Operational/access state of the user account. "
+            "Separate from lifecycle state; can be set by the service provider at any time."
+        ),
+    )
     service_provider_comment = models.TextField(
         blank=True,
         help_text=_(
@@ -2039,6 +3303,7 @@ class OfferingUser(
             fields=[
                 "username",
                 "state",
+                "runtime_state",
                 "is_restricted",
                 "service_provider_comment",
                 "service_provider_comment_url",
@@ -2048,7 +3313,7 @@ class OfferingUser(
 
     class Meta:
         unique_together = ("offering", "user")
-        ordering = ["username"]
+        ordering = ["username", "id"]
         indexes = [
             Index(fields=["offering", "user"], name="mp_offeringuser_offer_user_idx"),
         ]
@@ -2069,10 +3334,12 @@ class OfferingUser(
         source=[
             OfferingUserStates.CREATION_REQUESTED,
             OfferingUserStates.CREATING,
-            OfferingUserStates.PENDING_ADDITIONAL_VALIDATION,
             OfferingUserStates.PENDING_ACCOUNT_LINKING,
+            OfferingUserStates.PENDING_ADDITIONAL_VALIDATION,
             OfferingUserStates.ERROR_CREATING,
             OfferingUserStates.ERROR_DELETING,
+            OfferingUserStates.DELETION_REQUESTED,
+            OfferingUserStates.DELETING,
         ],
         target=OfferingUserStates.OK,
     )
@@ -2081,24 +3348,32 @@ class OfferingUser(
 
     @transition(
         field=state,
-        source=[OfferingUserStates.CREATING, OfferingUserStates.ERROR_CREATING],
+        source=[
+            OfferingUserStates.CREATING,
+            OfferingUserStates.ERROR_CREATING,
+            OfferingUserStates.PENDING_ACCOUNT_LINKING,
+        ],
         target=OfferingUserStates.PENDING_ADDITIONAL_VALIDATION,
     )
     def set_pending_additional_validation(self, comment=None, comment_url=None):
-        if comment:
+        if comment is not None:
             self.service_provider_comment = comment
-        if comment_url:
+        if comment_url is not None:
             self.service_provider_comment_url = comment_url
 
     @transition(
         field=state,
-        source=[OfferingUserStates.CREATING, OfferingUserStates.ERROR_CREATING],
+        source=[
+            OfferingUserStates.CREATING,
+            OfferingUserStates.ERROR_CREATING,
+            OfferingUserStates.PENDING_ADDITIONAL_VALIDATION,
+        ],
         target=OfferingUserStates.PENDING_ACCOUNT_LINKING,
     )
     def set_pending_account_linking(self, comment=None, comment_url=None):
-        if comment:
+        if comment is not None:
             self.service_provider_comment = comment
-        if comment_url:
+        if comment_url is not None:
             self.service_provider_comment_url = comment_url
 
     @transition(
@@ -2117,7 +3392,13 @@ class OfferingUser(
 
     @transition(
         field=state,
-        source=OfferingUserStates.OK,
+        source=[
+            OfferingUserStates.OK,
+            OfferingUserStates.CREATING,
+            OfferingUserStates.PENDING_ACCOUNT_LINKING,
+            OfferingUserStates.PENDING_ADDITIONAL_VALIDATION,
+            OfferingUserStates.ERROR_CREATING,
+        ],
         target=OfferingUserStates.DELETION_REQUESTED,
     )
     def request_deletion(self):
@@ -2136,7 +3417,10 @@ class OfferingUser(
 
     @transition(
         field=state,
-        source=OfferingUserStates.DELETING,
+        source=[
+            OfferingUserStates.CREATION_REQUESTED,
+            OfferingUserStates.DELETING,
+        ],
         target=OfferingUserStates.DELETED,
     )
     def set_deleted(self):
@@ -2170,9 +3454,20 @@ class OfferingUser(
 
     def save(self, *args, **kwargs):
         # Set state to OK when username is known at creation time or when changed
+        # This is triggered by:
+        # 1. Creation with username (not self.pk)
+        # 2. Direct username field updates (self.tracker.has_changed("username"))
+        # 3. Signal handlers that call save() without update_fields (e.g., FreeIPA profile creation)
         if (
             self.username
-            and self.state != OfferingUserStates.OK
+            and self.state
+            in (
+                OfferingUserStates.CREATION_REQUESTED,
+                OfferingUserStates.CREATING,
+                OfferingUserStates.PENDING_ACCOUNT_LINKING,
+                OfferingUserStates.PENDING_ADDITIONAL_VALIDATION,
+                OfferingUserStates.ERROR_CREATING,
+            )
             and (self.tracker.has_changed("username") or not self.pk)
         ):
             self.set_ok()
@@ -2185,6 +3480,7 @@ class OfferingUser(
             "username",
             "is_restricted",
             "get_state_display",
+            "runtime_state",
             "service_provider_comment",
             "service_provider_comment_url",
         )
@@ -2209,6 +3505,322 @@ class OfferingUserGroup(TimeStampedModel, common_mixins.BackendMetadataMixin):
         return "Offering user group for %s" % self.offering
 
 
+class OfferingRoleGroup(TimeStampedModel, common_mixins.BackendMetadataMixin):
+    """
+    Per-(offering, scope, role) groups materialised in glauth output.
+
+    Each row corresponds to one LDAP group exposed by the offering's
+    glauth integration. The scope is a Resource or a ResourceProject;
+    the role is an offering-custom Role. ``backend_metadata`` carries
+    the allocated ``gid`` and the cached rendered ``name`` so renames
+    of role/resource don't break already-published TOML.
+
+    Rows are created lazily on first matching UserRole assignment and
+    purged when the scope is deleted. Distinct from OfferingUserGroup
+    (project-mapped, gid-only naming) — the two coexist.
+    """
+
+    offering = models.ForeignKey(
+        Offering, on_delete=models.CASCADE, related_name="role_groups"
+    )
+    content_type = models.ForeignKey(
+        ContentType, on_delete=models.CASCADE, related_name="+"
+    )
+    object_id = models.PositiveIntegerField()
+    scope = GenericForeignKey("content_type", "object_id")
+    role = models.ForeignKey(
+        "permissions.Role", on_delete=models.CASCADE, related_name="+"
+    )
+
+    class Meta:
+        unique_together = ("offering", "content_type", "object_id", "role")
+        indexes = [models.Index(fields=["content_type", "object_id"])]
+
+    def __str__(self):
+        return f"Offering role group {self.role.name} on {self.scope} ({self.offering})"
+
+
+class PosixIdPool(
+    core_models.UuidMixin,
+    core_models.DescribableMixin,
+    TimeStampedModel,
+):
+    """
+    POSIX UID/GID pool for a service provider (or a single offering override).
+
+    A provider is one POSIX namespace: by default a single pool attached to the
+    ServiceProvider supplies every UID and GID the provider hands out. An
+    optional per-offering pool overrides the provider default for that offering
+    (see :meth:`PosixIdPool.resolve`).
+
+    Each pool carries two independent numeric namespaces — UID and GID — each
+    with its own ``[min, max]`` bounds and a ``next`` high-water mark. A UID and
+    a GID may legally share a number, so the two namespaces are never compared
+    to each other; provider-wide non-overlap is enforced per namespace.
+
+    Values are recorded in :class:`PosixIdentity`; consumers keep a projection of
+    the allocated value in their ``backend_metadata`` so the GLAuth rendering and
+    site-agent contracts stay unchanged.
+    """
+
+    MIN_ID = 1000
+    MAX_ID = 2**32 - 2
+
+    service_provider = models.OneToOneField(
+        ServiceProvider,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="posix_pool",
+    )
+    offering = models.OneToOneField(
+        Offering,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="posix_pool",
+    )
+    # Each namespace (UID, GID) is optional but all-or-nothing: a pool may manage
+    # UIDs only, GIDs only, or both. Managing only GIDs supports offerings whose
+    # UIDs come from an external identity source (e.g. an OIDC claim) while their
+    # project/role group GIDs are still allocated by Waldur.
+    min_uid = models.BigIntegerField(null=True, blank=True)
+    max_uid = models.BigIntegerField(null=True, blank=True)
+    next_uid = models.BigIntegerField(null=True, blank=True)
+    min_gid = models.BigIntegerField(null=True, blank=True)
+    max_gid = models.BigIntegerField(null=True, blank=True)
+    next_gid = models.BigIntegerField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = _("POSIX ID pool")
+        verbose_name_plural = _("POSIX ID pools")
+        constraints = [
+            models.CheckConstraint(
+                name="marketplace_posixidpool_exactly_one_scope",
+                condition=(
+                    Q(service_provider__isnull=False, offering__isnull=True)
+                    | Q(service_provider__isnull=True, offering__isnull=False)
+                ),
+            ),
+            # A namespace's three columns are all set or all null (all-or-nothing).
+            models.CheckConstraint(
+                name="marketplace_posixidpool_uid_all_or_nothing",
+                condition=(
+                    Q(min_uid__isnull=True, max_uid__isnull=True, next_uid__isnull=True)
+                    | Q(
+                        min_uid__isnull=False,
+                        max_uid__isnull=False,
+                        next_uid__isnull=False,
+                    )
+                ),
+            ),
+            models.CheckConstraint(
+                name="marketplace_posixidpool_gid_all_or_nothing",
+                condition=(
+                    Q(min_gid__isnull=True, max_gid__isnull=True, next_gid__isnull=True)
+                    | Q(
+                        min_gid__isnull=False,
+                        max_gid__isnull=False,
+                        next_gid__isnull=False,
+                    )
+                ),
+            ),
+            # At least one namespace must be managed.
+            models.CheckConstraint(
+                name="marketplace_posixidpool_at_least_one_namespace",
+                condition=Q(min_uid__isnull=False) | Q(min_gid__isnull=False),
+            ),
+            # Bounds are only enforced for a managed namespace; the comparisons
+            # evaluate to NULL (i.e. satisfied) when its columns are null.
+            models.CheckConstraint(
+                name="marketplace_posixidpool_uid_bounds",
+                condition=Q(min_uid__gte=1000)
+                & Q(min_uid__lte=models.F("max_uid"))
+                & Q(max_uid__lte=2**32 - 2)
+                & Q(next_uid__gte=models.F("min_uid"))
+                & Q(next_uid__lte=models.F("max_uid") + 1),
+            ),
+            models.CheckConstraint(
+                name="marketplace_posixidpool_gid_bounds",
+                condition=Q(min_gid__gte=1000)
+                & Q(min_gid__lte=models.F("max_gid"))
+                & Q(max_gid__lte=2**32 - 2)
+                & Q(next_gid__gte=models.F("min_gid"))
+                & Q(next_gid__lte=models.F("max_gid") + 1),
+            ),
+        ]
+
+    def __str__(self):
+        scope = self.service_provider if self.service_provider_id else self.offering
+        parts = []
+        if self.min_uid is not None:
+            parts.append(f"uid {self.min_uid}-{self.max_uid}")
+        if self.min_gid is not None:
+            parts.append(f"gid {self.min_gid}-{self.max_gid}")
+        return f"POSIX ID pool ({', '.join(parts)}) for {scope}"
+
+    @classmethod
+    def get_url_name(cls):
+        return "marketplace-posix-id-pool"
+
+    def manages(self, namespace: str) -> bool:
+        """Whether this pool allocates the given namespace ('uid' or 'gid')."""
+        return getattr(self, f"min_{namespace}") is not None
+
+    @property
+    def customer(self) -> structure_models.Customer:
+        if self.service_provider_id:
+            return self.service_provider.customer
+        return self.offering.customer
+
+    @property
+    def scope(self) -> str:
+        return "service_provider" if self.service_provider_id else "offering"
+
+    @classmethod
+    def resolve(cls, offering) -> "PosixIdPool | None":
+        """Most-specific pool for an offering: its own pool, else the provider's."""
+        pool = cls.objects.filter(offering=offering).first()
+        if pool is not None:
+            return pool
+        return cls.objects.filter(
+            service_provider__customer_id=offering.customer_id
+        ).first()
+
+    def clean(self):
+        from . import posix_ids
+
+        posix_ids.validate_pool(self)
+
+
+class PosixIdentity(
+    core_models.UuidMixin,
+    TimeStampedModel,
+):
+    """
+    Allocated POSIX identity for one principal, drawn from a :class:`PosixIdPool`.
+
+    A principal is either a Waldur user (``user``) or a single non-user consumer
+    row (``consumer``: RobotAccount, OfferingUserGroup or OfferingRoleGroup).
+    Exactly one of the two is set. User and robot rows carry both a ``uid`` and a
+    primary ``gid``; group rows carry only a ``gid``. This table is the source of
+    truth; the values are mirrored into the consumer's ``backend_metadata`` for
+    GLAuth and the site agent.
+
+    A user identity is shared by every offering account of that user that
+    resolves to the same pool, so one user has one UID and one primary GID per
+    pool — the provider's LDAP tree sees a single consistent entry even when the
+    user has accounts on several of the provider's offerings. An offering with
+    its own pool resolves elsewhere and therefore gets its own identity.
+
+    Deleting a consumer marks the row released (``released_at``) once no other
+    consumer still uses it. Released values are recycled automatically: a
+    released row leaves the partial-unique active set, so its value is offered
+    again on the next allocation from the same pool and namespace. A released row
+    with ``recyclable=False`` is withheld from that recycling — the retrofit and
+    the re-point action set it, because the value is still present on the
+    provider's filesystem until an operator has reconciled it. Released rows are
+    retained as an audit trail.
+    """
+
+    pool = models.ForeignKey(
+        PosixIdPool, on_delete=models.CASCADE, related_name="identities"
+    )
+    uid = models.BigIntegerField(null=True, blank=True)
+    gid = models.BigIntegerField(null=True, blank=True)
+    # Principal: exactly one of user / (content_type, object_id) is set.
+    user = models.ForeignKey(
+        core_models.User,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="posix_identities",
+    )
+    content_type = models.ForeignKey(
+        ContentType, on_delete=models.CASCADE, related_name="+", null=True, blank=True
+    )
+    object_id = models.PositiveIntegerField(null=True, blank=True)
+    consumer = GenericForeignKey("content_type", "object_id")
+    # The offering that first triggered the allocation. Audit only: a user
+    # identity is shared by every offering that resolves to the same pool, so
+    # this must not be read as "the offering this identity belongs to" — and
+    # deleting it must not take the row (and the reservation the other
+    # offerings' accounts depend on) with it.
+    offering = models.ForeignKey(
+        Offering,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="posix_identities",
+    )
+    released_at = models.DateTimeField(null=True, blank=True)
+    recyclable = models.BooleanField(default=True)
+
+    class Meta:
+        verbose_name = _("POSIX identity")
+        verbose_name_plural = _("POSIX identities")
+        ordering = ["pool", "uid", "gid", "id"]
+        constraints = [
+            UniqueConstraint(
+                fields=["pool", "uid"],
+                condition=Q(released_at__isnull=True, uid__isnull=False),
+                name="marketplace_posixidentity_active_uid",
+            ),
+            UniqueConstraint(
+                fields=["pool", "gid"],
+                condition=Q(released_at__isnull=True, gid__isnull=False),
+                name="marketplace_posixidentity_active_gid",
+            ),
+            # Per pool, like the user constraint: an offering that gains its own
+            # pool must still be able to allocate for a robot account or group
+            # that already holds a value in the provider's pool.
+            UniqueConstraint(
+                fields=["pool", "content_type", "object_id"],
+                condition=Q(released_at__isnull=True, content_type__isnull=False),
+                name="marketplace_posixidentity_active_consumer",
+            ),
+            # One identity per user per pool: this is what makes the value shared
+            # across the offerings of a provider that resolve to the same pool.
+            UniqueConstraint(
+                fields=["pool", "user"],
+                condition=Q(released_at__isnull=True, user__isnull=False),
+                name="marketplace_posixidentity_active_user",
+            ),
+            models.CheckConstraint(
+                name="marketplace_posixidentity_exactly_one_principal",
+                condition=(
+                    Q(
+                        user__isnull=False,
+                        content_type__isnull=True,
+                        object_id__isnull=True,
+                    )
+                    | Q(
+                        user__isnull=True,
+                        content_type__isnull=False,
+                        object_id__isnull=False,
+                    )
+                ),
+            ),
+        ]
+        indexes = [
+            Index(
+                fields=["content_type", "object_id"],
+                name="mp_posixidentity_consumer_idx",
+            ),
+            Index(fields=["pool", "uid"], name="mp_posixidentity_pool_uid_idx"),
+            Index(fields=["pool", "gid"], name="mp_posixidentity_pool_gid_idx"),
+            Index(fields=["user"], name="mp_posixidentity_user_idx"),
+        ]
+
+    def __str__(self):
+        principal = self.user if self.user_id else self.consumer
+        return f"POSIX identity uid={self.uid} gid={self.gid} ({principal})"
+
+    @classmethod
+    def get_url_name(cls):
+        return "marketplace-posix-identity"
+
+
 class CategoryHelpArticle(models.Model):
     """
     Help documentation linked to categories.
@@ -2224,6 +3836,34 @@ class CategoryHelpArticle(models.Model):
 
     def __str__(self):
         return self.title
+
+
+class Tag(
+    core_models.UuidMixin,
+    TimeStampedModel,
+):
+    """Free-form tag for categorizing offerings."""
+
+    name = models.CharField(max_length=100, unique=True)
+    description = models.TextField(blank=True)
+    created_by = models.ForeignKey(
+        on_delete=models.SET_NULL,
+        to=core_models.User,
+        related_name="+",
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        verbose_name = _("Tag")
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+    @classmethod
+    def get_url_name(cls):
+        return "marketplace-tag"
 
 
 class BaseServiceAccount(
@@ -2250,7 +3890,7 @@ class BaseServiceAccount(
 
     class Meta:
         abstract = True
-        ordering = ["created"]
+        ordering = ["created", "id"]
 
     def get_log_fields(self):
         return ("username",)
@@ -2283,7 +3923,7 @@ class ScopedServiceAccount(BaseServiceAccount):
     user details and scope-specific management.
     """
 
-    class Meta:
+    class Meta(BaseServiceAccount.Meta):
         abstract = True
 
     email = models.EmailField(max_length=320, default="")
@@ -2316,7 +3956,7 @@ class ProjectServiceAccount(ScopedServiceAccount):
         ),
     )
 
-    class Meta:
+    class Meta(ScopedServiceAccount.Meta):
         verbose_name = _("Project service account")
 
     def __str__(self):
@@ -2345,7 +3985,7 @@ class CustomerServiceAccount(ScopedServiceAccount):
         ),
     )
 
-    class Meta:
+    class Meta(ScopedServiceAccount.Meta):
         verbose_name = _("Customer service account")
 
     def __str__(self):
@@ -2428,7 +4068,7 @@ class RobotAccount(
 
     class Meta:
         unique_together = ("resource", "type")
-        ordering = ["created"]
+        ordering = ["created", "id"]
 
     def get_log_fields(self):
         return super().get_log_fields() + ("type",)
@@ -2465,46 +4105,68 @@ class ResourceAccessEndpoint(core_models.UuidMixin, core_models.NameMixin):
     )
 
 
-class OfferingUserRole(core_models.UuidMixin, core_models.NameMixin):
-    """
-    User roles within offerings.
-
-    Defines user roles for offerings providing permission management
-    and access control. Used for role-based access control within
-    offering contexts.
-    """
-
-    offering = models.ForeignKey(
-        on_delete=models.CASCADE, to=Offering, related_name="roles"
-    )
-
-    class Meta:
-        ordering = ["name"]
-
-
 class SoftwareCatalog(core_models.UuidMixin, TimeStampedModel):
     """
-    Software catalog metadata (like EESSI, Spack, etc.)
+    Generic software catalog supporting multiple package management systems.
+
+    Supports various catalog types:
+    - binary_runtime: Pre-compiled software (EESSI)
+    - source_package: Build recipes (Spack)
+    - package_manager: Package manager repos (conda-forge, PyPI)
     """
 
-    name = models.CharField(max_length=100, help_text=_("Catalog name (e.g., EESSI)"))
+    CATALOG_TYPE_CHOICES = [
+        ("binary_runtime", _("Binary Runtime (EESSI)")),
+        ("source_package", _("Source Package (Spack)")),
+        ("package_manager", _("Package Manager (conda, pip)")),
+    ]
+
+    name = models.CharField(
+        max_length=100, help_text=_("Catalog name (e.g., EESSI, Spack)")
+    )
     version = models.CharField(
-        max_length=50, help_text=_("Catalog version (e.g., 2023.06)")
+        max_length=50, help_text=_("Catalog version (e.g., 2023.06, 0.21.0)")
+    )
+    catalog_type = models.CharField(
+        max_length=50,
+        choices=CATALOG_TYPE_CHOICES,
+        default="binary_runtime",  # Default to EESSI-like for existing catalogs
+        help_text=_("Type of software catalog"),
     )
     source_url = models.URLField(blank=True, help_text=_("Catalog source URL"))
     description = models.TextField(blank=True)
 
+    # Flexible storage for catalog-specific metadata
+    metadata = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_(
+            "Catalog-specific metadata (architecture maps, API endpoints, etc.)"
+        ),
+    )
+
+    # Auto-update configuration
+    auto_update_enabled = models.BooleanField(
+        default=True,
+        help_text=_("Whether to automatically update this catalog via scheduled tasks"),
+    )
+    last_update_attempt = models.DateTimeField(null=True, blank=True)
+    last_successful_update = models.DateTimeField(null=True, blank=True)
+    update_errors = models.TextField(blank=True)
+
     class Meta:
-        unique_together = ("name", "version")
-        ordering = ["name", "version"]
+        unique_together = ("name", "version", "catalog_type")
+        ordering = ["name", "catalog_type", "version", "id"]
 
     def __str__(self):
-        return f"{self.name} {self.version}"
+        return f"{self.name} {self.version} ({self.get_catalog_type_display()})"
 
 
 class SoftwarePackage(core_models.UuidMixin, TimeStampedModel):
     """
-    Individual software package within a catalog.
+    Generic software package supporting multiple catalog types.
+
+    Includes common fields across EESSI, Spack, and other package systems.
     """
 
     catalog = models.ForeignKey(
@@ -2512,63 +4174,186 @@ class SoftwarePackage(core_models.UuidMixin, TimeStampedModel):
     )
     name = models.CharField(max_length=200, db_index=True)
     description = models.TextField(blank=True)
-    homepage = models.URLField(blank=True)
+    homepage = models.URLField(blank=True, null=True)
+
+    # Generic classification fields (common across catalogs)
+    categories = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=_("Package categories (e.g., ['bio', 'hpc', 'build-tools'])"),
+    )
+    licenses = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=_("Software licenses (e.g., ['GPL-3.0', 'MIT'])"),
+    )
+    maintainers = models.JSONField(
+        default=list, blank=True, help_text=_("Package maintainers")
+    )
+
+    # Extension/hierarchy support (for Python packages, R packages, etc.)
+    is_extension = models.BooleanField(
+        default=False,
+        help_text=_("Whether this package is an extension of another package"),
+    )
+    parent_softwares = models.ManyToManyField(
+        "self",
+        symmetrical=False,
+        blank=True,
+        related_name="extensions",
+        help_text=_(
+            "Parent packages for extensions (e.g., Python package within Python)"
+        ),
+    )
 
     class Meta:
         unique_together = ("catalog", "name")
-        ordering = ["name"]
+        ordering = ["name", "id"]
         indexes = [
             models.Index(fields=["catalog", "name"]),
             models.Index(fields=["name"]),
+            models.Index(fields=["is_extension"]),
         ]
 
     def __str__(self):
         return f"{self.name} ({self.catalog})"
 
+    @property
+    def extension_count(self):
+        """Count of extension packages."""
+        return self.extensions.count()
+
 
 class SoftwareVersion(core_models.UuidMixin, TimeStampedModel):
     """
-    Specific version of a software package.
+    Generic software version supporting multiple catalog types.
+
+    Stores common version metadata and catalog-specific data in flexible fields.
     """
 
     package = models.ForeignKey(
         SoftwarePackage, on_delete=models.CASCADE, related_name="versions"
     )
     version = models.CharField(max_length=100)
+    module_version = models.CharField(
+        max_length=150,
+        blank=True,
+        default="",
+        help_text=_("EESSI EasyBuild module version"),
+    )
     release_date = models.DateField(null=True, blank=True)
-    metadata = models.JSONField(default=dict, blank=True)
+
+    # Generic dependency tracking (catalog-agnostic)
+    dependencies = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=_("Package dependencies (format varies by catalog type)"),
+    )
+
+    # Flexible metadata storage for all catalog-specific data
+    metadata = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_(
+            "Version-specific metadata (toolchains, build info, modules, etc.)"
+        ),
+    )
 
     class Meta:
-        unique_together = ("package", "version")
-        ordering = ["package", "version"]
+        unique_together = ("package", "version", "module_version")
+        ordering = ["package", "version", "module_version", "id"]
+        indexes = [
+            models.Index(fields=["package", "version"]),
+            models.Index(fields=["package", "module_version"]),
+            models.Index(fields=["version"]),
+        ]
 
     def __str__(self):
+        if self.module_version:
+            return f"{self.package.name} {self.version} ({self.module_version})"
         return f"{self.package.name} {self.version}"
+
+    @property
+    def catalog_type(self):
+        """Return the catalog type for this version."""
+        return self.package.catalog.catalog_type
+
+    def get_metadata_field(self, field_name, default=None):
+        """Helper to get version metadata fields."""
+        return self.metadata.get(field_name, default)
 
 
 class SoftwareTarget(core_models.UuidMixin, TimeStampedModel):
     """
-    Target architecture/platform for software versions.
+    Generic deployment target for software versions.
+
+    Represents where/how software can be deployed - architecture for binary catalogs,
+    build variants for source catalogs, etc.
     """
 
     version = models.ForeignKey(
         SoftwareVersion, on_delete=models.CASCADE, related_name="targets"
     )
-    cpu_family = models.CharField(max_length=50, db_index=True)  # x86_64, aarch64
-    cpu_microarchitecture = models.CharField(
-        max_length=50, db_index=True
-    )  # generic, zen3, etc.
-    path = models.CharField(max_length=500)  # Full CVMFS path
+
+    # Generic target identification
+    target_type = models.CharField(
+        max_length=50,
+        db_index=True,
+        default="architecture",
+        help_text=_("Type of target (architecture, platform, variant, etc.)"),
+    )
+    target_name = models.CharField(
+        max_length=100,
+        db_index=True,
+        default="generic",
+        help_text=_("Target identifier (x86_64/generic, linux, variant_name, etc.)"),
+    )
+
+    # Optional secondary classification (for hierarchical targets)
+    target_subtype = models.CharField(
+        max_length=50,
+        blank=True,
+        db_index=True,
+        help_text=_("Target subtype (microarchitecture, distribution, etc.)"),
+    )
+
+    # Generic path/location (filesystem path, URL, etc.)
+    location = models.CharField(
+        max_length=500,
+        blank=True,
+        help_text=_("Target location (CVMFS path, download URL, etc.)"),
+    )
+
+    # Flexible metadata for target-specific data
+    metadata = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_(
+            "Target-specific metadata (build options, system requirements, etc.)"
+        ),
+    )
+
+    gpu_architectures = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=_(
+            "List of GPU architectures this target supports (e.g., ['nvidia/cc70', 'nvidia/cc90'])"
+        ),
+    )
 
     class Meta:
-        unique_together = ("version", "cpu_family", "cpu_microarchitecture")
+        ordering = ["-created", "id"]
+        unique_together = ("version", "target_type", "target_name", "target_subtype")
         indexes = [
-            models.Index(fields=["cpu_family", "cpu_microarchitecture"]),
-            models.Index(fields=["version", "cpu_family"]),
+            models.Index(fields=["target_type", "target_name"]),
+            models.Index(fields=["version", "target_type"]),
+            models.Index(fields=["target_type", "target_subtype"]),
         ]
 
     def __str__(self):
-        return f"{self.version} - {self.cpu_family}/{self.cpu_microarchitecture}"
+        if self.target_subtype:
+            return f"{self.version} - {self.target_type}:{self.target_name}/{self.target_subtype}"
+        return f"{self.version} - {self.target_type}:{self.target_name}"
 
 
 class OfferingSoftwareCatalog(core_models.UuidMixin, TimeStampedModel):
@@ -2685,6 +4470,20 @@ class OfferingPartition(core_models.UuidMixin, TimeStampedModel):
         default=False, help_text=_("Exclusive user access required")
     )
 
+    # Architecture
+    cpu_arch = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text=_("CPU architecture of the partition (e.g., x86_64/amd/zen3)"),
+    )
+    gpu_arch = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text=_(
+            "GPU architecture of the partition (e.g., nvidia/cc90, amd/gfx90a)"
+        ),
+    )
+
     # Scheduling configuration
     priority_tier = models.PositiveSmallIntegerField(
         null=True,
@@ -2709,34 +4508,416 @@ class OfferingPartition(core_models.UuidMixin, TimeStampedModel):
         return f"{self.offering.name} - {self.partition_name}"
 
 
-class ResourceUser(TimeStampedModel, core_models.UuidMixin):
-    """
-    User-role assignments for resources.
+# QoS names that are all digits collide with SLURM's numeric QoS id namespace
+# and can be mis-resolved by name-or-id lookups; reject them.
+NonNumericQoSNameValidator = RegexValidator(
+    regex=r"^\d+$",
+    inverse_match=True,
+    message=_("QoS name cannot consist only of digits."),
+)
 
-    Manages user-role assignments for resources with timestamp tracking.
-    Provides fine-grained access control and permission management
-    for individual resources.
+
+class SlurmOfferingQoS(core_models.UuidMixin, TimeStampedModel):
+    """
+    Quality of Service profile for a SLURM offering.
+
+    Cluster-scoped named entity carrying QoS-level limits, mirroring SLURM's
+    slurmdb_qos_rec_t. Not owned by a partition; partitions reference it via
+    the ``SlurmPartitionQoS`` allow-list gate (SLURM AllowQos).
     """
 
-    resource = models.ForeignKey(
-        on_delete=models.CASCADE, to=Resource, related_name="users"
+    offering = models.ForeignKey(
+        Offering, on_delete=models.CASCADE, related_name="qos_profiles"
     )
-    user = models.ForeignKey(
-        core_models.User, related_name="+", on_delete=models.CASCADE
+    name = models.CharField(
+        max_length=255,
+        validators=[NonNumericQoSNameValidator],
+        help_text=_("Name of the SLURM QOS."),
     )
-    role = models.ForeignKey(
-        OfferingUserRole, related_name="+", on_delete=models.CASCADE
+    description = models.CharField(max_length=255, blank=True)
+
+    # Limit fields (mirror slurmdb_qos_rec_t; nullable = unset).
+    max_nodes = models.PositiveIntegerField(
+        null=True, blank=True, help_text=_("Maximum nodes per job")
+    )
+    min_nodes = models.PositiveIntegerField(
+        null=True, blank=True, help_text=_("Minimum nodes per job")
+    )
+    default_time = models.PositiveIntegerField(
+        null=True, blank=True, help_text=_("Default time limit in minutes")
+    )
+    max_time = models.PositiveIntegerField(
+        null=True, blank=True, help_text=_("Maximum wall time in minutes")
+    )
+    grace_time = models.PositiveIntegerField(
+        null=True, blank=True, help_text=_("Preemption grace time in seconds")
+    )
+    priority = models.PositiveIntegerField(
+        null=True, blank=True, help_text=_("Scheduling priority")
+    )
+    grp_tres = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text=_("Aggregate TRES the QOS may allocate at once (GrpTRES)"),
+    )
+    max_tres_per_job = models.CharField(
+        max_length=255, blank=True, help_text=_("Max TRES per job (MaxTRESPerJob)")
+    )
+    max_tres_per_node = models.CharField(
+        max_length=255, blank=True, help_text=_("Max TRES per node (MaxTRESPerNode)")
+    )
+    max_tres_per_user = models.CharField(
+        max_length=255, blank=True, help_text=_("Max TRES per user (MaxTRESPerUser)")
+    )
+    min_tres_per_job = models.CharField(
+        max_length=255, blank=True, help_text=_("Min TRES per job (MinTRESPerJob)")
+    )
+    flags = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text=_("Comma-separated QOS flags (e.g. DenyOnLimit, OverPartQOS)"),
     )
 
     class Meta:
-        ordering = ["created"]
+        unique_together = ("offering", "name")
+        indexes = [models.Index(fields=["offering", "name"])]
+
+    def __str__(self):
+        return f"{self.offering.name} - {self.name}"
+
+
+class SlurmPartitionQoS(core_models.UuidMixin, TimeStampedModel):
+    """
+    Allow-list link between a partition and a QoS (SLURM AllowQos gate).
+
+    A partition with no ``SlurmPartitionQoS`` rows permits all of the
+    offering's QoS (SLURM AllowQos=ALL). ``is_default`` seeds the association
+    DefaultQOS; its absence models a mandatory ``--qos``.
+    """
+
+    partition = models.ForeignKey(
+        OfferingPartition, on_delete=models.CASCADE, related_name="qos_options"
+    )
+    qos = models.ForeignKey(
+        SlurmOfferingQoS, on_delete=models.CASCADE, related_name="partition_links"
+    )
+    is_default = models.BooleanField(
+        default=False,
+        help_text=_("Default QOS for this partition (seeds SLURM DefaultQOS)."),
+    )
+
+    def clean(self):
+        super().clean()
+        # The partition and the QoS must belong to the same offering. Enforced
+        # at DB level by a trigger (see migration), mirrored here for a clean
+        # ValidationError on the ORM/full_clean path.
+        if (
+            self.partition_id
+            and self.qos_id
+            and (self.partition.offering_id != self.qos.offering_id)
+        ):
+            raise ValidationError(
+                _("Partition and QoS must belong to the same offering.")
+            )
+
+    class Meta:
+        unique_together = ("partition", "qos")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["partition"],
+                condition=Q(is_default=True),
+                name="unique_default_qos_per_partition",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.partition.partition_name} - {self.qos.name}"
+
+
+class ResourceProject(
+    PermissionMixin,
+    core_models.UuidMixin,
+    core_models.NameMixin,
+    core_models.ErrorMessageMixin,
+    TimeStampedModel,
+    SoftDeletableModel,
+    structure_models.StructureLoggableMixin,
+):
+    """
+    Sub-project within a resource.
+
+    Represents a project-level entity within a resource (e.g., a Rancher project
+    within a cluster resource). Enabled per-offering via the
+    ``enable_resource_projects`` plugin option.
+    """
+
+    class States(ResourceStates):
+        pass
+
+    resource = models.ForeignKey(
+        Resource,
+        on_delete=models.CASCADE,
+        related_name="projects",
+    )
+    description = models.TextField(blank=True, default="")
+    backend_id = models.CharField(max_length=255, blank=True, default="")
+    state = FSMIntegerField(
+        default=States.CREATING,
+        choices=States.CHOICES,
+    )
+    limits = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_(
+            "Dictionary mapping component types to quota values. "
+            "Same format as Resource.limits."
+        ),
+    )
+    current_usages = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_(
+            "Dictionary mapping component types to current usage amounts. "
+            "Populated by backend synchronization."
+        ),
+    )
+    # Creation audit: who created the sub-project via the API. NULL for
+    # rows predating the field or created by system paths.
+    created_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_resource_projects",
+    )
+    removed_date = models.DateTimeField(null=True, blank=True)
+    removed_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="removed_resource_projects",
+    )
+    # Snapshot of the active UserRoles at soft-delete time. Used by the
+    # recover action to optionally recreate roles or send invitations.
+    # Mirrors structure.Project.termination_metadata.
+    termination_metadata = models.JSONField(null=True, blank=True)
+
+    # Mirrors classic Project (waldur_core/structure/models.py): objects returns
+    # all rows (including soft-removed) so audit/admin code can resolve them;
+    # available_objects is the active-only manager that viewsets use.
+    objects = models.Manager()
+    available_objects = SoftDeletableManager()
 
     def get_log_fields(self):
-        return (
-            "resource",
-            "user",
-            "role",
+        return ("uuid", "name", "backend_id", "resource")
+
+    class Meta:
+        ordering = ["created", "id"]
+        # Partial unique constraint: only enforce uniqueness for active rows so
+        # a soft-deleted project can be recreated with the same name.
+        constraints = [
+            UniqueConstraint(
+                fields=["resource", "name"],
+                condition=Q(is_removed=False),
+                name="uniq_active_resource_project_name_per_resource",
+            ),
+        ]
+        # Default related-manager (e.g. resource.projects) returns all rows;
+        # callers that want the active-only set should use
+        # resource.projects(manager="available_objects").
+        base_manager_name = "objects"
+
+    class Permissions:
+        customer_path = "resource__project__customer"
+        project_path = "resource__project"
+
+    @property
+    def customer(self) -> structure_models.Customer:
+        return self.resource.project.customer
+
+    @property
+    def project(self) -> structure_models.Project:
+        return self.resource.project
+
+    def __str__(self):
+        return f"{self.name} ({self.resource})"
+
+    @transition(
+        field=state,
+        source=[States.CREATING, States.UPDATING, States.ERRED],
+        target=States.OK,
+    )
+    def set_state_ok(self):
+        # ERRED is a valid source so a downstream operator (e.g.
+        # waldur-site-agent's rancher-kc-crd plugin) can flip the RP
+        # back to OK once a transient failure clears, without manual
+        # intervention. Mirrors the Resource FSM (line ~1762) which
+        # already allows the same recovery path.
+        pass
+
+    @transition(field=state, source="*", target=States.ERRED)
+    def set_state_erred(self):
+        pass
+
+    @transition(
+        field=state,
+        source=States.OK,
+        target=States.UPDATING,
+    )
+    def set_state_updating(self):
+        pass
+
+    @transition(
+        field=state,
+        source=States.OK,
+        target=States.TERMINATING,
+    )
+    def set_state_terminating(self):
+        pass
+
+    @transition(
+        field=state,
+        source=States.TERMINATING,
+        target=States.TERMINATED,
+    )
+    def set_state_terminated(self):
+        pass
+
+    def _soft_delete(self, using=None, terminated_by=None):
+        """Soft-delete: capture+revoke roles, flag as removed, fire delete signals.
+
+        Mirrors the classic Project soft-delete pattern (active roles snapshotted
+        into termination_metadata then revoked, so the membership-changed signal
+        fires and the helpdesk integration sees a clean turnover).
+        """
+        django_signals.pre_delete.send(
+            sender=self.__class__, instance=self, using=using
         )
+
+        active_roles = list(get_permissions(self))
+        user_roles_data = [
+            {
+                "user_username": role.user.username,
+                "user_first_name": role.user.first_name,
+                "user_last_name": role.user.last_name,
+                "user_email": role.user.email,
+                "role_name": role.role.name,
+                "created_by_username": role.created_by.username
+                if role.created_by
+                else None,
+                "original_created": role.created.isoformat(),
+                "original_expiration_time": role.expiration_time.isoformat()
+                if role.expiration_time
+                else None,
+                "is_restored": False,
+                "restored_at": None,
+                "restored_by": None,
+            }
+            for role in active_roles
+        ]
+        if user_roles_data:
+            self.termination_metadata = {
+                "terminated_at": timezone.now().isoformat(),
+                "terminated_by": terminated_by.username if terminated_by else None,
+                "user_roles": user_roles_data,
+            }
+        for role in active_roles:
+            role.revoke(
+                current_user=terminated_by, reason="Resource project soft-delete"
+            )
+
+        self.is_removed = True
+        self.removed_date = timezone.now()
+        self.removed_by = terminated_by
+        self.save(
+            using=using,
+            update_fields=[
+                "is_removed",
+                "removed_date",
+                "removed_by",
+                "termination_metadata",
+            ],
+        )
+        django_signals.post_delete.send(
+            sender=self.__class__, instance=self, using=using
+        )
+
+    def delete(self, using=None, soft=True, terminated_by=None, *args, **kwargs):
+        """Soft delete by default; soft=False triggers a real DB delete."""
+        if soft:
+            self._soft_delete(using=using, terminated_by=terminated_by)
+        else:
+            return super(SoftDeletableModel, self).delete(using=using, *args, **kwargs)
+
+
+class ResourceMemberSyncStatus(core_models.UuidMixin, TimeStampedModel):
+    """Agent-reported propagation state of a single role grant.
+
+    One row per (resource, user, scope, role name), written by the site
+    agent via ``set_membership_sync_statuses`` with full-replace-per-
+    resource semantics: the agent owns these rows, a report replaces the
+    resource's previous rows atomically, so a revoked grant's row cannot
+    outlive the grant. Enabled per offering via the
+    ``enable_membership_sync_status`` plugin option.
+
+    ``modified`` (TimeStampedModel) doubles as the reported-at
+    timestamp because rows are recreated on every report.
+    """
+
+    class States:
+        SYNCED = "synced"
+        PENDING = "pending"
+        MISSING_IN_IDP = "missing_in_idp"
+        ERROR = "error"
+
+        CHOICES = (
+            (SYNCED, "Synced"),
+            (PENDING, "Pending"),
+            (MISSING_IN_IDP, "Missing in identity provider"),
+            (ERROR, "Error"),
+        )
+
+    class ScopeTypes:
+        RESOURCE = "resource"
+        RESOURCE_PROJECT = "resource_project"
+
+        CHOICES = (
+            (RESOURCE, "Resource"),
+            (RESOURCE_PROJECT, "Resource project"),
+        )
+
+    resource = models.ForeignKey(
+        Resource,
+        on_delete=models.CASCADE,
+        related_name="member_sync_statuses",
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="+",
+    )
+    scope_type = models.CharField(max_length=32, choices=ScopeTypes.CHOICES)
+    resource_project = models.ForeignKey(
+        ResourceProject,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="member_sync_statuses",
+    )
+    role_name = models.CharField(max_length=150)
+    state = models.CharField(max_length=32, choices=States.CHOICES)
+    message = models.TextField(blank=True, default="")
+
+    class Meta:
+        verbose_name = "Resource member sync status"
+        verbose_name_plural = "Resource member sync statuses"
+        indexes = [
+            models.Index(fields=["resource", "user"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user.username} @ {self.resource.name} [{self.role_name}]: {self.state}"
 
 
 class IntegrationStatus(core_models.UuidMixin):
@@ -2788,6 +4969,7 @@ class IntegrationStatus(core_models.UuidMixin):
     service_name = models.CharField(_("Service name"), max_length=150, default="")
 
     class Meta:
+        ordering = ["id"]
         unique_together = ("offering", "agent_type")
 
     @transition(
@@ -2878,11 +5060,92 @@ class BackendResourceRequest(
         self.finished = timezone.now()
 
 
+class ResourceApiKey(
+    core_models.UuidMixin, TimeStampedModel, core_models.ErrorMessageMixin
+):
+    """One of a site-agent resource's API keys (e.g. an inference gateway key).
+
+    A resource owns many keys. The site agent generates each key, applies it to
+    the backend (e.g. a Kubernetes Secret entry keyed by client_id), and only
+    then pushes the value here Fernet-encrypted — so a stored key is always one
+    the backend already accepts. The state reuses the resource state vocabulary
+    so the portal renders it with the standard StateIndicator.
+    """
+
+    States = ResourceApiKeyStates
+
+    resource = models.ForeignKey(
+        to=Resource, on_delete=models.CASCADE, related_name="api_keys"
+    )
+    # The backend identity for this key (one gateway Secret entry). Assigned by
+    # the agent, e.g. "<resource_backend_id>-1".
+    client_id = models.CharField(max_length=255, blank=True, db_index=True)
+    key_ciphertext = models.TextField(blank=True)
+    state = FSMField(choices=States.CHOICES, default=States.CREATING)
+
+    class Meta:
+        verbose_name = _("Resource API key")
+        unique_together = (("resource", "client_id"),)
+
+    @transition(
+        field=state,
+        source=[States.CREATING, States.UPDATING, States.ERRED],
+        target=States.OK,
+    )
+    def set_ok(self):
+        pass
+
+    # Rotation is also allowed from Erred so a failed apply can be retried from
+    # the portal instead of leaving the key stuck.
+    @transition(field=state, source=[States.OK, States.ERRED], target=States.UPDATING)
+    def set_updating(self):
+        pass
+
+    # Only from the transitional states (not OK): a late/duplicate erred report
+    # must not flip a key that has since been applied successfully back to red.
+    @transition(
+        field=state,
+        source=[States.CREATING, States.UPDATING, States.ERRED],
+        target=States.ERRED,
+    )
+    def set_erred(self):
+        pass
+
+    def __str__(self) -> str:
+        return f"API key {self.client_id or self.uuid.hex} of {self.resource}"
+
+
 reversion.register(Screenshot)
 reversion.register(OfferingComponent)
 reversion.register(PlanComponent)
 reversion.register(Plan, follow=("components",))
-reversion.register(Offering, follow=("components", "plans", "screenshots"))
+# secret_options is excluded: it holds credentials that are encrypted at rest, and
+# reversion would otherwise serialize the decrypted plaintext into version history.
+# Reverting secrets is not a use case anyway. Existing history is scrubbed in a
+# data migration (see 0270_scrub_secret_options_from_reversion).
+reversion.register(
+    Offering, follow=("components", "plans", "screenshots"), exclude=["secret_options"]
+)
+reversion.register(
+    Resource,
+    fields=[
+        # Business-relevant fields to track:
+        "name",
+        "description",
+        "slug",
+        "state",
+        "limits",
+        "attributes",
+        "options",
+        "cost",
+        "end_date",
+        "downscaled",
+        "restrict_member_access",
+        "paused",
+        # Note: plan_id is tracked to capture plan switches
+        "plan",
+    ],
+)
 
 
 class MaintenanceAnnouncement(
@@ -2893,6 +5156,7 @@ class MaintenanceAnnouncement(
     core_models.BackendMixin,
 ):
     message = models.CharField(_("message"), max_length=2000, blank=True)
+    internal_notes = models.CharField(_("internal notes"), max_length=2000, blank=True)
     maintenance_type = models.PositiveSmallIntegerField(
         choices=MaintenanceType.CHOICES,
         default=MaintenanceType.SCHEDULED,
@@ -2946,7 +5210,7 @@ class MaintenanceAnnouncement(
     class Meta:
         verbose_name = _("Maintenance announcement")
         verbose_name_plural = _("Maintenance announcements")
-        ordering = ["-scheduled_start"]
+        ordering = ["-scheduled_start", "id"]
 
     class Permissions:
         customer_path = "service_provider__customer"
@@ -2955,6 +5219,45 @@ class MaintenanceAnnouncement(
     def affected_offerings_count(self):
         """Count of affected offerings"""
         return self.affected_offerings.count()
+
+    # Start/end deviations within this window count as on-time (see timing_bucket).
+    TIMING_TOLERANCE = timedelta(minutes=15)
+
+    @property
+    def overrun_minutes(self):
+        """Minutes actual_end ran past scheduled_end (negative = finished early);
+        None until the maintenance has completed."""
+        if not self.actual_end:
+            return None
+        return round((self.actual_end - self.scheduled_end).total_seconds() / 60)
+
+    @property
+    def start_delta_minutes(self):
+        """Minutes actual_start deviated from scheduled_start (negative = started
+        early); None until the maintenance has started."""
+        if not self.actual_start:
+            return None
+        return round((self.actual_start - self.scheduled_start).total_seconds() / 60)
+
+    @property
+    def timing_bucket(self):
+        """Classify timing against TIMING_TOLERANCE.
+
+        One of: pending / overrun / late_start / early / on_time.
+        Precedence: pending > overrun > late_start > early > on_time.
+        Uses raw timedelta comparison so it stays in sync with the DB-level
+        timing_bucket filter.
+        """
+        if not self.actual_start:
+            return MaintenanceTimingBucket.PENDING
+        tol = self.TIMING_TOLERANCE
+        if self.actual_end and (self.actual_end - self.scheduled_end) > tol:
+            return MaintenanceTimingBucket.OVERRUN
+        if (self.actual_start - self.scheduled_start) > tol:
+            return MaintenanceTimingBucket.LATE_START
+        if self.actual_end and (self.actual_end - self.scheduled_end) < -tol:
+            return MaintenanceTimingBucket.EARLY
+        return MaintenanceTimingBucket.ON_TIME
 
     @transition(
         field=state, source=MaintenanceState.DRAFT, target=MaintenanceState.SCHEDULED
@@ -3002,7 +5305,7 @@ class MaintenanceAnnouncement(
     def get_log_fields(self):
         return (
             "uuid",
-            "title",
+            "name",
             "maintenance_type",
             "state",
             "scheduled_start",
@@ -3068,7 +5371,7 @@ class MaintenanceAnnouncementTemplate(
     class Meta:
         verbose_name = _("Maintenance announcement")
         verbose_name_plural = _("Maintenance announcements")
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
 
     class Permissions:
         customer_path = "service_provider__customer"
@@ -3081,7 +5384,7 @@ class MaintenanceAnnouncementOfferingTemplate(core_models.UuidMixin, TimeStamped
     maintenance_template = models.ForeignKey(
         MaintenanceAnnouncementTemplate,
         on_delete=models.CASCADE,
-        related_name="+",
+        related_name="affected_offerings",
     )
     offering = models.ForeignKey(Offering, on_delete=models.CASCADE, related_name="+")
     impact_level = models.PositiveSmallIntegerField(
@@ -3136,14 +5439,16 @@ class CourseAccount(
 
     class Meta:
         verbose_name = _("Course account")
-        ordering = ["created"]
+        ordering = ["created", "id"]
 
     def __str__(self):
         user_name = self.user.username if self.user else "unknown"
         return f"Course account for {user_name} in {self.project}"
 
     @transition(
-        field=state, source=CourseAccountState.ERRED, target=CourseAccountState.OK
+        field=state,
+        source=[CourseAccountState.ERRED, CourseAccountState.PENDING],
+        target=CourseAccountState.OK,
     )
     def set_state_ok(self):
         pass
@@ -3159,3 +5464,120 @@ class CourseAccount(
     @transition(field=state, source="*", target=CourseAccountState.ERRED)
     def set_state_erred(self):
         pass
+
+    @transition(field=state, source="*", target=CourseAccountState.PENDING)
+    def set_state_pending(self):
+        pass
+
+
+class ResourceLimitChangeRequest(
+    core_models.UuidMixin, core_mixins.ReviewMixin, LoggableMixin
+):
+    """
+    Request from project member (without UPDATE_RESOURCE_LIMITS) to change resource limits.
+    Organization owners can approve or reject.
+    """
+
+    class Meta:
+        ordering = ["created", "id"]
+        verbose_name = _("Resource limit change request")
+        verbose_name_plural = _("Resource limit change requests")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["resource", "created_by"],
+                condition=models.Q(state=ReviewStates.PENDING),
+                name="unique_pending_limit_change_request_per_resource_and_user",
+            )
+        ]
+
+    class Permissions:
+        customer_path = "resource__project__customer"
+        project_path = "resource__project"
+
+    tracker = cast(FieldInstanceTracker, FieldTracker())
+    resource = models.ForeignKey(
+        Resource,
+        on_delete=models.CASCADE,
+        related_name="limit_change_requests",
+    )
+    requested_limits = models.JSONField()
+    created_by = models.ForeignKey(
+        "core.User",
+        on_delete=models.SET_NULL,
+        related_name="+",
+        null=True,
+    )
+
+    def get_log_fields(self):
+        return ("uuid", "state")
+
+    def __str__(self):
+        return f"Limit change request for {self.resource} ({self.get_state_display()})"
+
+
+class ResourceEndDateChangeRequest(
+    core_models.UuidMixin, core_mixins.ReviewMixin, LoggableMixin
+):
+    """
+    Request from a project member who may not change the resource end date
+    themselves. Users holding that permission approve or reject it, and approval
+    writes the date onto the resource — no order is involved.
+
+    The decision does not have to be taken inside Waldur: the request is
+    published as an observable event and carries a ``backend_id``, so an
+    external approval system can pick it up, record its own identifier, and call
+    approve or reject when its verdict is known.
+    """
+
+    class Meta:
+        ordering = ["created", "id"]
+        verbose_name = _("Resource end date change request")
+        verbose_name_plural = _("Resource end date change requests")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["resource", "created_by"],
+                condition=models.Q(state=ReviewStates.PENDING),
+                name="unique_pending_end_date_request_per_resource_and_user",
+            )
+        ]
+
+    class Permissions:
+        customer_path = "resource__project__customer"
+        project_path = "resource__project"
+
+    tracker = cast(FieldInstanceTracker, FieldTracker())
+    resource = models.ForeignKey(
+        Resource,
+        on_delete=models.CASCADE,
+        related_name="end_date_change_requests",
+    )
+    requested_end_date = models.DateField(
+        help_text=_("The requested new end date for the resource"),
+    )
+    created_by = models.ForeignKey(
+        "core.User",
+        on_delete=models.SET_NULL,
+        related_name="+",
+        null=True,
+    )
+    comment = models.TextField(
+        blank=True,
+        null=True,
+        help_text=_("Optional comment from the requester"),
+    )
+    backend_id = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text=_(
+            "Identifier of this request in an external approval system. Empty "
+            "means it has not been submitted there yet."
+        ),
+    )
+
+    def get_log_fields(self):
+        return ("uuid", "state")
+
+    def __str__(self):
+        return (
+            f"End date change request for {self.resource} ({self.get_state_display()})"
+        )

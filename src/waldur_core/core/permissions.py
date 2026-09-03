@@ -1,10 +1,19 @@
+from constance import config
 from rest_framework.permissions import SAFE_METHODS, BasePermission
+
+from waldur_core.core.exceptions import IncompleteProfileException
+from waldur_core.core.user_attributes import get_user_missing_mandatory_attributes
+from waldur_core.permissions.utils import check_pat_staff_scope, check_pat_support_scope
 
 
 class IsAdminOrReadOnly(BasePermission):
     def has_permission(self, request, view):
-        return request.method in SAFE_METHODS or (
-            request.user.is_authenticated and request.user.is_staff
+        if request.method in SAFE_METHODS:
+            return True
+        return (
+            request.user.is_authenticated
+            and request.user.is_staff
+            and check_pat_staff_scope(request)
         )
 
 
@@ -111,11 +120,65 @@ class ActionsPermission(BasePermission):
 
 class IsSupport(BasePermission):
     def has_permission(self, request, view):
-        return request.user.is_active and (
-            request.user.is_staff or request.user.is_support
+        return (
+            request.user.is_active
+            and (request.user.is_staff or request.user.is_support)
+            and check_pat_support_scope(request)
+        )
+
+
+class IsSupportOrReadOnly(BasePermission):
+    def has_permission(self, request, view):
+        if request.method in SAFE_METHODS:
+            return True
+        return (
+            request.user.is_authenticated
+            and (request.user.is_staff or request.user.is_support)
+            and check_pat_support_scope(request)
         )
 
 
 class IsStaff(BasePermission):
     def has_permission(self, request, view):
-        return request.user.is_active and request.user.is_staff
+        return (
+            request.user.is_active
+            and request.user.is_staff
+            and check_pat_staff_scope(request)
+        )
+
+
+class PATScopeAwareIsAdminUser(BasePermission):
+    """Drop-in replacement for DRF's IsAdminUser that also enforces PAT scopes."""
+
+    def has_permission(self, request, view):
+        return request.user and request.user.is_staff and check_pat_staff_scope(request)
+
+
+class RequiresCompleteProfile(BasePermission):
+    """
+    Permission class that requires users to have a complete profile.
+
+    When ENFORCE_MANDATORY_USER_ATTRIBUTES is True, users with missing
+    mandatory attributes will be blocked from accessing the view.
+    Staff users bypass this check.
+
+    Note: This permission class is created for future use but is not
+    applied to any ViewSets by default. To enable enforcement, add it
+    to the permission_classes of specific ViewSets.
+    """
+
+    def has_permission(self, request, view):
+        if not config.ENFORCE_MANDATORY_USER_ATTRIBUTES:
+            return True
+
+        if not request.user.is_authenticated:
+            return True
+
+        if request.user.is_staff:
+            return True
+
+        missing = get_user_missing_mandatory_attributes(request.user)
+        if missing:
+            raise IncompleteProfileException(missing_fields=missing)
+
+        return True

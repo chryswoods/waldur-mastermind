@@ -132,7 +132,6 @@ class PushSecurityGroupRulesExecutor(core_executors.ActionExecutor):
 def get_tenant_create_tasks(
     tenant: models.Tenant,
     skip_connection_extnet=False,
-    skip_creation_of_default_router=False,
 ):
     serialized_tenant = core_utils.serialize_instance(tenant)
     creation_tasks = [
@@ -155,19 +154,14 @@ def get_tenant_create_tasks(
             "sync_default_security_group",
         ),
     ]
-    if not skip_creation_of_default_router:
+    if not tenant.skip_creation_of_default_router:
         for router in tenant.routers.all():
             creation_tasks.append(RouterCreateExecutor.as_signature(router))
             creation_tasks.append(RouterSetRoutesExecutor.as_signature(router))
     for network in tenant.networks.all():
         creation_tasks.append(NetworkCreateExecutor.as_signature(network))
         for subnet in network.subnets.all():
-            creation_tasks.append(
-                SubNetCreateExecutor.as_signature(
-                    subnet,
-                    skip_creation_of_default_router=skip_creation_of_default_router,
-                )
-            )
+            creation_tasks.append(SubNetCreateExecutor.as_signature(subnet))
     security_groups = utils.reorder_security_groups_topologically(
         list(tenant.security_groups.exclude(name="default"))
     )
@@ -177,7 +171,7 @@ def get_tenant_create_tasks(
     if (
         external_network_id
         and not skip_connection_extnet
-        and not skip_creation_of_default_router
+        and not tenant.skip_creation_of_default_router
     ):
         creation_tasks.append(
             core_tasks.BackendMethodTask().si(
@@ -219,9 +213,6 @@ class TenantCreateExecutor(core_executors.BaseExecutor):
         return get_tenant_create_tasks(
             tenant,
             skip_connection_extnet=kwargs.get("skip_connection_extnet", False),
-            skip_creation_of_default_router=kwargs.get(
-                "skip_creation_of_default_router", False
-            ),
         )
 
     @classmethod
@@ -295,9 +286,7 @@ class TenantImportExecutor(core_executors.ActionExecutor):
                 serialized_tenant, state_transition="set_ok"
             ),
             tasks.SendSignalTenantPullSucceeded().si(serialized_tenant),
-            core_tasks.BackendMethodTask().si(
-                serialized_tenant, "create_offerings_for_volume_and_instance"
-            ),
+            tasks.create_offerings_task.si(serialized_tenant),
         )
 
 
@@ -427,10 +416,17 @@ class TenantAllocateFloatingIPExecutor(core_executors.ActionExecutor):
 class FloatingIPCreateExecutor(core_executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, floating_ip, serialized_floating_ip, **kwargs):
+        task_kwargs = {"state_transition": "begin_creating"}
+
+        router = kwargs.get("router")
+        if router:
+            serialized_router = core_utils.serialize_instance(router)
+            task_kwargs["serialized_router"] = serialized_router
+
         return core_tasks.BackendMethodTask().si(
             serialized_floating_ip,
             "create_floating_ip",
-            state_transition="begin_creating",
+            **task_kwargs,
         )
 
 
@@ -566,6 +562,19 @@ class ExistingTenantPullExecutor(core_executors.ActionExecutor):
             core_tasks.BackendMethodTask().si(
                 serialized_tenant, "pull_tenant_instances"
             ),
+            core_tasks.BackendMethodTask().si(
+                serialized_tenant, "pull_tenant_load_balancers"
+            ),
+            core_tasks.BackendMethodTask().si(serialized_tenant, "pull_tenant_pools"),
+            core_tasks.BackendMethodTask().si(
+                serialized_tenant, "pull_tenant_listeners"
+            ),
+            core_tasks.BackendMethodTask().si(
+                serialized_tenant, "pull_tenant_pool_members"
+            ),
+            core_tasks.BackendMethodTask().si(
+                serialized_tenant, "pull_tenant_healthmonitors"
+            ),
         )
 
     @classmethod
@@ -602,6 +611,16 @@ class TenantPullSecurityGroupsExecutor(core_executors.ActionExecutor):
         return core_tasks.BackendMethodTask().si(
             serialized_tenant,
             "pull_tenant_security_groups",
+            state_transition="begin_updating",
+        )
+
+
+class TenantPushSecurityGroupsExecutor(core_executors.ActionExecutor):
+    @classmethod
+    def get_task_signature(cls, tenant, serialized_tenant, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_tenant,
+            "push_tenant_security_groups",
             state_transition="begin_updating",
         )
 
@@ -653,6 +672,30 @@ class RouterSetRoutesExecutor(core_executors.ActionExecutor):
     def get_task_signature(cls, router, serialized_router, **kwargs):
         return core_tasks.BackendMethodTask().si(
             serialized_router, "set_static_routes", state_transition="begin_updating"
+        )
+
+
+class RouterSetExternalGatewayExecutor(core_executors.ActionExecutor):
+    action = "set_external_gateway"
+
+    @classmethod
+    def get_task_signature(cls, router, serialized_router, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_router,
+            "set_external_gateway",
+            state_transition="begin_updating",
+        )
+
+
+class RouterRemoveExternalGatewayExecutor(core_executors.ActionExecutor):
+    action = "remove_external_gateway"
+
+    @classmethod
+    def get_task_signature(cls, router, serialized_router, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_router,
+            "remove_external_gateway",
+            state_transition="begin_updating",
         )
 
 
@@ -708,13 +751,9 @@ class SetMtuExecutor(core_executors.ActionExecutor):
 class SubNetCreateExecutor(core_executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, subnet, serialized_subnet, **kwargs):
-        skip_creation_of_default_router = kwargs.get(
-            "skip_creation_of_default_router", False
-        )
         return core_tasks.BackendMethodTask().si(
             serialized_subnet,
             "create_subnet",
-            skip_creation_of_default_router=skip_creation_of_default_router,
             state_transition="begin_creating",
         )
 
@@ -1188,12 +1227,18 @@ class InstanceCreateExecutor(core_executors.CreateExecutor):
                 .set(countdown=30 if index == 0 else 0)
             )
 
-            # Pull volume runtime state
+            # Pull volume runtime state. Deliberately omit "bootable" from
+            # update_fields: Cinder may still report bootable="false" in the
+            # window right after the volume becomes available, which would
+            # clear the flag the serializer set on a system volume and make
+            # create_instance fail its bootable-volume guard
+            # (PUHURI-PORTALS-T2B). The periodic volume pull reconciles the
+            # flag later once Cinder has settled.
             _tasks.append(
                 core_tasks.BackendMethodTask().si(
                     serialized_volume,
                     "pull_volume",
-                    update_fields=["runtime_state", "bootable"],
+                    update_fields=["runtime_state"],
                 )
             )
 
@@ -1379,6 +1424,18 @@ class InstanceUpdateSecurityGroupsExecutor(core_executors.ActionExecutor):
         return core_tasks.BackendMethodTask().si(
             serialized_instance,
             backend_method="push_instance_security_groups",
+            state_transition="begin_updating",
+        )
+
+
+class InstanceUpdateMetadataExecutor(core_executors.ActionExecutor):
+    action = "Update metadata"
+
+    @classmethod
+    def get_task_signature(cls, instance, serialized_instance, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_instance,
+            backend_method="push_instance_metadata",
             state_transition="begin_updating",
         )
 
@@ -1756,6 +1813,48 @@ class InstanceRestartExecutor(core_executors.ActionExecutor):
         )
 
 
+class InstanceRescueExecutor(core_executors.ActionExecutor):
+    action = "Rescue"
+
+    @classmethod
+    def get_task_signature(cls, instance, serialized_instance, **kwargs):
+        rescue_image_ref = kwargs.get("rescue_image_ref")
+        return chain(
+            core_tasks.BackendMethodTask().si(
+                serialized_instance,
+                "rescue_instance",
+                state_transition="begin_updating",
+                rescue_image_ref=rescue_image_ref,
+            ),
+            core_tasks.PollRuntimeStateTask().si(
+                serialized_instance,
+                backend_pull_method="pull_instance_runtime_state",
+                success_state="RESCUE",
+                erred_state="ERRED",
+            ),
+        )
+
+
+class InstanceUnrescueExecutor(core_executors.ActionExecutor):
+    action = "Unrescue"
+
+    @classmethod
+    def get_task_signature(cls, instance, serialized_instance, **kwargs):
+        return chain(
+            core_tasks.BackendMethodTask().si(
+                serialized_instance,
+                "unrescue_instance",
+                state_transition="begin_updating",
+            ),
+            core_tasks.PollRuntimeStateTask().si(
+                serialized_instance,
+                backend_pull_method="pull_instance_runtime_state",
+                success_state="ACTIVE",
+                erred_state="ERRED",
+            ),
+        )
+
+
 class InstanceAllowedAddressPairsUpdateExecutor(core_executors.ActionExecutor):
     action = "Update allowed address pairs"
 
@@ -1929,12 +2028,304 @@ class RouterDeleteExecutor(core_executors.DeleteExecutor):
         )
 
 
+class LoadBalancerCreateExecutor(core_executors.CreateExecutor):
+    @classmethod
+    def get_task_signature(cls, load_balancer, serialized_load_balancer, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_load_balancer,
+            "create_load_balancer",
+            state_transition="begin_creating",
+        )
+
+
+class LoadBalancerDeleteExecutor(core_executors.DeleteExecutor):
+    @classmethod
+    def get_task_signature(cls, load_balancer, serialized_load_balancer, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_load_balancer,
+            "delete_load_balancer",
+            state_transition="begin_deleting",
+        )
+
+
+class LoadBalancerUpdateExecutor(core_executors.UpdateExecutor):
+    @classmethod
+    def get_task_signature(cls, load_balancer, serialized_load_balancer, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_load_balancer,
+            "update_load_balancer",
+            state_transition="begin_updating",
+        )
+
+
+class LoadBalancerAttachFloatingIPExecutor(core_executors.ActionExecutor):
+    @classmethod
+    def get_task_signature(cls, load_balancer, serialized_load_balancer, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_load_balancer,
+            "attach_floating_ip_to_load_balancer_vip",
+            state_transition="begin_updating",
+            serialized_floating_ip=kwargs.get("floating_ip"),
+        )
+
+
+class LoadBalancerDetachFloatingIPExecutor(core_executors.ActionExecutor):
+    @classmethod
+    def get_task_signature(cls, load_balancer, serialized_load_balancer, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_load_balancer,
+            "detach_floating_ip_from_load_balancer_vip",
+            state_transition="begin_updating",
+        )
+
+
+class LoadBalancerSetSecurityGroupsExecutor(core_executors.ActionExecutor):
+    action = "Set security groups on VIP"
+
+    @classmethod
+    def get_task_signature(cls, load_balancer, serialized_load_balancer, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_load_balancer,
+            "set_load_balancer_vip_security_groups",
+            state_transition="begin_updating",
+            serialized_security_groups=kwargs.get("security_groups"),
+        )
+
+
+class PoolCreateExecutor(core_executors.CreateExecutor):
+    @classmethod
+    def get_task_signature(cls, pool, serialized_pool, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_pool,
+            "create_pool",
+            state_transition="begin_creating",
+        )
+
+
+class PoolDeleteExecutor(core_executors.DeleteExecutor):
+    @classmethod
+    def get_task_signature(cls, pool, serialized_pool, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_pool,
+            "delete_pool",
+            state_transition="begin_deleting",
+        )
+
+
+class PoolUpdateExecutor(core_executors.UpdateExecutor):
+    @classmethod
+    def get_task_signature(cls, pool, serialized_pool, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_pool,
+            "update_pool",
+            state_transition="begin_updating",
+        )
+
+
+class ListenerCreateExecutor(core_executors.CreateExecutor):
+    @classmethod
+    def get_task_signature(cls, listener, serialized_listener, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_listener,
+            "create_listener",
+            state_transition="begin_creating",
+        )
+
+
+class ListenerDeleteExecutor(core_executors.DeleteExecutor):
+    @classmethod
+    def get_task_signature(cls, listener, serialized_listener, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_listener,
+            "delete_listener",
+            state_transition="begin_deleting",
+        )
+
+
+class ListenerUpdateExecutor(core_executors.UpdateExecutor):
+    @classmethod
+    def get_task_signature(cls, listener, serialized_listener, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_listener,
+            "update_listener",
+            state_transition="begin_updating",
+        )
+
+
+class PoolMemberCreateExecutor(core_executors.CreateExecutor):
+    @classmethod
+    def get_task_signature(cls, member, serialized_member, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_member,
+            "create_pool_member",
+            state_transition="begin_creating",
+        )
+
+
+class PoolMemberDeleteExecutor(core_executors.DeleteExecutor):
+    @classmethod
+    def get_task_signature(cls, member, serialized_member, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_member,
+            "delete_pool_member",
+            state_transition="begin_deleting",
+        )
+
+
+class PoolMemberUpdateExecutor(core_executors.UpdateExecutor):
+    @classmethod
+    def get_task_signature(cls, member, serialized_member, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_member,
+            "update_pool_member",
+            state_transition="begin_updating",
+        )
+
+
+class HealthMonitorCreateExecutor(core_executors.CreateExecutor):
+    @classmethod
+    def get_task_signature(cls, hm, serialized_hm, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_hm,
+            "create_health_monitor",
+            state_transition="begin_creating",
+        )
+
+
+class HealthMonitorDeleteExecutor(core_executors.DeleteExecutor):
+    @classmethod
+    def get_task_signature(cls, hm, serialized_hm, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_hm,
+            "delete_health_monitor",
+            state_transition="begin_deleting",
+        )
+
+
+class HealthMonitorUpdateExecutor(core_executors.UpdateExecutor):
+    @classmethod
+    def get_task_signature(cls, hm, serialized_hm, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_hm,
+            "update_health_monitor",
+            state_transition="begin_updating",
+        )
+
+
+class LoadBalancerPullExecutor(core_executors.ActionExecutor):
+    action = "pull"
+
+    @classmethod
+    def get_task_signature(cls, load_balancer, serialized_load_balancer, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_load_balancer,
+            "pull_load_balancer",
+            state_transition="begin_updating",
+        )
+
+
+class ListenerPullExecutor(core_executors.ActionExecutor):
+    action = "pull"
+
+    @classmethod
+    def get_task_signature(cls, listener, serialized_listener, **kwargs):
+        serialized_lb = kwargs["serialized_load_balancer"]
+        serialized_tenant = kwargs["serialized_tenant"]
+        return chain(
+            core_tasks.BackendMethodTask().si(
+                serialized_tenant,
+                "pull_tenant_pools",
+            ),
+            core_tasks.BackendMethodTask().si(
+                serialized_listener,
+                "pull_listener",
+                state_transition="begin_updating",
+            ),
+            core_tasks.BackendMethodTask().si(
+                serialized_lb,
+                "pull_load_balancer",
+            ),
+        )
+
+
+class PoolPullExecutor(core_executors.ActionExecutor):
+    action = "pull"
+
+    @classmethod
+    def get_task_signature(cls, pool, serialized_pool, **kwargs):
+        serialized_lb = kwargs["serialized_load_balancer"]
+        return chain(
+            core_tasks.BackendMethodTask().si(
+                serialized_pool,
+                "pull_pool",
+                state_transition="begin_updating",
+            ),
+            core_tasks.BackendMethodTask().si(
+                serialized_lb,
+                "pull_load_balancer",
+            ),
+        )
+
+
+class PoolMemberPullExecutor(core_executors.ActionExecutor):
+    action = "pull"
+
+    @classmethod
+    def get_task_signature(cls, member, serialized_member, **kwargs):
+        serialized_pool = kwargs["serialized_pool"]
+        serialized_lb = kwargs["serialized_load_balancer"]
+        return chain(
+            core_tasks.BackendMethodTask().si(
+                serialized_member,
+                "pull_pool_member",
+                state_transition="begin_updating",
+            ),
+            core_tasks.BackendMethodTask().si(
+                serialized_pool,
+                "pull_pool",
+            ),
+            core_tasks.BackendMethodTask().si(
+                serialized_lb,
+                "pull_load_balancer",
+            ),
+        )
+
+
+class HealthMonitorPullExecutor(core_executors.ActionExecutor):
+    action = "pull"
+
+    @classmethod
+    def get_task_signature(cls, hm, serialized_hm, **kwargs):
+        serialized_pool = kwargs["serialized_pool"]
+        serialized_lb = kwargs["serialized_load_balancer"]
+        return chain(
+            core_tasks.BackendMethodTask().si(
+                serialized_hm,
+                "pull_health_monitor",
+                state_transition="begin_updating",
+            ),
+            core_tasks.BackendMethodTask().si(
+                serialized_pool,
+                "pull_pool",
+            ),
+            core_tasks.BackendMethodTask().si(
+                serialized_lb,
+                "pull_load_balancer",
+            ),
+        )
+
+
 class OpenStackCleanupExecutor(structure_executors.BaseCleanupExecutor):
     executors = (
         (models.SecurityGroup, SecurityGroupDeleteExecutor),
         (models.FloatingIP, FloatingIPDeleteExecutor),
         (models.SubNet, SubNetDeleteExecutor),
         (models.Network, NetworkDeleteExecutor),
+        (models.LoadBalancer, LoadBalancerDeleteExecutor),
+        (models.Pool, PoolDeleteExecutor),
+        (models.PoolMember, PoolMemberDeleteExecutor),
+        (models.HealthMonitor, HealthMonitorDeleteExecutor),
+        (models.Listener, ListenerDeleteExecutor),
         (models.Tenant, TenantDeleteExecutor),
         (models.ServerGroup, ServerGroupDeleteExecutor),
         (models.Snapshot, SnapshotDeleteExecutor),

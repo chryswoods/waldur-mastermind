@@ -30,6 +30,36 @@ class WaldurCore(BaseModel):
     AUTHENTICATION_METHODS: list[str] = Field(
         ["LOCAL_SIGNIN"], description="List of enabled authentication methods."
     )
+    PASSKEY_RP_ID: str = Field(
+        "",
+        description="WebAuthn Relying Party ID: the bare registrable domain that "
+        "passkeys are bound to, without scheme or port, e.g. 'waldur.example.com'. "
+        "Has no default and cannot be derived from the request, because no "
+        "deployment sets SECURE_PROXY_SSL_HEADER. Changing it orphans every "
+        "credential already registered.",
+    )
+    PASSKEY_RP_NAME: str = Field(
+        "",
+        description="Human-readable Relying Party name shown by the authenticator "
+        "during registration. Defaults to SITE_NAME when left empty.",
+    )
+    PASSKEY_ALLOWED_ORIGINS: list[str] = Field(
+        [],
+        description="Full origins the SPA may run WebAuthn ceremonies from, "
+        "e.g. ['https://waldur.example.com']. Each must be subordinate to "
+        "PASSKEY_RP_ID, and HTTPS outside localhost.",
+    )
+    PASSKEY_ENFORCED_FOR_STAFF: bool = Field(
+        False,
+        description="Require staff and support accounts to hold a passkey and "
+        "to have satisfied it for the current session. Closes the paths that "
+        "otherwise yield a privileged session without one: reading another "
+        "user's raw API token, impersonation, the Django admin login form, "
+        "and minting a personal access token. Enabling it logs every staff "
+        "member out, because pre-existing tokens were issued without a "
+        "passkey; run 'waldur revoke_unverified_staff_tokens' as part of the "
+        "rollout.",
+    )
     INVITATIONS_ENABLED: bool = Field(
         True, description="Allows to disable invitations feature."
     )
@@ -41,11 +71,7 @@ class WaldurCore(BaseModel):
         description="Defines for how long user token should remain valid if there was no action from user.",
     )
     INVITATION_LIFETIME: timedelta = Field(
-        timedelta(weeks=4), description="Defines for how long invitation remains valid."
-    )
-    GROUP_INVITATION_LIFETIME: timedelta = Field(
-        timedelta(weeks=4),
-        description="Defines for how long group invitation remains valid.",
+        timedelta(weeks=1), description="Defines for how long invitation remains valid."
     )
     BACKEND_FIELDS_EDITABLE: bool = Field(
         True,
@@ -56,10 +82,6 @@ class WaldurCore(BaseModel):
     CREATE_DEFAULT_PROJECT_ON_ORGANIZATION_CREATION: bool = Field(
         False,
         description="Enables generation of the first project on organization creation.",
-    )
-    NATIVE_NAME_ENABLED: bool = Field(
-        False,
-        description="Allows to render native name field in customer and user forms.",
     )
     NOTIFICATIONS_PROFILE_CHANGES: dict[str, Any] = Field(
         {
@@ -271,9 +293,11 @@ class WaldurCore(BaseModel):
         public_settings: list[str] = [
             "MASTERMIND_URL",
             "AUTHENTICATION_METHODS",
+            # The portal has to know whether a staff account without a
+            # credential should be held at the enrollment interstitial.
+            "PASSKEY_ENFORCED_FOR_STAFF",
             "INVITATIONS_ENABLED",
             "VALIDATE_INVITATION_EMAIL",
-            "NATIVE_NAME_ENABLED",
             "PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS",
             "TRANSLATION_DOMAIN",
             "MATOMO_URL_BASE",
@@ -292,6 +316,40 @@ class WaldurCore(BaseModel):
             "COURSE_ACCOUNT_USE_API",
             "ENABLE_PROJECT_KIND_COURSE",
         ]
+
+
+class WaldurUserActions(BaseModel):
+    """Configuration for user actions notification system."""
+
+    ENABLED: bool = Field(
+        False,
+        description="Enable the user actions notification system.",
+    )
+
+    MAX_ACTIONS_PER_USER: int = Field(
+        100,
+        description="Maximum number of actions to store per user.",
+    )
+
+    DEFAULT_SILENCE_DURATION_DAYS: int = Field(
+        7,
+        description="Default number of days to silence actions when no duration is specified.",
+    )
+
+    NOTIFICATION_ENABLED: bool = Field(
+        False,
+        description="Enable daily digest notifications for user actions.",
+    )
+
+    HIGH_URGENCY_NOTIFICATION_THRESHOLD: int = Field(
+        1,
+        description="Number of high urgency actions that trigger immediate notification.",
+    )
+
+    CLEANUP_EXECUTION_HISTORY_DAYS: int = Field(
+        90,
+        description="Number of days to keep action execution history.",
+    )
 
 
 class WaldurAuthSocial(BaseModel):
@@ -379,16 +437,21 @@ class WaldurHPC(BaseModel):
 
 
 class WaldurOpenPortal(BaseModel):
-    ENABLED = Field(
+    ENABLED: bool = Field(
         False,
         description="Enable support for OpenPortal plugin in a deployment",
     )
-    DEFAULT_LIMITS = Field(
+    DEFAULT_LIMITS: dict[str, int] = Field(
         {
             "NODE": 1000,  # Measured unit is node-hours
         },
         description="Default limits of account that are set when OpenPortal account is provisioned.",
     )
+
+    class Meta:
+        public_settings: list[str] = [
+            "ENABLED",
+        ]
 
 
 class WaldurSlurm(BaseModel):
@@ -660,6 +723,7 @@ class WaldurConfiguration(BaseModel):
     WALDUR_OPENPORTAL: WaldurOpenPortal = WaldurOpenPortal()
     WALDUR_OPENSTACK: WaldurOpenstack = WaldurOpenstack()
     WALDUR_AUTH_SAML2: WaldurAuthSAML2 = WaldurAuthSAML2()
+    WALDUR_USER_ACTIONS: WaldurUserActions = WaldurUserActions()
     VERIFY_WEBHOOK_REQUESTS: bool = Field(
         True,
         description="When webook is processed, requests verifies SSL certificates for HTTPS requests, just like a web browser.",

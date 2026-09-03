@@ -1,12 +1,15 @@
 from unittest.mock import Mock
 
+from constance.test import override_config
 from django.contrib.contenttypes.models import ContentType
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework import exceptions, test
+from rest_framework.exceptions import ValidationError
 
 from waldur_core.permissions import models, utils
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
-from waldur_core.permissions.fixtures import CustomerRole
+from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.structure.tests import factories, fixtures
 
 
@@ -88,7 +91,7 @@ class HasPermissionUtilTest(TestCase):
         self.assertEqual(result_user, result_request)
 
 
-class PermissionFactoryTest(test.APITransactionTestCase):
+class PermissionFactoryTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -412,3 +415,177 @@ class HasUserUtilTest(TestCase):
 
         result = utils.has_user(self.customer, self.user, self.role)
         self.assertFalse(result)
+
+
+class BulkPermissionTest(TestCase):
+    """Tests for has_any_permission and has_all_permissions utilities."""
+
+    def setUp(self):
+        self.fixture = fixtures.CustomerFixture()
+        self.customer = self.fixture.customer
+        self.owner = self.fixture.owner
+        self.user = factories.UserFactory()
+        self.staff_user = factories.UserFactory(is_staff=True)
+        # Add specific permissions to customer owner role
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_OFFERING)
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING)
+
+    def test_has_any_permission_returns_true_when_user_has_one(self):
+        """Test that has_any_permission returns True when user has at least one permission."""
+        permissions = [PermissionEnum.CREATE_OFFERING, PermissionEnum.DELETE_OFFERING]
+        result = utils.has_any_permission(self.owner, permissions, self.customer)
+        self.assertTrue(result)
+
+    def test_has_any_permission_returns_false_when_user_has_none(self):
+        """Test that has_any_permission returns False when user has no permissions."""
+        permissions = [PermissionEnum.CREATE_OFFERING, PermissionEnum.DELETE_OFFERING]
+        result = utils.has_any_permission(self.user, permissions, self.customer)
+        self.assertFalse(result)
+
+    def test_has_all_permissions_returns_true_when_user_has_all(self):
+        """Test that has_all_permissions returns True when user has all permissions."""
+        permissions = [PermissionEnum.CREATE_OFFERING, PermissionEnum.UPDATE_OFFERING]
+        result = utils.has_all_permissions(self.owner, permissions, self.customer)
+        self.assertTrue(result)
+
+    def test_has_all_permissions_returns_false_when_user_lacks_one(self):
+        """Test that has_all_permissions returns False when user lacks any permission."""
+        permissions = [PermissionEnum.CREATE_OFFERING, PermissionEnum.DELETE_OFFERING]
+        result = utils.has_all_permissions(self.owner, permissions, self.customer)
+        self.assertFalse(result)
+
+    def test_staff_user_passes_any_permission_check(self):
+        """Test that staff users pass all bulk permission checks."""
+        permissions = [PermissionEnum.CREATE_OFFERING, PermissionEnum.DELETE_OFFERING]
+        self.assertTrue(
+            utils.has_any_permission(self.staff_user, permissions, self.customer)
+        )
+        self.assertTrue(
+            utils.has_all_permissions(self.staff_user, permissions, self.customer)
+        )
+
+    def test_has_any_permission_with_none_scope(self):
+        """Test that has_any_permission returns False for None scope."""
+        permissions = [PermissionEnum.CREATE_OFFERING]
+        result = utils.has_any_permission(self.owner, permissions, None)
+        self.assertFalse(result)
+
+    def test_has_all_permissions_with_none_scope(self):
+        """Test that has_all_permissions returns False for None scope."""
+        permissions = [PermissionEnum.CREATE_OFFERING]
+        result = utils.has_all_permissions(self.owner, permissions, None)
+        self.assertFalse(result)
+
+    def test_inactive_user_fails_any_permission_check(self):
+        """Test that inactive users fail all bulk permission checks."""
+        self.owner.is_active = False
+        self.owner.save()
+
+        permissions = [PermissionEnum.CREATE_OFFERING]
+        self.assertFalse(
+            utils.has_any_permission(self.owner, permissions, self.customer)
+        )
+        self.assertFalse(
+            utils.has_all_permissions(self.owner, permissions, self.customer)
+        )
+
+    def test_has_any_permission_accepts_request_object(self):
+        """Test that has_any_permission accepts request object."""
+        mock_request = Mock()
+        mock_request.user = self.owner
+
+        permissions = [PermissionEnum.CREATE_OFFERING]
+        result = utils.has_any_permission(mock_request, permissions, self.customer)
+        self.assertTrue(result)
+
+
+class PermissionFactoryValidationTest(TestCase):
+    """Tests for permission_factory input validation."""
+
+    def test_raises_value_error_for_invalid_permission_type(self):
+        """Test that permission_factory raises ValueError for invalid permission type."""
+        with self.assertRaises(ValueError) as context:
+            utils.permission_factory("OFFERING.CREATE")
+        self.assertIn("permission must be PermissionEnum", str(context.exception))
+
+    def test_raises_value_error_for_invalid_sources_type(self):
+        """Test that permission_factory raises ValueError for invalid sources type."""
+        with self.assertRaises(ValueError) as context:
+            utils.permission_factory(PermissionEnum.CREATE_OFFERING, sources="customer")
+        self.assertIn("sources must be a list or None", str(context.exception))
+
+    def test_accepts_valid_permission_enum(self):
+        """Test that permission_factory accepts valid PermissionEnum."""
+        result = utils.permission_factory(PermissionEnum.CREATE_OFFERING)
+        self.assertIsNotNone(result)
+
+    def test_accepts_none_sources(self):
+        """Test that permission_factory accepts None sources."""
+        result = utils.permission_factory(PermissionEnum.CREATE_OFFERING, sources=None)
+        self.assertIsNotNone(result)
+
+    def test_accepts_list_sources(self):
+        """Test that permission_factory accepts list sources."""
+        result = utils.permission_factory(
+            PermissionEnum.CREATE_OFFERING, sources=["customer"]
+        )
+        self.assertIsNotNone(result)
+
+
+class OnlyOneProjectManagerTest(TestCase):
+    def setUp(self):
+        self.project = factories.ProjectFactory()
+        self.manager = factories.UserFactory()
+        self.other_user = factories.UserFactory()
+
+    def test_disabled_by_default_allows_second_manager(self):
+        self.project.add_user(self.manager, ProjectRole.MANAGER)
+
+        utils.validate_role_grant(self.project, self.other_user, ProjectRole.MANAGER)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_enabled_blocks_second_manager(self):
+        self.project.add_user(self.manager, ProjectRole.MANAGER)
+
+        with self.assertRaisesMessage(
+            ValidationError, "Project already has an active project manager."
+        ):
+            utils.validate_role_grant(
+                self.project, self.other_user, ProjectRole.MANAGER
+            )
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_enabled_allows_first_manager(self):
+        utils.validate_role_grant(self.project, self.manager, ProjectRole.MANAGER)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_enabled_allows_admin_when_manager_exists(self):
+        self.project.add_user(self.manager, ProjectRole.MANAGER)
+
+        utils.validate_role_grant(self.project, self.other_user, ProjectRole.ADMIN)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_enabled_allows_manager_on_another_project(self):
+        self.project.add_user(self.manager, ProjectRole.MANAGER)
+        other_project = factories.ProjectFactory(customer=self.project.customer)
+
+        utils.validate_role_grant(other_project, self.other_user, ProjectRole.MANAGER)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_enabled_allows_manager_after_previous_is_revoked(self):
+        self.project.add_user(self.manager, ProjectRole.MANAGER)
+        utils.delete_user(self.project, self.manager, ProjectRole.MANAGER)
+
+        utils.validate_role_grant(self.project, self.other_user, ProjectRole.MANAGER)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_expired_manager_does_not_block_new_manager(self):
+        expired_manager = factories.UserFactory()
+        utils.add_user(
+            self.project,
+            expired_manager,
+            ProjectRole.MANAGER,
+            expiration_time=timezone.now() - timezone.timedelta(days=1),
+        )
+
+        utils.validate_role_grant(self.project, self.other_user, ProjectRole.MANAGER)

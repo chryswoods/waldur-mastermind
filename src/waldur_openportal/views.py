@@ -5,36 +5,33 @@ from django.http import Http404
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter
 from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
 from rest_framework import filters as rf_filters
 from rest_framework import permissions, response, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import BasePermission
+from rest_framework.response import Response
 
-from waldur_core.core.enums import ReviewStates
 from waldur_core.core import executors as core_executors
+from waldur_core.core import models as core_models
+from waldur_core.core import utils as core_utils
+from waldur_core.core import views as core_views
+from waldur_core.core.enums import ReviewStates
+from waldur_core.core.permissions import IsAdminOrReadOnly
+from waldur_core.core.serializers import ReviewCommentSerializer
+from waldur_core.core.validators import StateValidator
+from waldur_core.permissions.fixtures import ServiceProviderRole
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import views as structure_views
-from waldur_core.core import views as core_views
-from waldur_core.core import models as core_models
-from waldur_core.core.serializers import ReviewCommentSerializer, EmptySerializer
 from waldur_core.structure.filters import GenericRoleFilter
-from waldur_core.core.validators import StateValidator
-
-from waldur_core.permissions.fixtures import ServiceProviderRole
-from waldur_core.core.permissions import IsAdminOrReadOnly
-from waldur_core.structure.permissions import IsAdminOrOwner
-from waldur_core.structure.permissions import _has_owner_access
-from waldur_core.core import utils as core_utils
-
 from waldur_core.structure.managers import filter_queryset_for_user
+from waldur_core.structure.permissions import IsAdminOrOwner, _has_owner_access
 
-from . import executors, filters, models, serializers, tasks, utils
+from . import config, executors, filters, models, serializers, tasks, utils
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +55,11 @@ class AllocationViewSet(structure_views.ResourceViewSet):
     set_limits_permissions = [structure_permissions.is_staff]
     set_limits_serializer_class = serializers.AllocationSetLimitsSerializer
 
+    @extend_schema(
+        request=serializers.AllocationSetLimitsSerializer,
+        responses={status.HTTP_202_ACCEPTED: None},
+        description="Set limits for allocation",
+    )
     @action(detail=True, methods=["post"])
     def set_limits(self, request, uuid=None):
         instance = self.get_object()
@@ -87,6 +89,11 @@ class RemoteAllocationViewSet(structure_views.ResourceViewSet):
     set_limits_permissions = [structure_permissions.is_staff]
     set_limits_serializer_class = serializers.RemoteAllocationSetLimitsSerializer
 
+    @extend_schema(
+        request=serializers.AllocationSetLimitsSerializer,
+        responses={status.HTTP_202_ACCEPTED: None},
+        description="Set limits for allocation",
+    )
     @action(detail=True, methods=["post"])
     def set_limits(self, request, uuid=None):
         instance = self.get_object()
@@ -132,11 +139,11 @@ class CachedProjectUsageReportViewSet(viewsets.ReadOnlyModelViewSet):
         # Restrict to project_identifiers reachable via allocations on projects
         # the user has any role in, including projects in customers where the user
         # is an organisation viewer.
+        import openportal
+
         from waldur_core.structure.managers import get_visible_projects
 
-        from . import op as openportal
-
-        openportal.ensure_config_loaded()
+        config.ensure_config_loaded()
         accessible_project_ids = list(get_visible_projects(user))
         portal = str(openportal.get_portal())
         # Identifiers from allocations (covers active projects with existing allocations)
@@ -191,11 +198,11 @@ class CachedProjectStorageReportViewSet(viewsets.ReadOnlyModelViewSet):
         )
         if user.is_staff or user.is_support:
             return qs
+        import openportal
+
         from waldur_core.structure.managers import get_visible_projects
 
-        from . import op as openportal
-
-        openportal.ensure_config_loaded()
+        config.ensure_config_loaded()
         accessible_project_ids = list(get_visible_projects(user))
         portal = str(openportal.get_portal())
         # Identifiers from allocations (covers active projects with existing allocations)
@@ -249,7 +256,7 @@ class AssociationViewSet(viewsets.ReadOnlyModelViewSet):
 
 class RemoteAssociationViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "uuid"
-    queryset = models.RemoteAssociation.objects.all()
+    queryset = models.RemoteAssociation.objects.all().order_by("id")
     serializer_class = serializers.RemoteAssociationSerializer
     permission_classes = (
         permissions.IsAuthenticated,
@@ -299,6 +306,10 @@ class UserInfoViewSet(core_views.ActionsViewSet):
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.UserInfoSerializer},
+        description="Retrieve UserInfo for current user",
+    )
     @action(detail=False, methods=["get"])
     def me(self, request):
         logger.info(f"Retrieving UserInfo for 'me'=user {request.user}")
@@ -315,6 +326,10 @@ class UserInfoViewSet(core_views.ActionsViewSet):
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.UserInfoSerializer},
+        description="Set shortname for user",
+    )
     @action(detail=True, methods=["PUT"])
     def set_shortname(self, request, user=None):
         try:
@@ -389,6 +404,10 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.ProjectInfoSerializer},
+        description="Set shortname for project",
+    )
     @action(detail=True, methods=["PUT"])
     def set_shortname(self, request, project=None):
         try:
@@ -424,6 +443,10 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.ProjectInfoSerializer},
+        description="Set allowed destinations for project",
+    )
     @action(detail=True, methods=["PUT"])
     def set_allowed_destinations(self, request, project=None):
         try:
@@ -789,7 +812,6 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
 
     serializer_class = serializers.ManagedProjectSerializer
     attach_serializer_class = serializers.ProjectAttachSerializer
-    detach_serializer_class = EmptySerializer
     approve_serializer_class = reject_serializer_class = ReviewCommentSerializer
 
     approve_validators = reject_validators = [
@@ -916,7 +938,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     @action(
         detail=False,
         methods=["get", "head"],
-        url_path=r"(?P<identifier>[^/]+)/(?P<destination>[^/]+)",
+        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)",
     )
     def retrieve_custom(self, request, identifier=None, destination=None, **kwargs):
         """Custom retrieve action with composite key"""
@@ -952,7 +974,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     @action(
         detail=False,
         methods=["post"],
-        url_path=r"(?P<identifier>[^/]+)/(?P<destination>[^/]+)/approve",
+        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)/approve",
     )
     def approve(self, request, identifier=None, destination=None, **kwargs):
         project: models.ManagedProject = self.get_object()
@@ -1009,7 +1031,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     @action(
         detail=False,
         methods=["post"],
-        url_path=r"(?P<identifier>[^/]+)/(?P<destination>[^/]+)/reject",
+        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)/reject",
     )
     def reject(self, request, identifier=None, destination=None, **kwargs):
         project: models.ManagedProject = self.get_object()
@@ -1021,6 +1043,11 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         comment = serializer.validated_data.get("comment")
         project.reject(request.user, comment)
         project.notify_rejected()
+
+        # notify project admins and managers about the rejection
+        tasks.notify_users_about_rejected_allocation.delay(
+            core_utils.serialize_instance(project)
+        )
 
         models.ManagedProjectAuditEntry.record(
             project,
@@ -1052,7 +1079,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     @action(
         detail=False,
         methods=["delete"],
-        url_path=r"(?P<identifier>[^/]+)/(?P<destination>[^/]+)/delete",
+        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)/delete",
     )
     def delete(self, request, identifier=None, destination=None, **kwargs):
         project: models.ManagedProject = self.get_object()
@@ -1094,7 +1121,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     @action(
         detail=False,
         methods=["post"],
-        url_path=r"(?P<identifier>[^/]+)/(?P<destination>[^/]+)/attach",
+        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)/attach",
     )
     def attach(self, request, identifier=None, destination=None, **kwargs):
         managed_project: models.ManagedProject = self.get_object()
@@ -1146,6 +1173,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
             )
 
     @extend_schema(
+        request=None,
         parameters=[
             OpenApiParameter(
                 name="identifier",
@@ -1166,7 +1194,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
     @action(
         detail=False,
         methods=["post"],
-        url_path=r"(?P<identifier>[^/]+)/(?P<destination>[^/]+)/detach",
+        url_path=r"(?P<identifier>[^/.]+)/(?P<destination>[^/.]+)/detach",
     )
     def detach(self, request, identifier=None, destination=None, **kwargs):
         managed_project: models.ManagedProject = self.get_object()
@@ -1228,7 +1256,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         serializer = serializers.AddManagedProjectNoteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        from . import op as openportal
+        import openportal
 
         details = managed_project.get_details()
         details.add_note(
@@ -1258,19 +1286,6 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         )
 
 
-@extend_schema_view(
-    list=extend_schema(
-        parameters=[
-            OpenApiParameter(
-                name="include_offering_names",
-                type=OpenApiTypes.BOOL,
-                location=OpenApiParameter.QUERY,
-                description="If true, include the offering_names field listing "
-                "the names of offerings currently attached to each project.",
-            ),
-        ],
-    ),
-)
 class ProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
     """
     Read-only endpoint returning accounting summaries for projects.
@@ -1285,11 +1300,6 @@ class ProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
     Filterable by:
       - project_uuid: return summary for a single project
       - customer_uuid: return summaries for all projects in an organisation
-      - offering_name: return summaries for projects with an attached offering
-        whose name matches (case-insensitive, partial match)
-
-    Pass include_offering_names=true to also return the offering_names field,
-    listing the names of offerings currently attached to each project.
     """
 
     queryset = structure_models.Project.objects.none()
@@ -1310,57 +1320,6 @@ class ProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
             return qs
         accessible_project_ids = list(get_visible_projects(user))
         return qs.filter(id__in=accessible_project_ids)
-
-    def _include_offering_names(self):
-        value = self.request.query_params.get("include_offering_names", "")
-        return value.lower() in ("true", "1", "yes")
-
-    def _get_offering_names_by_project(self, projects):
-        from waldur_mastermind.marketplace import models as marketplace_models
-        from waldur_mastermind.marketplace.enums import ResourceStates
-
-        project_ids = [project.id for project in projects]
-        rows = (
-            marketplace_models.Resource.objects.filter(
-                project_id__in=project_ids, state=ResourceStates.OK
-            )
-            .values_list("project_id", "offering__name")
-            .distinct()
-        )
-        result = {}
-        for project_id, offering_name in rows:
-            result.setdefault(project_id, []).append(offering_name)
-        return result
-
-    def get_serializer_context(self):
-        context = super().get_serializer_context()
-        context["include_offering_names"] = self._include_offering_names()
-        context["offering_names_by_project"] = getattr(
-            self, "_offering_names_by_project", {}
-        )
-        return context
-
-    def list(self, request, *args, **kwargs):
-        queryset = self.filter_queryset(self.get_queryset())
-        page = self.paginate_queryset(queryset)
-        projects = page if page is not None else queryset
-        if self._include_offering_names():
-            self._offering_names_by_project = self._get_offering_names_by_project(
-                projects
-            )
-        serializer = self.get_serializer(projects, many=True)
-        if page is not None:
-            return self.get_paginated_response(serializer.data)
-        return Response(serializer.data)
-
-    def retrieve(self, request, *args, **kwargs):
-        instance = self.get_object()
-        if self._include_offering_names():
-            self._offering_names_by_project = self._get_offering_names_by_project(
-                [instance]
-            )
-        serializer = self.get_serializer(instance)
-        return Response(serializer.data)
 
 
 class UnmanagedProjectViewSet(structure_views.ProjectViewSet):
@@ -1465,6 +1424,11 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
                     core_utils.serialize_instance(project)
                 )
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.RemoteProjectSerializer},
+        request=serializers.AddNoteSerializer,
+        description="Add note to remote project",
+    )
     @action(detail=True, methods=["post"], url_path="add-note")
     def add_note(self, request, uuid=None):
         """
@@ -1479,7 +1443,7 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        author = serializer.validated_data["author"]
+        author = request.user.full_name or request.user.email
         text = serializer.validated_data["text"]
 
         note = {
@@ -1506,6 +1470,11 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
             ).data
         )
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.RemoteProjectSerializer},
+        request=serializers.SetEarliestApproveSerializer,
+        description="Set earliest approve date for remote project",
+    )
     @action(
         detail=True,
         methods=["post"],
@@ -1540,6 +1509,11 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
             ).data
         )
 
+    @extend_schema(
+        responses={status.HTTP_202_ACCEPTED: None},
+        request=serializers.SetMembershipControlSerializer,
+        description="Set membership control for remote project",
+    )
     @action(
         detail=True,
         methods=["post"],
@@ -1565,6 +1539,11 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
 
         return Response(status=status.HTTP_202_ACCEPTED)
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.RemoteProjectSerializer},
+        request=serializers.SetAllowedDomainsSerializer,
+        description="Set allowed domains for remote project",
+    )
     @action(
         detail=True,
         methods=["post"],
@@ -1572,8 +1551,9 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
     )
     def set_allowed_domains(self, request, uuid=None):
         """
-        Replace the list of allowed email domain patterns.  Pass an
-        empty list to remove all restrictions.
+        Replace the list of allowed email domain patterns.  Pass null to
+        remove all restrictions; an empty list means that no address is
+        allowed to join.
         """
         remote_project = self.get_object()
         self._check_write_permission(request, remote_project)
@@ -1582,9 +1562,9 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        from . import op as openportal
+        import openportal
 
-        for domain in serializer.validated_data["allowed_domains"]:
+        for domain in serializer.validated_data["allowed_domains"] or []:
             if "@" not in domain and utils.is_likely_personal_email_address(domain):
                 raise ValidationError(
                     {
@@ -1614,6 +1594,11 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
             ).data
         )
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.RemoteProjectSerializer},
+        request=serializers.SetLinksSerializer,
+        description="Set links for remote project",
+    )
     @action(detail=True, methods=["post"], url_path="set-links")
     def set_links(self, request, uuid=None):
         """
@@ -1660,6 +1645,11 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
             ).data
         )
 
+    @extend_schema(
+        request=None,
+        responses={status.HTTP_200_OK: serializers.RemoteProjectSerializer},
+        description="Approve remote project now",
+    )
     @action(detail=True, methods=["post"], url_path="approve-now")
     def approve_now(self, request, uuid=None):
         """
@@ -1687,6 +1677,11 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
             ).data
         )
 
+    @extend_schema(
+        request=None,
+        responses={status.HTTP_200_OK: serializers.RemoteProjectSerializer},
+        description="Hold remote project indefinitely",
+    )
     @action(
         detail=True,
         methods=["post"],
@@ -1724,6 +1719,11 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
             ).data
         )
 
+    @extend_schema(
+        request=None,
+        responses={status.HTTP_200_OK: serializers.RemoteProjectSerializer},
+        description="Reset remote project to pending",
+    )
     @action(detail=True, methods=["post"], url_path="reset-to-pending")
     def reset_to_pending(self, request, uuid=None):
         """
@@ -1744,6 +1744,11 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
             ).data
         )
 
+    @extend_schema(
+        request=None,
+        responses={status.HTTP_200_OK: serializers.RemoteProjectSerializer},
+        description="Resend remote project request",
+    )
     @action(detail=True, methods=["post"], url_path="resend-request")
     def resend_request(self, request, uuid=None):
         """
@@ -1766,6 +1771,10 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
             ).data
         )
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: OpenApiTypes.OBJECT},
+        description="Get total usage for remote project",
+    )
     @action(detail=True, methods=["get"], url_path="total-usage")
     def total_usage(self, request, uuid=None):
         """

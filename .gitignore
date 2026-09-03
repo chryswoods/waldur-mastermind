@@ -7,6 +7,7 @@
 *.mo
 .DS_Store
 src/waldur_core/server/settings.py
+src/waldur_core/server/settings_local.py
 
 # Editor artifacts
 /.idea
@@ -29,6 +30,15 @@ pytest.ini
 __pycache__/
 
 .vscode/
+pyrightconfig.json
 
-waldur-openapi-schema.yaml
+# Local Matrix appservice registration (contains dev tokens)
+docker/matrix-dev/appservices/
+
+# Local scratch and generated artifacts (never commit to this repo)
+scratchpad/
 waldur-typescript-sdk/
+waldur-openapi-schema.yaml
+
+# UI review screenshot artifacts (not for commit)
+.ui-review-shots/

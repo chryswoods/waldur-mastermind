@@ -1,27 +1,25 @@
-import logging
 import json
+import logging
 
-from . import op as openportal
-
+import openportal
 from django.conf import settings
+from django.core import validators
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.db.models import F
 from django.utils.translation import gettext_lazy as _
-from django.core import validators
-
 from model_utils import FieldTracker
 
 from waldur_core.core import models as core_models
-from waldur_core.core import utils as core_utils
-from waldur_core.structure import models as structure_models
-from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.invoices import models as invoice_models
-from waldur_core.structure.managers import get_project_users
-from waldur_core.permissions.models import UserRole, Role
-from waldur_core.core.mixins import ReviewMixin
 from waldur_core.core.enums import ReviewStates
+from waldur_core.core.mixins import ReviewMixin
+from waldur_core.permissions.models import Role, UserRole
+from waldur_core.structure import models as structure_models
+from waldur_core.structure.managers import get_project_users
+from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_openportal import utils
+
+from . import config
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +70,10 @@ class UsageMixin(models.Model):
     node_usage = models.DecimalField(default=0, decimal_places=2, max_digits=20)
 
 
-class Allocation(UsageMixin, structure_models.BaseResource):
+class Allocation(UsageMixin, structure_models.BaseResource, core_models.AvailableMixin):
+    class Meta(structure_models.BaseResource.Meta):
+        pass
+
     is_active = models.BooleanField(default=True)
     tracker = FieldTracker()
 
@@ -162,7 +163,12 @@ class Allocation(UsageMixin, structure_models.BaseResource):
         return self.__str__()
 
 
-class RemoteAllocation(UsageMixin, structure_models.BaseResource):
+class RemoteAllocation(
+    UsageMixin, structure_models.BaseResource, core_models.AvailableMixin
+):
+    class Meta(structure_models.BaseResource.Meta):
+        pass
+
     is_active = models.BooleanField(default=True)
     tracker = FieldTracker()
 
@@ -372,13 +378,13 @@ class RemoteAllocation(UsageMixin, structure_models.BaseResource):
 
         return (allocation, allocation_unit)
 
-    def get_project_details(self) -> openportal.ProjectDetails:
+    def get_project_details(self) -> openportal.AwardDetails:
         if self.project is None:
             raise ValueError("Project is not set!")
 
         project = self.project
 
-        details = openportal.ProjectDetails("{}")
+        details = openportal.AwardDetails("{}")
 
         if project.name is not None:
             details.name = str(project.name)
@@ -1682,7 +1688,7 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
     # Combination of name, offering and portal must be unique
     class Meta:
         unique_together = ("name", "offering", "portal")
-        ordering = ["name"]
+        ordering = ["name", "id"]
         verbose_name = _("Project class")
         verbose_name_plural = _("Project classes")
 
@@ -2245,16 +2251,16 @@ class ManagedProject(ReviewMixin, models.Model):
             f"{self.get_remote_identifier()}:{self.get_local_identifier()}"
         )
 
-    def set_details(self, details: openportal.ProjectDetails):
+    def set_details(self, details: openportal.AwardDetails):
         """
-        Set the ProjectDetails object for this project.
-        If the details are not an instance of ProjectDetails, convert it.
+        Set the AwardDetails object for this project.
+        If the details are not an instance of AwardDetails, convert it.
         """
-        if not isinstance(details, openportal.ProjectDetails):
+        if not isinstance(details, openportal.AwardDetails):
             if not isinstance(details, str):
-                details = openportal.ProjectDetails(json.dumps(details))
+                details = openportal.AwardDetails(json.dumps(details))
             else:
-                details = openportal.ProjectDetails(details)
+                details = openportal.AwardDetails(details)
 
         new_details = json.loads(str(details))
 
@@ -2284,12 +2290,12 @@ class ManagedProject(ReviewMixin, models.Model):
                     new_details=self.details,
                 )
 
-    def get_details(self) -> openportal.ProjectDetails:
+    def get_details(self) -> openportal.AwardDetails:
         """
-        Get the ProjectDetails object from the project data.
+        Get the AwardDetails object from the project data.
         If the project data is not set, return None.
         """
-        return openportal.ProjectDetails(json.dumps(self.details))
+        return openportal.AwardDetails(json.dumps(self.details))
 
     def _get_project_link(self) -> openportal.Link | None:
         """
@@ -2339,8 +2345,8 @@ class ManagedProject(ReviewMixin, models.Model):
         self.set_details(existing_details)
 
     def merge_details(
-        self, new_details: openportal.ProjectDetails
-    ) -> openportal.ProjectDetails:
+        self, new_details: openportal.AwardDetails
+    ) -> openportal.AwardDetails:
         """
         Merge incoming details from the local portal into the existing details,
         with the following fields treated as authoritative from the incoming
@@ -2373,24 +2379,6 @@ class ManagedProject(ReviewMixin, models.Model):
 
         merged.project_link = self._get_project_link()
         return merged
-
-    def set_project_link(self, waldur_project) -> None:
-        """
-        Set the project_link in AwardDetails to point to this portal's
-        representation of the project (UUID as id, homeport URL as url).
-        Called whenever a Waldur project is attached or created.
-        """
-        from waldur_core.core.utils import format_homeport_link
-
-        details = self.get_details()
-        link = openportal.Link()
-        link.id = str()
-        try:
-            link.set_url(format_homeport_link(f"/projects/{waldur_project.uuid}/"))
-        except Exception:
-            pass
-        details.project_link = link
-        self.set_details(details)
 
     def get_default_offerings(self) -> list[marketplace_models.Offering]:
         """
@@ -2469,10 +2457,10 @@ class ManagedProject(ReviewMixin, models.Model):
 
         Failures are logged and swallowed so they never disrupt the caller.
         """
-        if not openportal.have_openportal():
+        if not config.ensure_config_loaded():
             return
         try:
-            openportal.ensure_config_loaded()
+            config.ensure_config_loaded()
             dest = openportal.Destination(self.destination)
             reverse_dest = openportal.Destination(".".join(reversed(dest.agents)))
             openportal.notify(f"{reverse_dest} {action} {self.identifier}")
@@ -2657,7 +2645,7 @@ class ManagedProjectAuditEntry(models.Model):
     )
 
     class Meta:
-        ordering = ["-timestamp"]
+        ordering = ["-timestamp", "id"]
         verbose_name = _("Managed Project Audit Entry")
         verbose_name_plural = _("Managed Project Audit Entries")
 
@@ -3092,11 +3080,26 @@ class RemoteProject(core_models.UuidMixin, models.Model):
 
             # explicitly control these terms locally
             result.membership_control = extras_obj.membership_control or None
-            result.allowed_domains = extras_obj.allowed_domains or None
             result.earliest_approve = extras_obj.earliest_approve or None
             result.call = extras_obj.call or None
             result.award = extras_obj.award or None
             result.renewal = extras_obj.renewal or None
+
+            # allowed_domains cannot go through the attribute setter: it
+            # normalises an empty list to None, which would turn "nothing
+            # allowed" into "no restriction at all".  merge() does preserve an
+            # empty list, but only onto a field that is unset, so clear the
+            # field first and then merge the local value back in.
+            # Still true as of openportal 0.91.0; from_json and merge keep the
+            # empty list, only assignment drops it.  See
+            # docs/guides/how-to-reconcile-a-fork.md, section 7.
+            result.allowed_domains = None
+            if self.allowed_domains is not None:
+                result = result.merge(
+                    openportal.AwardDetails(
+                        json.dumps({"allowed_domains": self.allowed_domains})
+                    )
+                )
 
         # Remote portal always owns its project URL — restore after extras
         # so that link_project cannot silently override a confirmed value.
@@ -3130,7 +3133,10 @@ class RemoteProject(core_models.UuidMixin, models.Model):
 
         if self.membership_control:
             extras["membership_control"] = self.membership_control
-        if self.allowed_domains:
+        # None and [] mean different things here — None is "no restriction",
+        # [] is "nothing allowed" — so an empty list has to be forwarded
+        # rather than treated as unset.
+        if self.allowed_domains is not None:
             extras["allowed_domains"] = self.allowed_domains
         if self.breakdown:
             extras["breakdown"] = self.breakdown
@@ -3274,7 +3280,7 @@ class RemoteProjectAttachment(models.Model):
     )
 
     class Meta:
-        ordering = ["-attached_at"]
+        ordering = ["-attached_at", "id"]
         verbose_name = _("Remote Project Attachment")
         verbose_name_plural = _("Remote Project Attachments")
 
@@ -3379,7 +3385,7 @@ class RemoteProjectAllocationEntry(models.Model):
     )
 
     class Meta:
-        ordering = ["-submitted_at"]
+        ordering = ["-submitted_at", "id"]
         verbose_name = _("Remote Project Allocation Entry")
         verbose_name_plural = _("Remote Project Allocation Entries")
 
@@ -3524,7 +3530,7 @@ class RemoteProjectAuditEntry(models.Model):
     )
 
     class Meta:
-        ordering = ["-timestamp"]
+        ordering = ["-timestamp", "id"]
         verbose_name = _("Remote Project Audit Entry")
         verbose_name_plural = _("Remote Project Audit Entries")
 

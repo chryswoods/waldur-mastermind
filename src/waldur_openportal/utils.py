@@ -12,7 +12,7 @@ from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.permissions.models import Role
 from waldur_core.permissions.utils import add_user as grant_role
-from waldur_core.permissions.utils import get_permissions
+from waldur_core.permissions.utils import get_permissions, validate_role_grant
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import (
     get_connected_customers,
@@ -20,11 +20,12 @@ from waldur_core.structure.managers import (
     get_project_users,
 )
 from waldur_core.users import models as user_models
+from waldur_core.users import tasks as user_tasks
 from waldur_core.users.enums import InvitationState
+from waldur_core.users.utils import get_invitation_duplicates
 from waldur_mastermind.invoices import models as invoice_models
 
-from . import models
-
+from . import exceptions, models, utils
 
 logger = logging.getLogger(__name__)
 
@@ -815,6 +816,52 @@ def get_project_members(project) -> dict[str, str]:
     return members
 
 
+def invite_user_to_project(project, email, role, send_email: bool = True):
+    """
+    Invite a user to the project with the specified email and role.
+    If a matching pending invitation already exists, do nothing.
+    If send_email is True, send an invitation email.
+    """
+    if not isinstance(project, structure_models.Project):
+        raise TypeError("project must be an instance of Project")
+
+    if not isinstance(email, str) or not email:
+        raise ValueError("email must be a non-empty string")
+
+    duplicates = get_invitation_duplicates(project, [{"email": email, "role": role}])
+    if duplicates:
+        logger.info(
+            "Skipping invitation for %s to project %s with role %s: "
+            "pending invitation %s already exists.",
+            email,
+            project,
+            role,
+            duplicates[0]["existing_invitation_uuid"],
+        )
+        return
+
+    invitation = user_models.Invitation.objects.create(
+        scope=project,
+        email=email,
+        role=role,
+        created_by=utils.get_openportal_robot(),
+        state=InvitationState.PENDING,
+        customer=project.customer,
+    )
+
+    if project.start_date and project.start_date > timezone.now().date():
+        invitation.state = InvitationState.PENDING_PROJECT
+
+    invitation.save()
+
+    logger.info(
+        f"Created invitation {invitation} for user {email} to project {project} with role {role}"
+    )
+
+    if send_email:
+        user_tasks.process_invitation.delay(invitation.uuid.hex, "OpenPortal")
+
+
 def get_or_create_user_by_email(email: str) -> core_models.User:
     """
     Return the User with the given email, creating one if none exists.
@@ -824,7 +871,10 @@ def get_or_create_user_by_email(email: str) -> core_models.User:
     by the identity provider), and an unusable password.
     """
     email = email.strip().lower()
-    user = core_models.User.objects.filter(email__iexact=email).first()
+    # all_objects, not objects: the default manager hides inactive accounts, so
+    # looking through it would miss a deactivated user and then fail to create a
+    # replacement, because username is unique and already taken by that account.
+    user = core_models.User.all_objects.filter(email__iexact=email).first()
     if user is not None:
         return user
 
@@ -849,6 +899,10 @@ def set_project_member_role(project, email, role, is_existing_member: bool = Fal
 
     If is_existing_member is False, the user is looked up (or created) by email and
     added directly.
+
+    Raises ValidationError if the role cannot be granted. This path bypasses the
+    serializer, so it validates the same invariants explicitly, as
+    Invitation.accept does for the invitation path.
     """
     if not isinstance(project, structure_models.Project):
         raise TypeError("project must be an instance of Project")
@@ -862,6 +916,7 @@ def set_project_member_role(project, email, role, is_existing_member: bool = Fal
         for perm in get_permissions(project, user):
             perm.revoke(current_user=robot)
 
+    validate_role_grant(project, user, role)
     grant_role(project, user, role, created_by=robot)
     logger.debug(f"Set role {role.name} for {email} on project {project}.")
 
@@ -879,7 +934,9 @@ def remove_project_member(project, email: str) -> None:
     email = str(email).strip().lower()
     robot = get_openportal_robot()
 
-    user = core_models.User.objects.filter(email__iexact=email).first()
+    # all_objects, not objects: deactivating a user already revokes their roles,
+    # so this is normally moot, but the removal should not depend on that.
+    user = core_models.User.all_objects.filter(email__iexact=email).first()
     if user is not None:
         for perm in get_permissions(project, user):
             perm.revoke(current_user=robot)
@@ -905,15 +962,15 @@ def get_local_project_identifier(project):
         logger.error(f"Project {project} has no shortname; cannot get identifier.")
         raise ValueError(f"Project {project} has no shortname; cannot get identifier.")
 
-    from . import op as openportal
+    import openportal
 
-    if not openportal.have_openportal():
+    if not config.ensure_config_loaded():
         logger.error("OpenPortal is not configured; cannot get project identifier.")
         raise RuntimeError(
             "OpenPortal is not configured; cannot get project identifier."
         )
 
-    openportal.ensure_config_loaded()
+    config.ensure_config_loaded()
 
     return openportal.ProjectIdentifier(f"{shortname}.{openportal.get_portal()}")
 
@@ -926,7 +983,8 @@ def refresh_remote_project(remote_project):
     Returns the AwardDetails on success, or None if OpenPortal is not configured
     or the fetch fails.
     """
-    from . import op as openportal
+    import openportal
+
     from . import remote_project_service
     from .board import OpenPortalBoard
 
@@ -937,11 +995,11 @@ def refresh_remote_project(remote_project):
         )
         return None
 
-    if not openportal.have_openportal():
+    if not config.ensure_config_loaded():
         logger.warning("refresh_remote_project: OpenPortal is not configured.")
         return None
 
-    openportal.ensure_config_loaded()
+    config.ensure_config_loaded()
 
     destination = openportal.Destination(str(remote_project.destination))
 
@@ -959,7 +1017,7 @@ def refresh_remote_project(remote_project):
 
         try:
             details = board.refetch_award(local_id)
-        except openportal.OpenPortalUnsupportedCommandError as e:
+        except exceptions.OpenPortalUnsupportedCommandError as e:
             logger.warning(
                 f"refresh_remote_project: remote portal does not support get_award"
                 f" for {remote_project.identifier!r} (older portal) — skipping refresh: {e}"
@@ -1157,8 +1215,9 @@ def set_membership_control(
     dry_run=True (default) logs intended changes without applying them.
     The function is idempotent — re-running after a partial failure is safe.
     """
+    import openportal
+
     from . import models as op_models
-    from . import op as openportal
     from . import tasks as op_tasks
 
     if new_control is None:
@@ -1269,10 +1328,10 @@ def _resolve_useridentifier_from_slugs(identifier: str):
     by their slugs and confirm the user is still a member of that project.
     Returns a user info dict or None.
     """
+    import openportal
+
     from waldur_core.permissions.models import UserRole
     from waldur_core.structure import models as structure_models
-
-    from . import op as openportal
 
     try:
         portal = str(openportal.get_portal())
@@ -1379,7 +1438,8 @@ def backfill_usage_report_cache():
     Skips any month for which a complete CachedProjectUsageReport already
     exists, so it is safe to re-run.
     """
-    from . import op as openportal
+    import openportal
+
     from .backend import OpenPortalBackend
 
     today = timezone.now().date()
@@ -1621,7 +1681,8 @@ def backfill_remote_usage_report_cache():
     Skips any month for which a complete CachedProjectUsageReport already
     exists, so it is safe to re-run.
     """
-    from . import op as openportal
+    import openportal
+
     from .remotebackend import RemoteOpenPortalBackend
 
     today = timezone.now().date()

@@ -4,7 +4,6 @@ from unittest import mock
 # Mock objects for testing - will be replaced with proper mocks
 from unittest.mock import MagicMock
 
-from constance import config
 from constance.test.unittest import override_config
 from ddt import data, ddt
 from django.conf import settings
@@ -146,7 +145,10 @@ class IssueCreateBaseTest(base.BaseTest):
         service_desk_response = {
             "issueKey": issue_data["key"],  # Map key to issueKey for Service Desk API
             "issueId": issue_data["id"],
-            "requestFieldValues": [],
+            "requestFieldValues": [
+                {"fieldId": "summary", "value": "test_issue"},
+                {"fieldId": "description", "value": ""},
+            ],
             "currentStatus": {"status": "Open"},
             "_links": {"agent": f"https://example.com/browse/{issue_data['key']}"},
         }
@@ -160,13 +162,18 @@ class IssueCreateBaseTest(base.BaseTest):
         self.mock_service_desk_instance.create_issue.return_value = issue_data
 
         # Mock additional API calls used in the backend
-        self.mock_service_desk_instance.get.return_value = [
-            {"id": "customfield_10001", "clauseNames": ["Waldur project"]},
-            {"id": "customfield_10002", "clauseNames": ["Reporter organization"]},
-            {"id": "customfield_10003", "clauseNames": ["Affected resource"]},
-            {"id": "customfield_10004", "clauseNames": ["Waldur template"]},
-            {"id": "customfield_10005", "clauseNames": ["Original Reporter"]},
-        ]
+        def mock_get(url, *args, **kwargs):
+            if url.endswith("?fields=resolution"):
+                return {"fields": {"resolution": {"name": "Done"}}}
+            return [
+                {"id": "customfield_10001", "clauseNames": ["Waldur project"]},
+                {"id": "customfield_10002", "clauseNames": ["Reporter organization"]},
+                {"id": "customfield_10003", "clauseNames": ["Affected resource"]},
+                {"id": "customfield_10004", "clauseNames": ["Waldur template"]},
+                {"id": "customfield_10005", "clauseNames": ["Original Reporter"]},
+            ]
+
+        self.mock_service_desk_instance.get.side_effect = mock_get
 
         # Mock user response
         mock_backend_users = [
@@ -182,11 +189,14 @@ class IssueCreateBaseTest(base.BaseTest):
 
     def _get_valid_payload(self, **additional):
         is_reported_manually = additional.get("is_reported_manually")
-        issue_type = utils.get_atlassian_issue_type()
-        # Map frontend type to backend type using configuration
-        type_mapping = config.ATLASSIAN_SUPPORT_TYPE_MAPPING or {}
-        backend_type = type_mapping.get(issue_type, issue_type)
-        factories.RequestTypeFactory(name=backend_type, issue_type_name=issue_type)
+        issue_type = utils.get_default_request_type()
+        # Create the request type if it doesn't exist
+        if issue_type:
+            factories.RequestTypeFactory(name=issue_type, is_active=True)
+        else:
+            # If no default, create one
+            rt = factories.RequestTypeFactory(name="Test Request", is_active=True)
+            issue_type = rt.name
         payload = {
             "summary": "test_issue",
             "type": issue_type,
@@ -447,8 +457,10 @@ class IssueCreateTest(IssueCreateBaseTest):
             reporter=None, backend_id=None, type="Informational"
         )
         factories.SupportCustomerFactory(user=issue.caller)
-        # Create RequestType for the mapped backend type (Informational -> Get IT help)
-        factories.RequestTypeFactory(name="Get IT help", issue_type_name="Get IT help")
+        # Create RequestType with the same name as issue.type (no mapping anymore)
+        factories.RequestTypeFactory(
+            name="Informational", issue_type_name="Informational"
+        )
         ServiceDeskBackend().create_issue(issue)
         # Check that create_customer_request was called without Original Reporter field
         call_args = self.mock_service_desk_instance.create_customer_request.call_args
@@ -467,8 +479,8 @@ class IssueCreateTest(IssueCreateBaseTest):
             "id": "1",
         }
         issue_type = utils.get_atlassian_issue_type()  # Returns "Informational"
-        # Create RequestType for the mapped backend type (Informational -> Get IT help)
-        factories.RequestTypeFactory(name="Get IT help", issue_type_name="Get IT help")
+        # Create RequestType with the same name as issue.type (no mapping anymore)
+        factories.RequestTypeFactory(name=issue_type, issue_type_name=issue_type)
         issue = factories.IssueFactory(reporter=None, backend_id=None, type=issue_type)
         factories.SupportCustomerFactory(user=issue.caller)
         ServiceDeskBackend().create_issue(issue)
@@ -476,8 +488,6 @@ class IssueCreateTest(IssueCreateBaseTest):
 
     def test_create_issue_if_exist_several_backend_users_with_same_email(self):
         self._mock_jira()
-        # Create RequestType for the mapped backend type (Informational -> Get IT help)
-        factories.RequestTypeFactory(name="Get IT help", issue_type_name="Get IT help")
         factories.SupportUserFactory(user=self.fixture.staff)
         self.client.force_authenticate(self.fixture.staff)
         mock_backend_users = [
@@ -661,7 +671,7 @@ class IssueDeleteTest(base.BaseTest):
         self.assertEqual(response.status_code, status.HTTP_424_FAILED_DEPENDENCY)
 
 
-class IssueOrderingTest(test.APITransactionTestCase):
+class IssueOrderingTest(test.APITestCase):
     @override_config(WALDUR_SUPPORT_ENABLED=True)
     def test_issue_ordering(self):
         factories.IssueFactory(key="TST")
@@ -788,3 +798,47 @@ class GetIssueScopesTest(base.BaseTest):
         self.assertIn(resource, scopes)
         self.assertIn(self.project, scopes)
         self.assertIn(self.customer, scopes)
+
+    def test_get_issue_scopes_with_stale_resource_content_type(self):
+        """When ``resource_content_type`` points at a model that is no longer
+        registered, ``ContentType.model_class()`` returns ``None`` and
+        accessing the GenericForeignKey raises
+        ``AttributeError("'NoneType' object has no attribute '_base_manager'")``.
+        ``get_issue_scopes`` must tolerate this and fall back to the issue's
+        project/customer.
+        """
+        from django.contrib.contenttypes.models import ContentType
+
+        resource = ResourceFactory(project=self.project)
+        self.issue.resource = resource
+        self.issue.save()
+        self.issue.refresh_from_db()
+
+        with mock.patch.object(ContentType, "model_class", return_value=None):
+            scopes = get_issue_scopes(self.issue)
+
+        self.assertIn(self.project, scopes)
+        self.assertIn(self.customer, scopes)
+
+
+class IssueSerializerSafeResourceTest(base.BaseTest):
+    """Regression test for production crash on ``GET /api/support-issues/``
+    when an issue's ``resource_content_type`` points at a model whose class
+    is no longer registered.
+    """
+
+    def test_list_does_not_crash_when_resource_content_type_is_stale(self):
+        from django.contrib.contenttypes.models import ContentType
+
+        self.client.force_authenticate(self.fixture.staff)
+        resource = ResourceFactory(project=self.fixture.project)
+        issue = factories.IssueFactory(
+            customer=self.fixture.customer, project=self.fixture.project
+        )
+        issue.resource = resource
+        issue.save()
+
+        with mock.patch.object(ContentType, "model_class", return_value=None):
+            response = self.client.get(factories.IssueFactory.get_list_url())
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)

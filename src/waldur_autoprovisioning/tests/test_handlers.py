@@ -6,6 +6,7 @@ from django.test import TestCase
 from waldur_autoprovisioning import handlers, models
 from waldur_autoprovisioning.tests import factories as autoprovisioning_factories
 from waldur_core.core.models import User
+from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.permissions.fixtures import ProjectRole
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
@@ -206,8 +207,102 @@ class GetOrCreateProjectWithTemplateTest(TestCase):
         self.rule.project_role = ProjectRole.MANAGER
         self.rule.save()
 
-        project = handlers.get_or_create_project(self.rule, self.user)
+        # Create a new user after setting project_role to MANAGER
+        # This avoids the signal handler creating a project with ADMIN role
+        # when the user is created in setUp (before project_role is set)
+        new_user = User.objects.create(
+            username="custom_role_user",
+            email="custom_role@example.com",
+            first_name="Custom",
+            last_name="Role",
+        )
+
+        project = handlers.get_or_create_project(self.rule, new_user)
 
         self.assertIsNotNone(project)
-        self.assertTrue(project.has_user(self.user, ProjectRole.MANAGER))
-        self.assertFalse(project.has_user(self.user, ProjectRole.ADMIN))
+        self.assertTrue(project.has_user(new_user, ProjectRole.MANAGER))
+        self.assertFalse(project.has_user(new_user, ProjectRole.ADMIN))
+
+
+class ProjectProvisionByOrganizationTest(TestCase):
+    def setUp(self):
+        self.organization_name = "OrgFromIdP"
+        self.customer = structure_models.Customer.objects.create(
+            name=self.organization_name
+        )
+        self.plan = marketplace_factories.PlanFactory()
+        self.plan.offering.type = MARKETPLACE_BASIC
+        self.plan.offering.save()
+        self.rule = autoprovisioning_factories.RuleFactory(
+            plan=self.plan, user_email_patterns=[".+@example.com"], customer=None
+        )
+        # Enable taking customer from user's organization
+        self.rule.use_user_organization_as_customer_name = True
+        self.rule.save()
+
+    @override_waldur_core_settings(
+        PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS=["PROTECTED"]
+    )
+    @patch("waldur_autoprovisioning.handlers.process_order_on_commit")
+    def test_project_created_for_user_organization(self, mock_process_order):
+        user = User.objects.create(
+            username="orguser",
+            email="orguser@example.com",
+            organization=self.organization_name,
+            registration_method="PROTECTED",
+        )
+        project = structure_models.Project.available_objects.filter(
+            name=user.username, customer=self.customer
+        ).first()
+        self.assertIsNotNone(
+            project, "Project should be created for user's organization"
+        )
+        self.assertTrue(
+            project.has_user(user, ProjectRole.ADMIN),
+            "User should have ADMIN role in the project",
+        )
+
+
+class GetOrCreateProjectPolicyTest(TestCase):
+    """The org-scoping policy is respected when auto-provisioning grants a role,
+    on both the existing-project and the newly-created-project branches."""
+
+    def _make_user(self):
+        # Email does not match the rule pattern, so the post_save signal does not
+        # auto-provision — the handler is exercised directly instead.
+        return User.objects.create(username="npuser", email="npuser@nowhere.test")
+
+    def _concealed_rule(self):
+        from django.contrib.contenttypes.models import ContentType
+
+        from waldur_core.permissions.models import CustomerRoleConcealment
+        from waldur_core.structure.models import Customer
+
+        rule = autoprovisioning_factories.RuleFactory(
+            project_role=ProjectRole.ADMIN,
+            user_email_patterns=[".+@example.com"],
+        )
+        CustomerRoleConcealment.objects.create(
+            role=ProjectRole.ADMIN,
+            content_type=ContentType.objects.get_for_model(Customer),
+            object_id=rule.customer.id,
+        )
+        return rule
+
+    def test_concealed_role_skipped_when_creating_project(self):
+        rule = self._concealed_rule()
+        user = self._make_user()
+        # No project exists yet -> exercises the Project.DoesNotExist branch.
+        project = handlers.get_or_create_project(rule, user)
+        self.assertIsNotNone(project)
+        self.assertFalse(project.has_user(user, ProjectRole.ADMIN))
+
+    def test_concealed_role_skipped_for_existing_project(self):
+        rule = self._concealed_rule()
+        user = self._make_user()
+        project = structure_models.Project.available_objects.create(
+            name=rule.resolve_project_name(user), customer=rule.customer
+        )
+        result = handlers.get_or_create_project(rule, user)
+        self.assertEqual(result.pk, project.pk)
+        self.assertFalse(project.has_user(user, ProjectRole.ADMIN))

@@ -1,8 +1,10 @@
 import datetime
 
+from dateutil.relativedelta import relativedelta
 from ddt import data, ddt
 from django.core import mail
 from django.test import override_settings
+from django.utils import timezone
 from rest_framework import status, test
 
 from waldur_core.permissions.fixtures import CallRole
@@ -15,7 +17,7 @@ from . import factories
 
 
 @ddt
-class PublicRoundTest(test.APITransactionTestCase):
+class PublicRoundTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
 
@@ -43,7 +45,7 @@ class PublicRoundTest(test.APITransactionTestCase):
 
 
 @ddt
-class RoundGetTest(test.APITransactionTestCase):
+class RoundGetTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.url = factories.RoundFactory.get_list_url(self.fixture.call)
@@ -73,12 +75,12 @@ class RoundGetTest(test.APITransactionTestCase):
 
 
 @ddt
-class RoundCreateTest(test.APITransactionTestCase):
+class RoundCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.round = self.fixture.round
-        self.round.start_time = datetime.date.today() - datetime.timedelta(days=10)
-        self.round.cutoff_time = datetime.date.today() - datetime.timedelta(days=5)
+        self.round.start_time = timezone.now() - datetime.timedelta(days=10)
+        self.round.cutoff_time = timezone.now() - datetime.timedelta(days=5)
         self.round.save()
         self.url = factories.RoundFactory.get_list_url(self.fixture.call)
 
@@ -111,40 +113,40 @@ class RoundCreateTest(test.APITransactionTestCase):
 
         # old: ---------[-]-
         # new: --------[-]--
-        self.round.start_time = datetime.date.today() + datetime.timedelta(days=1)
-        self.round.cutoff_time = datetime.date.today() + datetime.timedelta(days=2)
+        self.round.start_time = timezone.now() + datetime.timedelta(days=1)
+        self.round.cutoff_time = timezone.now() + datetime.timedelta(days=2)
         self.round.save()
         response = self.create_round("staff")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
         # old: -------[-]---
         # new: --------[-]--
-        self.round.start_time = datetime.date.today() - datetime.timedelta(days=1)
-        self.round.cutoff_time = datetime.date.today() + datetime.timedelta(days=1)
+        self.round.start_time = timezone.now() - datetime.timedelta(days=1)
+        self.round.cutoff_time = timezone.now() + datetime.timedelta(days=1)
         self.round.save()
         response = self.create_round("staff")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
         # old: -------[---]-
         # new: --------[-]--
-        self.round.start_time = datetime.date.today() - datetime.timedelta(days=1)
-        self.round.cutoff_time = datetime.date.today() + datetime.timedelta(days=3)
+        self.round.start_time = timezone.now() - datetime.timedelta(days=1)
+        self.round.cutoff_time = timezone.now() + datetime.timedelta(days=3)
         self.round.save()
         response = self.create_round("staff")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
         # old: ---------[]---
         # new: --------[--]--
-        self.round.start_time = datetime.date.today() + datetime.timedelta(days=1)
-        self.round.cutoff_time = datetime.date.today() + datetime.timedelta(days=1)
+        self.round.start_time = timezone.now() + datetime.timedelta(days=1)
+        self.round.cutoff_time = timezone.now() + datetime.timedelta(days=1)
         self.round.save()
         response = self.create_round("staff")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
         # old: ------------[-]
         # new: --------[-]----
-        self.round.start_time = datetime.date.today() + datetime.timedelta(days=3)
-        self.round.cutoff_time = datetime.date.today() + datetime.timedelta(days=4)
+        self.round.start_time = timezone.now() + datetime.timedelta(days=3)
+        self.round.cutoff_time = timezone.now() + datetime.timedelta(days=4)
         self.round.save()
         response = self.create_round("staff")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -154,25 +156,21 @@ class RoundCreateTest(test.APITransactionTestCase):
         self.client.force_authenticate(user)
 
         payload = {
-            "start_time": (datetime.date.today()).strftime("%Y-%m-%dT%H:%M:%S"),
-            "cutoff_time": (
-                datetime.date.today() + datetime.timedelta(days=2)
-            ).strftime("%Y-%m-%dT%H:%M:%S"),
-            "review_strategy": models.Round.ReviewStrategies.AFTER_PROPOSAL,
-            "deciding_entity": models.Round.AllocationStrategies.BY_CALL_MANAGER,
+            "start_time": (timezone.now()).strftime("%Y-%m-%dT%H:%M:%S"),
+            "cutoff_time": (timezone.now() + datetime.timedelta(days=2)).strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            ),
             "review_duration_in_days": 2,
-            "minimum_number_of_reviewers": 3,
-            "minimal_average_scoring": 3.0,
-            "allocation_date": (
-                datetime.date.today() + datetime.timedelta(days=2)
-            ).strftime("%Y-%m-%dT%H:%M:%S"),
+            "allocation_date": (timezone.now() + datetime.timedelta(days=2)).strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            ),
         }
 
         return self.client.post(self.url, payload)
 
 
 @ddt
-class RoundUpdateTest(test.APITransactionTestCase):
+class RoundUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.round = self.fixture.round
@@ -200,10 +198,10 @@ class RoundUpdateTest(test.APITransactionTestCase):
         self.client.force_authenticate(user)
 
         payload = {
-            "start_time": datetime.date.today().strftime("%Y-%m-%dT%H:%M:%S"),
-            "cutoff_time": (
-                datetime.date.today() + datetime.timedelta(days=3)
-            ).strftime("%Y-%m-%dT%H:%M:%S"),
+            "start_time": timezone.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "cutoff_time": (timezone.now() + datetime.timedelta(days=3)).strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            ),
         }
         response = self.client.patch(self.url, payload)
         self.round.refresh_from_db()
@@ -211,7 +209,7 @@ class RoundUpdateTest(test.APITransactionTestCase):
 
 
 @ddt
-class RoundDeleteTest(test.APITransactionTestCase):
+class RoundDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.round = self.fixture.new_round
@@ -241,16 +239,19 @@ class RoundDeleteTest(test.APITransactionTestCase):
 
 
 @ddt
-class RoundCloseTest(test.APITransactionTestCase):
+class RoundCloseTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.round = self.fixture.new_round
-        self.round.minimum_number_of_reviewers = 1
-        self.round.save()
         self.url = factories.RoundFactory.get_url(
             self.fixture.call, self.round, "close"
         )
-        self.proposal = factories.ProposalFactory(
+        self.draft_proposal = factories.ProposalFactory(
+            round=self.round,
+            state=ProposalStates.DRAFT,
+            project=self.fixture.proposal_project,
+        )
+        self.submitted_proposal = factories.ProposalFactory(
             round=self.round,
             state=ProposalStates.SUBMITTED,
             project=self.fixture.proposal_project,
@@ -261,10 +262,16 @@ class RoundCloseTest(test.APITransactionTestCase):
         "call_manager",
     )
     def test_user_can_close_round(self, user):
-        self.assertEqual(self.proposal.review_set.count(), 0)
+        """Closing a round cancels draft proposals but does not auto-create reviews.
+        Reviews are created through the assignment batch workflow."""
         response = self.close_round(user)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(self.proposal.review_set.count(), 1)
+        # Draft proposals are canceled
+        self.draft_proposal.refresh_from_db()
+        self.assertEqual(self.draft_proposal.state, ProposalStates.CANCELED)
+        # Submitted proposals remain submitted (reviews created via assignment workflow)
+        self.submitted_proposal.refresh_from_db()
+        self.assertEqual(self.submitted_proposal.state, ProposalStates.SUBMITTED)
 
     @data(
         "user",
@@ -281,7 +288,7 @@ class RoundCloseTest(test.APITransactionTestCase):
         return self.client.post(self.url)
 
 
-class RoundNotificationsTest(test.APITransactionTestCase):
+class RoundNotificationsTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.round = self.fixture.round
@@ -292,9 +299,7 @@ class RoundNotificationsTest(test.APITransactionTestCase):
         self.call.add_user(self.call_manager, CallRole.MANAGER)
 
         # set the other round in another time not to trigger notification
-        self.fixture.new_round.start_time = datetime.date.today() + datetime.timedelta(
-            days=2
-        )
+        self.fixture.new_round.start_time = timezone.now() + datetime.timedelta(days=2)
         self.fixture.new_round.save()
 
     @override_settings(task_always_eager=True)
@@ -325,7 +330,7 @@ class RoundNotificationsTest(test.APITransactionTestCase):
         structure_factories.NotificationFactory(
             key="proposal.round_closing_for_managers",
         )
-        self.round.cutoff_time = datetime.datetime.now()
+        self.round.cutoff_time = timezone.now()
         self.round.save()
 
         tasks.notify_manager_on_round_cutoff()
@@ -338,10 +343,77 @@ class RoundNotificationsTest(test.APITransactionTestCase):
         self.assertIn("Dear call manager", body)
         self.assertIn(self.round.name, body)
         self.assertIn(self.call.name, body)
-        self.assertIn(self.round.get_review_strategy_display(), body)
+        # The template must only describe what closing actually does: no review
+        # strategy exists any more, and the cutoff neither moves proposals into
+        # review nor creates assignments.
+        self.assertNotIn("review strategy", body)
+        self.assertNotIn("in_review", body)
+        self.assertIn("cancelled automatically", body)
+
+    @override_settings(task_always_eager=True)
+    def test_proposal_creator_is_notified_before_submission_deadline(self):
+        structure_factories.NotificationFactory(
+            key="proposal.proposal_submission_deadline_approaching",
+        )
+
+        self.round.cutoff_time = timezone.now() + datetime.timedelta(days=3)
+        self.round.save(update_fields=["cutoff_time"])
+
+        tasks.notify_proposal_creator_on_submission_deadline_approaching()
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn(self.fixture.proposal.created_by.email, mail.outbox[0].to)
+        self.assertIn(self.fixture.proposal.name, mail.outbox[0].subject)
+        self.assertIn(self.call.name, mail.outbox[0].subject)
+        self.assertIn(self.round.name, mail.outbox[0].body)
+        self.assertIn(
+            "This is a friendly reminder that the submission deadline for your draft proposal",
+            mail.outbox[0].body,
+        )
+
+    @override_settings(task_always_eager=True)
+    def test_submitted_proposals_are_not_notified_before_submission_deadline(self):
+        structure_factories.NotificationFactory(
+            key="proposal.proposal_submission_deadline_approaching",
+        )
+
+        self.round.cutoff_time = timezone.now() + datetime.timedelta(days=3)
+        self.round.save(update_fields=["cutoff_time"])
+        self.fixture.proposal.state = ProposalStates.SUBMITTED
+        self.fixture.proposal.save(update_fields=["state"])
+
+        tasks.notify_proposal_creator_on_submission_deadline_approaching()
+
+        self.assertEqual(len(mail.outbox), 0)
+
+    @override_settings(task_always_eager=True)
+    def test_proposal_creator_is_not_notified_before_three_day_window(self):
+        structure_factories.NotificationFactory(
+            key="proposal.proposal_submission_deadline_approaching",
+        )
+
+        self.round.cutoff_time = timezone.now() + datetime.timedelta(days=4)
+        self.round.save(update_fields=["cutoff_time"])
+
+        tasks.notify_proposal_creator_on_submission_deadline_approaching()
+
+        self.assertEqual(len(mail.outbox), 0)
+
+    @override_settings(task_always_eager=True)
+    def test_proposal_creator_is_not_notified_after_round_cutoff_passed(self):
+        structure_factories.NotificationFactory(
+            key="proposal.proposal_submission_deadline_approaching",
+        )
+
+        self.round.cutoff_time = timezone.now() - datetime.timedelta(hours=1)
+        self.round.save(update_fields=["cutoff_time"])
+
+        tasks.notify_proposal_creator_on_submission_deadline_approaching()
+
+        self.assertEqual(len(mail.outbox), 0)
 
 
-class RoundSlugGenerationTest(test.APITransactionTestCase):
+class RoundSlugGenerationTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
 
@@ -451,7 +523,7 @@ class RoundSlugGenerationTest(test.APITransactionTestCase):
         self.assertNotEqual(round_obj.slug, round_obj.slug.lower())
 
 
-class ProposalSlugGenerationTest(test.APITransactionTestCase):
+class ProposalSlugGenerationTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
 
@@ -630,7 +702,196 @@ class ProposalSlugGenerationTest(test.APITransactionTestCase):
         proposal.delete()
 
 
-class SlugUtilityTest(test.APITransactionTestCase):
+class ProposalSlugTemplateTest(test.APITestCase):
+    """Tests for configurable proposal slug templates."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProposalFixture()
+
+    def test_default_template_when_none_configured(self):
+        """Proposals use default format when call has no template."""
+        # Ensure no template is set
+        self.fixture.call.proposal_slug_template = None
+        self.fixture.call.save()
+
+        # Create fresh round to avoid counter conflicts
+        fresh_round = models.Round.objects.create(
+            call=self.fixture.call,
+            start_time=datetime.date(2025, 1, 1),
+            cutoff_time=datetime.date(2025, 1, 10),
+        )
+
+        proposal = models.Proposal.objects.create(name="Test", round=fresh_round)
+
+        # Default: {round_slug}-{counter_padded}
+        self.assertTrue(proposal.slug.startswith(fresh_round.slug))
+        self.assertTrue(proposal.slug.endswith("-001"))
+
+        # Clean up
+        proposal.delete()
+        fresh_round.delete()
+
+    def test_custom_template_with_call_slug(self):
+        """Custom template using call_slug variable."""
+        self.fixture.call.proposal_slug_template = "{call_slug}-{counter_padded}"
+        self.fixture.call.save()
+
+        # Create fresh round
+        fresh_round = models.Round.objects.create(
+            call=self.fixture.call,
+            start_time=datetime.date(2025, 2, 1),
+            cutoff_time=datetime.date(2025, 2, 10),
+        )
+
+        proposal = models.Proposal.objects.create(name="Test", round=fresh_round)
+
+        expected = f"{self.fixture.call.slug}-001".upper()
+        self.assertEqual(proposal.slug, expected)
+
+        # Clean up
+        proposal.delete()
+        fresh_round.delete()
+
+    def test_custom_template_with_org_slug(self):
+        """Custom template using org_slug variable."""
+        self.fixture.call.proposal_slug_template = "{org_slug}-{year}-{counter_padded}"
+        self.fixture.call.save()
+
+        # Create fresh round
+        fresh_round = models.Round.objects.create(
+            call=self.fixture.call,
+            start_time=datetime.date(2025, 3, 1),
+            cutoff_time=datetime.date(2025, 3, 10),
+        )
+
+        proposal = models.Proposal.objects.create(name="Test", round=fresh_round)
+
+        # Should contain org slug
+        org_slug = self.fixture.call.manager.customer.slug.upper()
+        self.assertTrue(proposal.slug.startswith(org_slug))
+        self.assertTrue(proposal.slug.endswith("-001"))
+
+        # Clean up
+        proposal.delete()
+        fresh_round.delete()
+
+    def test_custom_template_with_year_month(self):
+        """Custom template using year and month variables."""
+        self.fixture.call.proposal_slug_template = (
+            "{call_slug}-{year}{month}-{counter_padded}"
+        )
+        self.fixture.call.save()
+
+        # Create fresh round
+        fresh_round = models.Round.objects.create(
+            call=self.fixture.call,
+            start_time=datetime.date(2025, 4, 1),
+            cutoff_time=datetime.date(2025, 4, 10),
+        )
+
+        proposal = models.Proposal.objects.create(name="Test", round=fresh_round)
+
+        # Should contain call slug and year/month pattern
+        self.assertTrue(proposal.slug.startswith(self.fixture.call.slug.upper()))
+        # Should have format CALL-YYYYMM-001
+        parts = proposal.slug.split("-")
+        self.assertEqual(parts[-1], "001")
+
+        # Clean up
+        proposal.delete()
+        fresh_round.delete()
+
+    def test_invalid_template_fallback(self):
+        """Invalid template falls back to default format."""
+        self.fixture.call.proposal_slug_template = "{invalid_var}-{counter_padded}"
+        self.fixture.call.save()
+
+        # Create fresh round
+        fresh_round = models.Round.objects.create(
+            call=self.fixture.call,
+            start_time=datetime.date(2025, 5, 1),
+            cutoff_time=datetime.date(2025, 5, 10),
+        )
+
+        proposal = models.Proposal.objects.create(name="Test", round=fresh_round)
+
+        # Should fallback to default format
+        self.assertTrue(proposal.slug.startswith(fresh_round.slug))
+        self.assertTrue(proposal.slug.endswith("-001"))
+
+        # Clean up
+        proposal.delete()
+        fresh_round.delete()
+
+    def test_counter_increments_within_round_with_template(self):
+        """Counter increments for each proposal in the round with custom template."""
+        self.fixture.call.proposal_slug_template = "{call_slug}-{counter_padded}"
+        self.fixture.call.save()
+
+        # Create fresh round
+        fresh_round = models.Round.objects.create(
+            call=self.fixture.call,
+            start_time=datetime.date(2025, 6, 1),
+            cutoff_time=datetime.date(2025, 6, 10),
+        )
+
+        p1 = models.Proposal.objects.create(name="P1", round=fresh_round)
+        p2 = models.Proposal.objects.create(name="P2", round=fresh_round)
+        p3 = models.Proposal.objects.create(name="P3", round=fresh_round)
+
+        self.assertTrue(p1.slug.endswith("-001"))
+        self.assertTrue(p2.slug.endswith("-002"))
+        self.assertTrue(p3.slug.endswith("-003"))
+
+        # Clean up
+        p1.delete()
+        p2.delete()
+        p3.delete()
+        fresh_round.delete()
+
+    def test_slug_is_url_safe_with_template(self):
+        """Generated slugs are URL-safe with templates."""
+        self.fixture.call.proposal_slug_template = "{round_slug}--{counter_padded}"
+        self.fixture.call.save()
+
+        # Create fresh round
+        fresh_round = models.Round.objects.create(
+            call=self.fixture.call,
+            start_time=datetime.date(2025, 7, 1),
+            cutoff_time=datetime.date(2025, 7, 10),
+        )
+
+        proposal = models.Proposal.objects.create(name="Test", round=fresh_round)
+
+        # Double hyphens should be cleaned
+        self.assertNotIn("--", proposal.slug)
+
+        # Clean up
+        proposal.delete()
+        fresh_round.delete()
+
+    def test_slug_is_uppercased_with_template(self):
+        """Generated slugs are uppercased with templates."""
+        self.fixture.call.proposal_slug_template = "{call_slug}-{counter_padded}"
+        self.fixture.call.save()
+
+        # Create fresh round
+        fresh_round = models.Round.objects.create(
+            call=self.fixture.call,
+            start_time=datetime.date(2025, 8, 1),
+            cutoff_time=datetime.date(2025, 8, 10),
+        )
+
+        proposal = models.Proposal.objects.create(name="Test", round=fresh_round)
+
+        self.assertEqual(proposal.slug, proposal.slug.upper())
+
+        # Clean up
+        proposal.delete()
+        fresh_round.delete()
+
+
+class SlugUtilityTest(test.APITestCase):
     def test_clean_slug_hyphens_function(self):
         """Test the clean_slug_hyphens utility function."""
         from waldur_core.core.models import clean_slug_hyphens
@@ -652,3 +913,194 @@ class SlugUtilityTest(test.APITransactionTestCase):
             with self.subTest(input=input_slug):
                 result = clean_slug_hyphens(input_slug)
                 self.assertEqual(result, expected_output)
+
+
+@ddt
+class BulkRoundCreateTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProposalFixture()
+        self.call = self.fixture.new_call
+        self.call.add_user(self.fixture.call_manager, CallRole.MANAGER)
+        self.url = factories.CallFactory.get_protected_url(
+            self.call, action="rounds-bulk-set"
+        )
+        # start_time chosen far enough out and aligned to day boundary so
+        # day-of-month arithmetic with relativedelta(months=N) is stable.
+        self.base_start = (timezone.now() + datetime.timedelta(days=30)).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        )
+
+    def _payload(self, **overrides):
+        payload = {
+            "start_time": self.base_start.strftime("%Y-%m-%dT%H:%M:%S"),
+            "submission_window_days": 14,
+            "cadence": "monthly",
+            "number_of_rounds": 3,
+            "review_duration_in_days": 7,
+        }
+        payload.update(overrides)
+        return payload
+
+    def _post(self, user, **overrides):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        return self.client.post(self.url, self._payload(**overrides))
+
+    @data("staff", "call_manager")
+    def test_user_can_bulk_create_rounds_with_monthly_cadence(self, user):
+        response = self._post(user)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(len(response.data), 3)
+        rounds = list(self.call.round_set.all().order_by("start_time"))
+        self.assertEqual(len(rounds), 3)
+        # 1-month cadence; cutoff = start + 14 days.
+        for i, round_obj in enumerate(rounds):
+            expected_start = self.base_start + relativedelta(months=i)
+            self.assertEqual(round_obj.start_time, expected_start)
+            self.assertEqual(
+                round_obj.cutoff_time,
+                expected_start + datetime.timedelta(days=14),
+            )
+
+    def test_custom_cadence_uses_custom_interval(self):
+        response = self._post(
+            "staff",
+            cadence="custom",
+            custom_interval_months=2,
+            number_of_rounds=4,
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        rounds = list(self.call.round_set.all().order_by("start_time"))
+        self.assertEqual(len(rounds), 4)
+        for i, round_obj in enumerate(rounds):
+            self.assertEqual(
+                round_obj.start_time, self.base_start + relativedelta(months=2 * i)
+            )
+
+    def test_custom_cadence_requires_custom_interval_months(self):
+        response = self._post("staff", cadence="custom", custom_interval_months=None)
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+        self.assertIn("custom_interval_months", response.data)
+        self.assertEqual(self.call.round_set.count(), 0)
+
+    def test_overlap_aborts_whole_batch(self):
+        # Seed a round that collides with what would be round #2.
+        collision_start = self.base_start + relativedelta(months=1)
+        models.Round.objects.create(
+            call=self.call,
+            start_time=collision_start,
+            cutoff_time=collision_start + datetime.timedelta(days=3),
+        )
+        seeded = self.call.round_set.count()
+        response = self._post("staff")
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+        # Nothing extra persisted — only the seeded round remains.
+        self.assertEqual(self.call.round_set.count(), seeded)
+
+    @data("user", "owner", "customer_support")
+    def test_user_can_not_bulk_create_rounds(self, user):
+        response = self._post(user)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, response.data)
+        self.assertEqual(self.call.round_set.count(), 0)
+
+    def test_bulk_create_after_duplicate_keeps_both_round_sets(self):
+        # Duplicate copies the source's existing rounds, then we bulk-add
+        # three more on a non-overlapping window; the duplicate ends up
+        # with both sets and the source is untouched.
+        source = self.fixture.call
+        # Add one more round at a known position to exercise the multi-round
+        # copy path beyond just the fixture-provided one.
+        factories.RoundFactory(
+            call=source,
+            start_time=self.base_start - datetime.timedelta(days=200),
+            cutoff_time=self.base_start - datetime.timedelta(days=190),
+        )
+        source_round_count = source.round_set.count()
+
+        from waldur_mastermind.proposal import utils as proposal_utils
+
+        duplicate = proposal_utils.duplicate_call(
+            source=source,
+            new_name="Copy",
+            created_by=self.fixture.staff,
+        )
+        self.assertEqual(duplicate.round_set.count(), source_round_count)
+
+        bulk_url = factories.CallFactory.get_protected_url(
+            duplicate, action="rounds-bulk-set"
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(bulk_url, self._payload())
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(duplicate.round_set.count(), source_round_count + 3)
+        # Source unchanged.
+        self.assertEqual(source.round_set.count(), source_round_count)
+
+
+class RoundListPaginationTest(test.APITestCase):
+    """Verify that listing endpoints honour LinkHeaderPagination.
+
+    Covers two distinct code paths:
+    - ``ProtectedCallViewSet.rounds()`` GET — inline paginate_queryset
+      added in the same change that wires the rounds tab pager.
+    - ``ProtectedCallViewSet.offerings()`` GET and the shared
+      ``ActionMethodMixin.action_list_method`` helper — also paginated.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.ProposalFixture()
+        self.call = self.fixture.call
+        self.client.force_authenticate(self.fixture.staff)
+        # Seed 6 non-overlapping rounds spaced a year apart so we have
+        # enough rows to actually paginate.
+        base = (timezone.now() + datetime.timedelta(days=365)).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        )
+        for i in range(6):
+            start = base + relativedelta(years=i)
+            factories.RoundFactory(
+                call=self.call,
+                start_time=start,
+                cutoff_time=start + datetime.timedelta(days=14),
+            )
+        # Seed 3 requested offerings on the same call.
+        for _ in range(3):
+            factories.RequestedOfferingFactory(call=self.call)
+
+    def test_rounds_list_paginates_and_sets_result_count_header(self):
+        url = factories.CallFactory.get_protected_url(self.call, "rounds")
+        response = self.client.get(url, {"page_size": 2})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        # 6 seeded + 1 from the fixture = 7 rounds on this call.
+        self.assertEqual(response["X-Result-Count"], "7")
+        self.assertEqual(len(response.data), 2)
+        self.assertIn("Link", response.headers)
+
+    def test_rounds_list_page_two(self):
+        url = factories.CallFactory.get_protected_url(self.call, "rounds")
+        page1 = self.client.get(url, {"page_size": 3, "page": 1})
+        page2 = self.client.get(url, {"page_size": 3, "page": 2})
+        self.assertEqual(len(page1.data), 3)
+        self.assertEqual(len(page2.data), 3)
+        page1_uuids = {row["uuid"] for row in page1.data}
+        page2_uuids = {row["uuid"] for row in page2.data}
+        self.assertEqual(page1_uuids & page2_uuids, set())
+
+    def test_offerings_list_paginates_via_action_list_method(self):
+        # Goes through ProtectedCallViewSet.offerings GET branch + (via
+        # the action_list_method helper for POST). The GET path was
+        # updated to use paginate_queryset; verify the X-Result-Count
+        # header is set.
+        url = factories.CallFactory.get_protected_url(self.call, "offerings")
+        total = self.call.requestedoffering_set.count()
+        # The seed setUp adds 3 — the fixture itself may contribute extras
+        # via cached_property side-effects, so assert from observed total.
+        self.assertGreaterEqual(total, 3)
+        response = self.client.get(url, {"page_size": 2})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response["X-Result-Count"], str(total))
+        self.assertEqual(len(response.data), 2)

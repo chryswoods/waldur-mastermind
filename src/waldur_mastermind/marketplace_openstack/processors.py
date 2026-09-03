@@ -1,13 +1,17 @@
 import logging
 from typing import cast
 
+from django.core.exceptions import ObjectDoesNotExist
+from django.http import Http404
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 from rest_framework.reverse import reverse
 
+from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.exceptions import IncorrectStateException
 from waldur_mastermind.marketplace import models, processors, signals
+from waldur_mastermind.marketplace.enums import BillingTypes
 from waldur_mastermind.marketplace.processors import (
     copy_attributes,
     get_order_post_data,
@@ -16,6 +20,8 @@ from waldur_mastermind.marketplace_openstack import views
 from waldur_mastermind.marketplace_openstack.utils import delete_instance
 from waldur_openstack import models as openstack_models
 from waldur_openstack import views as openstack_views
+from waldur_openstack.backend import OpenStackBackend
+from waldur_openstack.exceptions import OpenStackBackendError
 
 from . import utils
 
@@ -32,7 +38,9 @@ class TenantCreateProcessor(processors.BaseCreateResourceProcessor):
         "subnet_cidr",
         "skip_connection_extnet",
         "skip_creation_of_default_router",
+        "skip_creation_of_default_subnet",
         "availability_zone",
+        "security_groups",
     )
 
     def get_post_data(self):
@@ -51,16 +59,21 @@ class TenantCreateProcessor(processors.BaseCreateResourceProcessor):
                     f"Invalid MTU value: {mtu} in {order.offering}. Skipping."
                 )
 
-        if not order.limits:
-            raise serializers.ValidationError(
-                _(
-                    "Order does not contain limits. Quotas are required to create a tenant."
-                )
-            )
+        if order.limits:
+            quotas = utils.map_limits_to_quotas(order.limits, order.offering)
+            return dict(quotas=quotas, **payload)
 
-        quotas = utils.map_limits_to_quotas(order.limits, order.offering)
+        # Usage-based offerings don't require limits — tenants are created
+        # with default quotas and billed by actual consumption.
+        has_usage_billing = order.offering.components.filter(
+            billing_type=BillingTypes.USAGE,
+        ).exists()
+        if has_usage_billing:
+            return payload
 
-        return dict(quotas=quotas, **payload)
+        raise serializers.ValidationError(
+            _("Order does not contain limits. Quotas are required to create a tenant.")
+        )
 
     @classmethod
     def get_resource_model(cls):
@@ -86,7 +99,7 @@ class TenantUpdateProcessor(processors.UpdateScopedResourceProcessor):
 
 
 class TenantDeleteProcessor(processors.DeleteScopedResourceProcessor):
-    viewset = openstack_views.TenantViewSet
+    viewset = views.MarketplaceTenantViewSet
 
 
 class TenantMixin:
@@ -129,8 +142,76 @@ class InstanceCreateProcessor(TenantMixin, processors.BaseCreateResourceProcesso
         "user_data",
         "availability_zone",
         "connect_directly_to_external_network",
+        "config_drive",
         "data_volumes",
+        "metadata",
     )
+
+    def validate_order(self, request):
+        super().validate_order(request)
+        self._run_pre_flight_check()
+
+    def _run_pre_flight_check(self):
+        """Pre-flight allocation check against OpenStack Placement.
+
+        When the offering opts in via ``plugin_options.pre_flight_check_enabled``,
+        ask Placement whether any compute host can currently satisfy the flavor
+        of the requested instance and reject the order upfront if none can,
+        instead of failing in the middle of provisioning.
+
+        Only VCPU and MEMORY_MB are checked: Waldur instances boot from Cinder
+        volumes, so the compute host's DISK_GB is not consumed. Querying DISK_GB
+        would ask Placement for compute-node disk that boot-from-volume instances
+        never allocate, falsely rejecting legitimate orders.
+
+        Placement being missing or unreachable is treated as an infrastructure
+        issue: log a warning and let the order proceed rather than blocking it.
+        """
+        offering = self.order.offering
+        if not offering.plugin_options.get("pre_flight_check_enabled"):
+            return
+
+        tenant = offering.scope
+        if tenant is None:
+            return
+
+        flavor_url = self.order.attributes.get("flavor")
+        if not flavor_url:
+            return
+        try:
+            flavor = core_utils.instance_from_url(flavor_url)
+        except (ObjectDoesNotExist, Http404):
+            # Invalid flavor is already reported by serializer validation.
+            return
+
+        settings = tenant.service_settings
+
+        resources = {"VCPU": flavor.cores, "MEMORY_MB": flavor.ram}
+
+        backend = OpenStackBackend(settings)
+        try:
+            raw = backend.get_allocation_candidates(resources=resources)
+        except OpenStackBackendError as e:
+            logger.warning(
+                "Pre-flight allocation check skipped for order %s: "
+                "Placement is unavailable (%s).",
+                self.order.uuid,
+                e,
+            )
+            return
+
+        candidate_count = len(raw.get("allocation_requests", []))
+        if candidate_count == 0:
+            raise serializers.ValidationError(
+                {
+                    "flavor": _(
+                        "No schedulable host: the cloud cannot currently "
+                        "satisfy a request for %(cores)s vCPU / %(ram)s MB RAM. "
+                        "Please choose a smaller flavor or try again later."
+                    )
+                    % {"cores": flavor.cores, "ram": flavor.ram}
+                }
+            )
 
 
 class InstanceDeleteProcessor(processors.AbstractDeleteResourceProcessor):
@@ -193,5 +274,24 @@ class VolumeCreateProcessor(TenantMixin, processors.BaseCreateResourceProcessor)
     )
 
 
-class VolumeDeleteProcessor(processors.DeleteScopedResourceProcessor):
-    viewset = openstack_views.MarketplaceVolumeViewSet
+class VolumeDeleteProcessor(processors.AbstractDeleteResourceProcessor):
+    """
+    Volume delete processor that bypasses viewset permission filtering.
+
+    This processor directly calls delete_volume utility function instead of
+    making an internal API request through the viewset. This avoids permission
+    filtering issues where users with marketplace termination permissions
+    could not delete volumes due to GenericRoleFilter in the viewset.
+    """
+
+    def validate_order(self, request):
+        volume = cast(openstack_models.Volume, self.order.resource.scope)
+        if not volume:
+            return
+        # Validation is done in delete_volume function
+
+    def send_request(self, user, resource: models.Resource):
+        if not resource.scope:
+            return True
+        utils.delete_volume(resource.scope, self.order.attributes)
+        return False

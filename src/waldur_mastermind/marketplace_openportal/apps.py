@@ -10,19 +10,17 @@ class MarketplaceOpenPortalConfig(AppConfig):
 
     def ready(self):
         # These need to be imported here to avoid circular imports
-        # This is the same as in waldur_slurm.apps.py
-        from waldur_mastermind.marketplace.enums import BillingTypes, LimitPeriods
-
         from waldur_mastermind.marketplace import handlers as marketplace_handlers
+        from waldur_mastermind.marketplace.enums import BillingTypes, LimitPeriods
         from waldur_mastermind.marketplace.plugins import Component, manager
         from waldur_mastermind.marketplace_openportal import (
             PLUGIN_NAME,
             handlers,
             processor,
         )
-        from waldur_openportal.apps import OpenPortalConfig
         from waldur_openportal import models as openportal_models
         from waldur_openportal import signals as openportal_signals
+        from waldur_openportal.apps import OpenPortalConfig
 
         signals.post_save.connect(
             handlers.update_component_quota,
@@ -35,8 +33,6 @@ class MarketplaceOpenPortalConfig(AppConfig):
             openportal_models.Allocation
         )
 
-        USAGE = BillingTypes.USAGE
-        TOTAL = LimitPeriods.TOTAL
         default_limits = django_settings.WALDUR_OPENPORTAL["DEFAULT_LIMITS"]
 
         manager.register(
@@ -49,8 +45,8 @@ class MarketplaceOpenPortalConfig(AppConfig):
                     type="node",
                     name="NODE",
                     measured_unit="hours",
-                    billing_type=USAGE,
-                    limit_period=TOTAL,
+                    billing_type=BillingTypes.USAGE,
+                    limit_period=LimitPeriods.TOTAL,
                     limit_amount=default_limits["NODE"],
                 ),
             ),

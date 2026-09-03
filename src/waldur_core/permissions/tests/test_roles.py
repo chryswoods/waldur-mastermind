@@ -17,7 +17,7 @@ from waldur_mastermind.marketplace.tests import fixtures
 ROLE_ENDPOINT = "/api/roles/"
 
 
-class RoleTest(test.APITransactionTestCase):
+class RoleTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.project = self.fixture.project
@@ -194,7 +194,7 @@ class RoleTest(test.APITransactionTestCase):
         self.assertEqual(action_response.status_code, status.HTTP_403_FORBIDDEN)
 
 
-class RoleUpdateDescriptionsTest(test.APITransactionTestCase):
+class RoleUpdateDescriptionsTest(test.APITestCase):
     def setUp(self):
         self.staff = UserFactory(is_staff=True)
         self.role = models.Role.objects.create(
@@ -235,7 +235,7 @@ class RoleUpdateDescriptionsTest(test.APITransactionTestCase):
 
 
 @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
-class UserDeactivationTest(test.APITransactionTestCase):
+class UserDeactivationTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.user = self.fixture.owner
@@ -265,3 +265,91 @@ class UserDeactivationTest(test.APITransactionTestCase):
         staff_role.revoke()
         staff.refresh_from_db()
         self.assertTrue(staff.is_active)
+
+    def test_user_reactivated_when_granted_new_role(self):
+        # First, deactivate the user by revoking their role
+        self.role.revoke()
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.is_active)
+
+        # Then grant a new role and verify reactivation
+        self.customer.add_user(self.user, ServiceProviderRole.MANAGER)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.is_active)
+        self.assertTrue(
+            logging_models.Event.objects.filter(event_type="user_activated").exists()
+        )
+
+    def test_staff_not_reactivated_by_role_grant(self):
+        # Create inactive staff user
+        staff = structure_factories.UserFactory(is_active=False, is_staff=True)
+
+        # Grant role to staff - should not reactivate because they're staff
+        self.customer.add_user(staff, CustomerRole.OWNER)
+        staff.refresh_from_db()
+        self.assertFalse(staff.is_active)
+
+    def test_support_not_reactivated_by_role_grant(self):
+        # Create inactive support user
+        support = structure_factories.UserFactory(is_active=False, is_support=True)
+
+        # Grant role to support - should not reactivate because they're support
+        self.customer.add_user(support, CustomerRole.OWNER)
+        support.refresh_from_db()
+        self.assertFalse(support.is_active)
+
+    def test_reactivation_disabled_when_setting_false(self):
+        # Deactivate user first
+        self.role.revoke()
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.is_active)
+
+        # Disable the setting and grant role
+        with override_config(DEACTIVATE_USER_IF_NO_ROLES=False):
+            self.customer.add_user(self.user, ServiceProviderRole.MANAGER)
+            self.user.refresh_from_db()
+            # Should remain inactive because setting is disabled
+            self.assertFalse(self.user.is_active)
+
+
+class DeactivatedUserRoleAssignmentTest(test.APITestCase):
+    def setUp(self):
+        from waldur_core.permissions.fixtures import ProjectRole
+
+        self.role = ProjectRole.MEMBER
+        self.deactivated_user = structure_factories.UserFactory(is_active=False)
+
+    def test_staff_can_add_deactivated_user_to_project(self):
+        """Staff should be able to grant a role to a deactivated user via API."""
+        staff = structure_factories.UserFactory(is_staff=True)
+        project = structure_factories.ProjectFactory()
+
+        self.client.force_authenticate(staff)
+        url = structure_factories.ProjectFactory.get_url(project, action="add_user")
+        response = self.client.post(
+            url,
+            {
+                "user": self.deactivated_user.uuid.hex,
+                "role": self.role.name,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_non_staff_cannot_add_deactivated_user_to_project(self):
+        """Non-staff users should not be able to grant a role to a deactivated user."""
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_PROJECT_PERMISSION)
+        fixture = structure_fixtures.CustomerFixture()
+        owner = fixture.owner
+        project = structure_factories.ProjectFactory(customer=fixture.customer)
+
+        self.client.force_authenticate(owner)
+        url = structure_factories.ProjectFactory.get_url(project, action="add_user")
+        response = self.client.post(
+            url,
+            {
+                "user": self.deactivated_user.uuid.hex,
+                "role": self.role.name,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("deactivated", str(response.data))

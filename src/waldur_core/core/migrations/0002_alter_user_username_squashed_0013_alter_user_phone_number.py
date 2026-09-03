@@ -30,7 +30,6 @@ class Migration(migrations.Migration):
         ("core", "0009_rename_fingerprint_sshpublickey_fingerprint_md5_and_more"),
         ("core", "0010_generate_missing_fingerprint"),
         ("core", "0011_user_identity_source_alter_user_registration_method"),
-        ("core", "0011_user_unix_username"),
         ("core", "0012_user_slug"),
         ("core", "0013_alter_user_phone_number"),
     ]
@@ -135,28 +134,6 @@ class Migration(migrations.Migration):
                 max_length=255,
                 validators=[waldur_core.core.validators.validate_phone_number],
                 verbose_name="phone number",
-            ),
-        ),
-        migrations.AddField(
-            model_name="user",
-            name="unix_username",
-            field=models.CharField(
-                help_text="A short, unique name for you. It will be used to form your local username on any systems. Should only contain lower-case letters and digits and must start with a letter.",
-                max_length=50,
-                null=True,
-                unique=True,
-                validators=[
-                    django.core.validators.RegexValidator(
-                        message="Must start with a letter and only contain numbers and letters.",
-                        regex="^[a-z][a-z0-9]+$",
-                    ),
-                    django.core.validators.RegexValidator(
-                        inverse_match=True, regex="(admin)|(root)$"
-                    ),
-                    django.core.validators.MinLengthValidator(5),
-                    django.core.validators.MaxLengthValidator(20),
-                ],
-                verbose_name="UNIX username",
             ),
         ),
     ]
