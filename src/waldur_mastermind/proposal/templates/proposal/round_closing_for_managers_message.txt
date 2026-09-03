@@ -15,4 +15,4 @@ so only proposals with a final decision remain.
 You can view the round details and manage proposals by visiting:
 {{ round_url }}
 
-This is an automated message from the {{ site_name }}. Please do not reply to this email.
+This is an automated message from {{ site_name }}. Please do not reply to this email.

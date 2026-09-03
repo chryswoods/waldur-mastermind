@@ -143,7 +143,6 @@ class ProposalFilter(django_filters.FilterSet):
         method="filter_my_proposals",
         widget=BooleanWidget,
     )
-    project_uuid = django_filters.UUIDFilter(field_name="project__uuid")
     o = django_filters.OrderingFilter(
         fields=(
             "round__call__name",
@@ -152,7 +151,6 @@ class ProposalFilter(django_filters.FilterSet):
             "state",
             "created",
             "slug",
-            "submitted_at",
         )
     )
 
