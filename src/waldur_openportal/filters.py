@@ -156,6 +156,16 @@ class ProjectAccountingSummaryFilter(django_filters.FilterSet):
         view_name="customer-detail", field_name="customer__uuid"
     )
     is_active = django_filters.BooleanFilter(method="filter_is_active")
+    offering_name = django_filters.CharFilter(method="filter_offering_name")
+
+    def filter_offering_name(self, queryset, name, value):
+        from waldur_mastermind.marketplace import models as marketplace_models
+        from waldur_mastermind.marketplace.enums import ResourceStates
+
+        project_ids = marketplace_models.Resource.objects.filter(
+            offering__name__icontains=value, state=ResourceStates.OK
+        ).values_list("project_id", flat=True)
+        return queryset.filter(id__in=project_ids)
 
     def filter_is_active(self, queryset, name, value):
         today = timezone.now().date()
