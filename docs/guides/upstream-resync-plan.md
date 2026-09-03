@@ -297,6 +297,37 @@ uv run pre-commit run --all-files
 Note that `uv sync` needs LDAP headers (`libldap2-dev`, `libsasl2-dev`) to
 build `python-ldap`.
 
+### Generate the OpenAPI schema — treat this as a required gate
+
+```bash
+DJANGO_SETTINGS_MODULE=waldur_core.server.doc_settings \
+  uv run waldur spectacular --api-version "$VERSION" \
+  --file waldur-openapi-schema.yaml --fail-on-warn
+```
+
+This is what CI runs (`.gitlab-ci.yml`, the `spectacular` job, which also does
+a second pass with `SKIP_MAKE_FIELDS_OPTIONAL=true` for the TypeScript
+schema). It takes ~10 minutes and it is the **only** check that exercises the
+whole API surface, which is also the contract waldur-homeport consumes through
+the generated `waldur-js-client`.
+
+It earned its place here. After the merge, the migration graph built, Django
+system checks passed, `makemigrations --check` reported nothing pending, ruff
+was clean, the tree byte-compiled and the test subset passed — and schema
+generation still failed with four errors. The cause was residue: where a file
+changed on both sides without a textual conflict, git auto-merged it and kept
+the local lines, so `proposal/filters.py` carried a stray `project_uuid`
+filter with no `view_name` and a fields entry for the dropped `submitted_at`.
+None of the other checks can see a filter on a column that no longer exists.
+
+Two habits follow from that:
+
+- After adopting a directory wholesale, verify it: diff every file in it
+  against `upstream/develop` and reset anything that differs. A clean merge is
+  not evidence that a file matches upstream.
+- Regenerate the schema before asking anyone to build a client from the
+  branch.
+
 Coverage to add for the carried-forward code, which currently has little:
 
 - `structure/filters.py` — the project date filters, especially
