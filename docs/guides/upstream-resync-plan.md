@@ -97,6 +97,11 @@ Upstream's OpenPortal code guards both with `hasattr`, so removing the columns
 makes it fall back to `slug` with no code change on upstream's side. Upstream
 files are deliberately left untouched.
 
+No migration is needed for either removal. Adopting upstream's model state and
+migration graph wholesale means neither column was ever part of that state, and
+`makemigrations --check` confirms nothing is pending. The deployed database
+keeps the columns until the reconciliation script drops them.
+
 ### 4.2 Proposal
 
 All of `waldur_mastermind/proposal`, plus the local changes that only exist to
@@ -111,10 +116,16 @@ serve it:
 
 ### 4.3 `BroadcastMessageAttachment`
 
-The model, serializer, the `attach_file` action in `notifications/views.py`,
-and `format_attachment_links` in `notifications/tasks.py`. Its only consumer
-was `format_mastermind_link` in `core/utils.py`, which becomes dead code and
-is removed with it.
+The whole `notifications` app is reset to upstream. The local delta there was
+the attachment model, serializer and `attach_file` action, `format_attachment_links`
+in `tasks.py`, and the proposal-round recipient targeting in `utils.py` and
+`serializers.py` — all of it dropped. `format_mastermind_link` in
+`core/utils.py` was its only remaining consumer and is removed as dead code.
+
+This also drops three generic broadcast conveniences that came in on the same
+serializer and have no upstream equivalent: `send_to_me`,
+`additional_recipients` and `excluded_recipients`. They are worth re-adding
+deliberately if the homeport broadcast composer uses them.
 
 ### 4.4 Obsolete Dockerfile hack
 
@@ -130,21 +141,43 @@ unless noted.
 
 | Location | Change |
 | --- | --- |
-| `core/authentication.py` | `Token.objects.get_or_create` race fix. Upstream fixed one call site (line 54) but not the second (line 70). |
 | `core/utils.py` | Collapse blank lines in rendered email templates; warn instead of failing on an unknown notification key; double-slash hardening in `format_homeport_link`. |
 | `billing/serializers.py` | `_original_eager_load` fix so credit and billing eager-load optimisations compose instead of double-applying. |
+
+The local `Token.objects.get_or_create` race fix in `core/authentication.py` is
+**not** carried forward: upstream's own fix wraps the rotation in a savepoint
+and tolerates a concurrent rotation via `IntegrityError`, covering the call
+site the local fix missed.
 
 ### 5.2 Homeport support
 
 | Location | Change |
 | --- | --- |
 | `structure/filters.py` | Project date filters: `start_date_after/before`, `end_date_after/before`, `active_during`, `started`, `ended`, `in_grace`. |
-| `structure/models.py` | `PROJECT_GRACE_PERIOD_DAYS` and the grace-period helpers. |
 | `structure/serializers.py` | Grace-period-aware project end date (commit `95486ab`). |
 | `invoices/views.py` | `ProjectCredit.list` so project members can read their own credits — needed by the homeport accounting widget. |
-| `marketplace/` | Project-ending notification: `handlers.py`, `tasks.py`, templates, tests. |
 | `core/features.py` | 8 feature flags, none upstream: `show_openportal_remote_projects`, `enforce_allowed_domains`, `show_openportal_accounting_pages`, `credentials`, `disable_long_tokens`, `show_slug_as_id`, `minimal_user_profile`, `allow_user_creation`. |
 | `users/templates` | Invitation email template improvements. |
+
+Two items in this group turned out to be superseded rather than carried:
+
+- **Grace periods.** Upstream implements them per project with a
+  customer-level fallback (`Project.grace_period_days`,
+  `Customer.grace_period_days`, `get_grace_period_days()`,
+  `get_effective_end_date()`, `is_in_grace_period`, `end_date_with_grace`),
+  exposes them on the serializer including a staff-only write path, and covers
+  them with a `GracePeriodTest` suite. That is strictly better than the local
+  hardcoded `PROJECT_GRACE_PERIOD_DAYS = 30`, which is dropped. The two local
+  dependents are reworked onto upstream's API: `validate_end_date` reads
+  `self.instance.get_grace_period_days()` (a project being created has no
+  grace period, so a past end date is rejected as upstream does), and
+  `filter_in_grace` resolves each project's own grace period in the database
+  via `Coalesce` over the project and customer columns.
+- **The project-ending notification and grace-period-aware termination.**
+  Upstream reimplemented all of this more thoroughly — deletion moved to a
+  Celery task, resources paused while inside the grace period where the
+  offering supports it, and a per-offering opt-out — so `marketplace/`
+  handlers, tasks, templates and tests are all upstream's.
 
 ### 5.3 OpenPortal domain enforcement
 
@@ -179,9 +212,10 @@ and propose the shared import upstream later.
 
 ## 6. Database reconciliation
 
-A one-time script, run against a restored production dump before going near
-the live database. This fork is the only deployment, so `--fake` plus
-targeted DDL is sufficient.
+A one-time script, `scripts/resync_reconcile_db.sql`, run against a restored
+production dump before going near the live database. This fork is the only
+deployment, so recording upstream's migrations as applied plus targeted DDL is
+sufficient. The script is one transaction and is safe to re-run.
 
 ### 6.1 OpenPortal — bookkeeping only
 
@@ -210,11 +244,15 @@ the local `Proposal.notes`.
 
 ### 6.3 Dropped columns
 
-New migrations remove `core.User.unix_username`,
-`structure.Project.short_name` and the `notifications` broadcast attachment
-table. Confirm OpenPortal shortnames have fully migrated to
-`UserInfo.shortname` / `ProjectInfo.shortname` **before** dropping, since the
-data is not recoverable afterwards.
+`core.User.unix_username`, `structure.Project.short_name` and the broadcast
+attachment table are dropped by the script rather than by migrations — the
+adopted model state never contained them, so there is nothing for Django to
+generate. The migration rows that added them, and the merge nodes that
+stitched the local branch into upstream's history, are deleted with them.
+
+Confirm OpenPortal shortnames have fully migrated to `UserInfo.shortname` /
+`ProjectInfo.shortname` **before** dropping; the script carries the two
+verification queries in a comment, and the data is not recoverable afterwards.
 
 ### 6.4 Squashes
 
@@ -243,22 +281,36 @@ Upstream requires Python 3.13 (`requires-python = ">=3.13,<3.14"`, from
 `bbc7909be`, which also moved to Debian Bookworm), so the toolchain moves with
 the resync.
 
+Upstream ships `waldur_core.server.test_settings`, which points at a `db`
+host. `waldur_core/server/my_test_settings.py` overrides that to a local
+PostgreSQL instance, keeping the command in `CLAUDE.md` working:
+
 ```bash
 DJANGO_SETTINGS_MODULE=waldur_core.server.my_test_settings uv run pytest
 uv run pre-commit run --all-files
 ```
 
+Note that `uv sync` needs LDAP headers (`libldap2-dev`, `libsasl2-dev`) to
+build `python-ldap`.
+
 Coverage to add for the carried-forward code, which currently has little:
 
-- `structure/filters.py` — the project date filters, especially `active_during`
-  boundaries and `in_grace` against `PROJECT_GRACE_PERIOD_DAYS`.
+- `structure/filters.py` — the project date filters, especially
+  `active_during` boundaries and `in_grace`, whose database-resolved grace
+  period should be checked against `Project.get_grace_period_days()` for the
+  project-level, customer-fallback and zero cases.
 - `invoices/views.py` — that a project member can list their own project
   credits and cannot see another project's.
 - `permissions/views.py` and `users/views.py` — domain enforcement both on and
   off, given upstream has no coverage for these paths.
-- `core/authentication.py` — the token race fix at the second call site.
 - `billing/serializers.py` — that the composed eager-load runs the original
   method exactly once.
+
+`validate_end_date` is already covered: the local test was rewritten as
+`test_validate_end_date_on_creation_has_no_grace_period`,
+`test_validate_end_date_uses_project_grace_period` and
+`test_validate_end_date_falls_back_to_customer_grace_period`. Upstream's own
+`GracePeriodTest` covers the model-level grace behaviour.
 
 ## 9. Effort
 
