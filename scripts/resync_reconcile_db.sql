@@ -21,14 +21,30 @@
 BEGIN;
 
 -- ---------------------------------------------------------------------------
--- 1. waldur_openportal: bookkeeping only, no DDL.
+-- 1. waldur_openportal: almost all bookkeeping, with one exception.
 --
--- The local 0034-0043 series and upstream's 0034-0039 series reach an
--- identical model state - verified by comparing class sets and field
--- definitions between the two trees - so the tables are already correct and
--- only django_migrations needs rewriting. Simply deleting the local rows would
--- make step 3 re-run upstream's migrations against tables that already match,
--- so upstream's rows are inserted here as already-applied instead.
+-- The local 0034-0043 series and upstream's 0035-0039 reach the same objects
+-- by a different route, so those five are recorded here as already-applied
+-- rather than deleted, which would make step 3 re-run them against tables
+-- that already exist:
+--
+--   upstream 0035  creates the two cached report tables and their indexes,
+--                  which local 0034, 0035 and 0036 already created
+--   upstream 0036  creates RemoteProject, RemoteProjectAllocationEntry,
+--                  RemoteProjectAuditEntry, RemoteProjectAttachment and
+--                  ManagedProjectAuditEntry, which local 0037-0043 created
+--   upstream 0037-0039  AlterModelOptions only, so no DDL either way
+--
+-- Upstream 0034 is deliberately NOT in that list. It adds can_be_managed to
+-- allocation and remoteallocation, which upstream's Allocation and
+-- RemoteAllocation gain from core_models.AvailableMixin - a base class this
+-- fork's models never had. Those two columns genuinely do not exist here, so
+-- 0034 must be allowed to run for real in step 3. Faking it would leave the
+-- columns missing and the schema quietly wrong.
+--
+-- AvailableMixin is the only base-class difference between the two trees'
+-- openportal models; every other model has identical bases and identical
+-- declared fields, which is why the rest of the series is safe to fake.
 -- ---------------------------------------------------------------------------
 
 DELETE FROM django_migrations
@@ -50,7 +66,7 @@ INSERT INTO django_migrations (app, name, applied)
 SELECT 'waldur_openportal', upstream_migrations.name, now()
 FROM (
     VALUES
-      ('0034_allocation_can_be_managed_and_more'),
+      -- 0034 is intentionally absent: it carries real DDL. See above.
       ('0035_add_cached_reports_and_available_mixin'),
       ('0036_remote_projects'),
       ('0037_alter_allocation_options_and_more'),
