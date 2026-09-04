@@ -27,6 +27,20 @@
 # generates from /etc/waldur/settings.py at build time. That is harmless here:
 # the test settings chain imports base_settings, never server.settings.
 #
+# THE IMAGE MUST MATCH THE CHECKOUT
+#
+# The code under test comes from the mounted working tree, but the installed
+# Python dependencies come from the image. An image built before this branch
+# has the wrong ones - the resync moved openportal from 0.32 to 0.92 and
+# rewrote 1400-odd lines of uv.lock - and the resulting failures look like
+# unrelated import errors rather than a stale image.
+#
+# The entrypoint checks this and stops with a clear message. Either rebuild the
+# image from this checkout, or set WALDUR_TEST_SYNC_DEPS=1 to install the
+# locked dependencies into the container at startup instead:
+#
+#   WALDUR_TEST_SYNC_DEPS=1 docker compose -f docker-compose.test.yml run --rm test
+#
 # THIS NEVER TOUCHES A REAL DEPLOYMENT
 #
 # The suite gets its own throwaway PostgreSQL on an isolated network, so it
@@ -80,8 +94,10 @@ services:
     depends_on:
       test-db:
         condition: service_healthy
-    # Bypass the deployment entrypoint, which expects to start a service.
-    entrypoint: ["python", "-m", "pytest"]
+    # Bypass the deployment entrypoint, which expects to start a service. The
+    # test entrypoint checks that the image's installed dependencies match this
+    # checkout before running anything - see the script for why that matters.
+    entrypoint: ["/usr/src/waldur/scripts/docker-test-entrypoint.sh"]
     command: ["src/", "--reuse-db", "-q"]
 
 volumes:
