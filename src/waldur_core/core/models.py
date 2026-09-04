@@ -634,7 +634,6 @@ class User(
             update_fields.add("query_field")
             kwargs["update_fields"] = update_fields
         self.query_field = normalize_unicode(self.full_name)
-
         super().save(*args, **kwargs)
 
     def get_log_fields(self):

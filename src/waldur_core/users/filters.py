@@ -50,7 +50,6 @@ class InvitationFilterBackend(BaseFilterBackend):
             if not permission:
                 continue
             scopes = get_scope_ids(user, content_type, permission=permission)
-
             subquery |= Q(content_type=content_type, object_id__in=scopes)
 
         return queryset.filter(subquery).distinct()
