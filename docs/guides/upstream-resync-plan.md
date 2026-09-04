@@ -218,16 +218,34 @@ production dump before going near the live database. This fork is the only
 deployment, so recording upstream's migrations as applied plus targeted DDL is
 sufficient. The script is one transaction and is safe to re-run.
 
-### 6.1 OpenPortal — bookkeeping only
+### 6.1 OpenPortal — almost all bookkeeping
 
 Migration *numbers* collide (local `0034`–`0043` against upstream
-`0034`–`0039`) but the end state is provably identical, so there is **no DDL
-at all**:
+`0034`–`0039`), and the two routes reach the same objects with one exception:
 
 1. Delete the `waldur_openportal` rows for local `0034`–`0043` from
    `django_migrations`.
-2. `migrate waldur_openportal --fake` to record upstream `0034`–`0039`.
-3. Verify with `makemigrations --check --dry-run` that no changes are pending.
+2. Record upstream `0035`–`0039` as already-applied. Upstream `0035` creates
+   the two cached report tables and their indexes, which local `0034`–`0036`
+   already created; `0036` creates the five remote-project models that local
+   `0037`–`0043` created; `0037`–`0039` are `AlterModelOptions` only.
+3. Let upstream `0034` **run for real**. It adds `can_be_managed` to
+   `allocation` and `remoteallocation`, which upstream's models inherit from
+   `core_models.AvailableMixin` — a base class this fork never had, so those
+   columns genuinely do not exist here.
+4. Verify with `makemigrations --check --dry-run` that no changes are pending.
+
+The `AvailableMixin` case is worth dwelling on, because the original analysis
+missed it and only `migrate` on a real database caught it. Comparing the two
+trees' `models.py` showed identical class sets and identical field
+*definitions*, which was read as "the schema has converged". That comparison
+only saw fields **declared in that file**; it was blind to fields arriving
+through a base class, and `can_be_managed` is declared on `AvailableMixin` in
+`waldur_core`.
+
+Diffing the model **base classes** as well as their declared fields catches
+this, and confirms `AvailableMixin` on `Allocation` and `RemoteAllocation` is
+the only such difference in the app.
 
 ### 6.2 Proposal — clean reset
 
