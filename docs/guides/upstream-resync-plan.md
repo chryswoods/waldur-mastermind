@@ -382,3 +382,89 @@ main unknown.
 Net gain: 13 upstream test modules covering OpenPortal code written here that
 previously had almost no coverage, and a base from which `waldur_openportal`
 can be developed against upstream directly.
+
+## 10. Current delta versus upstream
+
+An audit of where the branch actually sits, rather than what was intended.
+Regenerate it with:
+
+```bash
+git fetch upstream develop
+git diff --name-status upstream/develop HEAD
+git diff --shortstat upstream/develop HEAD
+```
+
+At the time of writing: **38 files, +2,841 / -37**, and — importantly —
+**nothing upstream has that this branch deletes**. Every difference is either
+an addition or a local modification, so there is no risk of having silently
+dropped upstream code.
+
+### Files only in this branch (13)
+
+| File | Purpose |
+| --- | --- |
+| `docs/guides/upstream-resync-plan.md` | This document |
+| `docs/guides/homeport-resync-plan.md` | The frontend companion, temporary |
+| `scripts/resync_reconcile_db.sql` | One-time database reconciliation |
+| `scripts/resync_preflight_check.sql` | Read-only pre-flight for the above |
+| `scripts/docker-test-entrypoint.sh` | Stale-image guard for the test container |
+| `docker-compose.test.yml` | Running the suite in Docker |
+| `src/waldur_core/server/my_test_settings.py` | Test database from the environment |
+| `src/waldur_core/structure/tests/test_project_date_filters.py` | Coverage for the project date filters |
+| `src/waldur_mastermind/invoices/tests/test_project_credit_list_scoping.py` | Coverage for the ProjectCredit list scoping |
+| `src/waldur_openportal/tests/test_project_accounting_summary.py` | Coverage for the accounting summary additions |
+| `docker/rootfs/etc/nginx/*` (3 files) | Local nginx configuration |
+
+The first six and `my_test_settings.py` are resync scaffolding: the two plans
+and the homeport companion are deletable once the work is done, the rest are
+worth keeping.
+
+### Files modified (25)
+
+Functional carry-forwards:
+
+| File | Change |
+| --- | --- |
+| `structure/filters.py` | Project date filters, `in_grace` resolving grace per row |
+| `structure/serializers.py` | Grace-aware `validate_end_date`, `disable_long_tokens` |
+| `structure/tests/test_project.py` | End-date tests rewritten for per-project grace |
+| `billing/serializers.py`, `invoices/serializers.py` | Composed eager-load fix |
+| `invoices/views.py` | `ProjectCredit` list scoped by role |
+| `core/features.py`, `core/tests/test_features.py` | 8 feature flags and their coverage |
+| `core/utils.py` | Email blank-line collapsing, unknown-key warning, link hardening |
+| `permissions/views.py`, `users/views.py` | `enforce_allowed_domains` enforcement |
+| `permissions/serializers.py` | `user_slug`, pairing with `show_slug_as_id` |
+| `logging/tasks.py`, `server/celery_settings.py` | `purge_old_events` and its schedule |
+| `users/templates/invitation_created_message.*` | Invitation email improvements |
+| `openportal/{views,serializers,filters}.py` | The `offering_name` filter and `include_offering_names` |
+| `openportal/tasks.py` | `Status.pending()` fix for openportal 0.92 |
+
+Configuration and packaging:
+
+| File | Change |
+| --- | --- |
+| `pyproject.toml`, `uv.lock` | `openportal>=0.92.0` |
+| `docker/rootfs/etc/waldur/notifications.json` | Local notification configuration |
+| `docs/guides/build-commands.md` | Running the suite in Docker |
+
+### Auditing for residue
+
+Most defects found after the merge were residue: a file changed on both sides
+without a textual conflict, auto-merged, keeping the local version. A clean
+merge is not evidence that a file matches upstream.
+
+The check that finds it is to diff **every** file present in both trees, not
+just the directories adopted wholesale, and to account for each difference:
+
+```bash
+git diff --name-only upstream/develop HEAD | while read f; do
+    [ -f "$f" ] || continue
+    git cat-file -e "upstream/develop:$f" 2>/dev/null && echo "$f"
+done
+```
+
+Anything on that list without a reason in the tables above is residue. That
+sweep found the project-ending notification templates (which failed upstream's
+own test), Call-scope filtering in `logging/filters.py`, a proposal-creator
+guard in `permissions/serializers.py`, a `PROPOSAL.DELETE_PERMISSION` grant in
+`permissions.yaml`, and two stray blank lines.
