@@ -12,6 +12,9 @@
 --      completely or not at all.
 --   3. Run:  python -m waldur_core.server.manage migrate
 --      which replays upstream's proposal 0047-0077 and anything else new.
+--      Where migrations run automatically at startup, bring up only the
+--      database first, run this script, and start the rest afterwards -
+--      otherwise startup migrates before the reconciliation lands.
 --   4. Verify:  python -m waldur_core.server.manage makemigrations --check --dry-run
 --      must report "No changes detected".
 --
@@ -84,6 +87,12 @@ WHERE NOT EXISTS (
 -- The portal holds no proposals, so the local 0047-0054 series is undone
 -- entirely and upstream's 0047-0077 replays from scratch in step 3.
 --
+-- This script does not delete proposal rows. Production has none, but a dev
+-- or test database may: upstream's history replays cleanly only on empty
+-- tables, so purge first where the data is disposable. Nothing outside the
+-- app points at these tables, which the pre-flight check confirms, so
+-- TRUNCATE across proposal_* is self-contained.
+--
 -- Checked for collisions before writing this: none of these names clash with
 -- upstream's proposal schema. Upstream's only submitted_at is on ReviewerBid,
 -- not Proposal, and its notes fields are internal_notes, review_notes and
@@ -125,19 +134,18 @@ WHERE app = 'proposal'
 -- Project.slug). Upstream's OpenPortal code guards both with hasattr and falls
 -- back to slug, so dropping them changes no upstream behaviour.
 --
--- BEFORE RUNNING: confirm every user and project has its shortname migrated
--- into waldur_openportal. Both queries below must return zero; the data is not
--- recoverable once the columns are gone.
+-- BEFORE RUNNING: confirm no value would be lost. Run
+-- scripts/resync_preflight_check.sql, whose irreversible_gate section must
+-- report PASS for both users_losing_unix_username and
+-- projects_losing_short_name. The data is not recoverable once the columns
+-- are gone.
 --
---   SELECT count(*) FROM core_user u
---   WHERE u.unix_username IS NOT NULL
---     AND NOT EXISTS (SELECT 1 FROM waldur_openportal_userinfo i
---                     WHERE i.user_id = u.id AND i.shortname = u.unix_username);
---
---   SELECT count(*) FROM structure_project p
---   WHERE p.short_name IS NOT NULL
---     AND NOT EXISTS (SELECT 1 FROM waldur_openportal_projectinfo i
---                     WHERE i.project_id = p.id AND i.shortname = p.short_name);
+-- The gate allows two homes for the value, because upstream's OpenPortal code
+-- reads either: the matching UserInfo/ProjectInfo shortname, or the slug it
+-- falls back to when no info row exists. Requiring the info row alone gives
+-- false failures - a rehearsal against a real database flagged a user who had
+-- no UserInfo row but whose slug already carried the value, so nothing would
+-- have been lost.
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE core_user DROP COLUMN IF EXISTS unix_username;
