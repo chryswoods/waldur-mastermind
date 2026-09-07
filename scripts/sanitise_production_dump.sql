@@ -67,6 +67,44 @@ END $$;
 DROP SCHEMA IF EXISTS sanitise CASCADE;
 CREATE SCHEMA sanitise;
 
+-- Progress reporting.
+--
+-- Notices reach the client as they are raised rather than at commit, so these
+-- appear live even though the whole script is one transaction. They go to
+-- stderr, which is why the \o above does not silence them.
+--
+-- This matters because the JSON sweep is linear in row count and on a large
+-- installation can run for hours; without output there is no way to tell a
+-- long run from a stuck one.
+CREATE FUNCTION sanitise.say(msg text)
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE NOTICE '[%] %', to_char(clock_timestamp(), 'HH24:MI:SS'), msg;
+END $$;
+
+-- A duration as something readable at a glance: 42s, 7m11s, 2h13m.
+CREATE FUNCTION sanitise.human(d interval)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+    SELECT CASE
+        WHEN d IS NULL THEN '?'
+        WHEN extract(epoch FROM d) < 90
+            THEN round(extract(epoch FROM d))::text || 's'
+        WHEN extract(epoch FROM d) < 5400
+            THEN floor(extract(epoch FROM d) / 60)::text || 'm'
+                 || lpad(round(extract(epoch FROM d))::int % 60 || '', 2, '0')
+                 || 's'
+        ELSE floor(extract(epoch FROM d) / 3600)::text || 'h'
+             || lpad(floor((extract(epoch FROM d) % 3600) / 60)::int || '',
+                     2, '0') || 'm'
+    END
+$$;
+
+-- Thousands separators, so a seven-figure row count is readable.
+CREATE FUNCTION sanitise.commas(n bigint)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+    SELECT to_char(n, 'FM999,999,999,999')
+$$;
+
 -- Run a statement only if the table and every named column exist. Waldur's
 -- schema moves between releases and this script has to work either side of the
 -- resync, so a missing column is a skip rather than an error.
@@ -171,6 +209,8 @@ $$;
 -- accepted, a service-account contact address - are counted after the users,
 -- ordered by address, so they get stable numbers too.
 -- ---------------------------------------------------------------------------
+
+SELECT sanitise.say('Building the identity map from core_user');
 
 CREATE TABLE sanitise.person (
     n            int PRIMARY KEY,
@@ -318,6 +358,8 @@ $$;
 -- of a person's names must map to the same personN or those tables stop
 -- joining.
 -- ---------------------------------------------------------------------------
+
+SELECT sanitise.say('Building the login-name map');
 
 CREATE TABLE sanitise.token_map (
     orig  text PRIMARY KEY,
@@ -484,6 +526,8 @@ WHERE sanitise.map_identifier(t.token) IS NULL;
 -- ---------------------------------------------------------------------------
 -- 3. The written-name map, for substitution inside free text.
 -- ---------------------------------------------------------------------------
+
+SELECT sanitise.say('Building the written-name map');
 
 UPDATE sanitise.person p
 SET user_uuid = u.uuid::text
@@ -738,6 +782,8 @@ END $$;
 -- URL, a host, an address or a credential.
 -- ---------------------------------------------------------------------------
 
+SELECT sanitise.say('Removing deployment configuration and credentials');
+
 SELECT sanitise.exec_if('constance_constance', ARRAY['key'], $$
     DELETE FROM public.constance_constance
     WHERE key NOT IN (
@@ -872,6 +918,8 @@ SELECT sanitise.blank('waldur_autoprovisioning_rule', 'user_email_patterns', $$'
 -- length - the UI still looks like it holds a real conversation, and nothing
 -- of the conversation survives.
 -- ---------------------------------------------------------------------------
+
+SELECT sanitise.say('Replacing free text written by people');
 
 DO $$
 DECLARE
@@ -1033,6 +1081,8 @@ BEGIN
     END LOOP;
 END $$;
 
+SELECT sanitise.say('Rewriting the event log');
+
 SELECT sanitise.exec_if('logging_event', ARRAY['context', 'message'], $$
     UPDATE public.logging_event e
     SET context = r.new_ctx, message = r.new_msg
@@ -1070,6 +1120,8 @@ END $$;
 --
 -- Done last, so that the maps above were built from the original values.
 -- ---------------------------------------------------------------------------
+
+SELECT sanitise.say('Pseudonymising people');
 
 UPDATE public.core_user u SET
     first_name = 'Person',
@@ -1250,6 +1302,8 @@ SELECT sanitise.blank('structure_affiliatedorganization', 'address', $$''$$);
 -- A cache table is a copy of things computed elsewhere, keyed by strings that
 -- in Waldur's case include addresses (LOGIN_FAILURES_OF_<address>). Nothing
 -- needs it.
+SELECT sanitise.say('Sweeping every JSON and text column in the database');
+
 SELECT sanitise.wipe('waldur_cache');
 
 -- Text columns that hold a JSON document. Walked as JSON so that login names
@@ -1260,38 +1314,197 @@ SELECT sanitise.exec_if('waldur_openportal_job', ARRAY['job_data'],
       SET job_data = sanitise.scrub_json_text(job_data)
       WHERE job_data IS NOT NULL AND job_data <> ''$$);
 
+-- The plan is built and reported before any of it runs, so the size of the job
+-- is known up front rather than discovered at 3am.
+--
+-- The measurement is a real one: a count of the rows that will actually be
+-- walked and the number of bytes of JSON in them, per column. Estimating from
+-- pg_class.reltuples instead would be free but useless - the three payload
+-- columns on an audit table have identical row counts and wildly different
+-- costs, because two of them are empty on most rows. Cost tracks BYTES of
+-- JSON, not rows, so that is what the projection is weighted by.
+--
+-- It costs one sequential scan per JSON column. That is a rounding error
+-- against the walk itself, which is three orders of magnitude slower per row,
+-- but on a very large database it is still minutes: set
+-- waldur.sanitise_skip_measure to 'yes' to fall back to row estimates and
+-- start immediately with a vaguer ETA.
+CREATE TABLE sanitise.json_plan (
+    seq       int,
+    tbl       text,
+    col       text,
+    udt       text,
+    rows_todo bigint,
+    bytes     bigint
+);
+
+DO $$
+DECLARE
+    r record;
+    measured int := 0;
+    total int;
+    n bigint;
+    b bigint;
+    skip boolean := current_setting('waldur.sanitise_skip_measure', true)
+                    = 'yes';
+    started timestamptz := clock_timestamp();
+BEGIN
+    CREATE TEMP TABLE json_columns AS
+    SELECT c.table_name AS tbl, c.column_name AS col, c.udt_name AS udt,
+           greatest(cls.reltuples, 0)::bigint AS est_rows
+    FROM information_schema.columns c
+    JOIN information_schema.tables t
+      ON t.table_schema = c.table_schema
+     AND t.table_name = c.table_name
+     AND t.table_type = 'BASE TABLE'
+    JOIN pg_class cls
+      ON cls.oid = to_regclass('public.' || quote_ident(c.table_name))
+    WHERE c.table_schema = 'public'
+      AND c.udt_name IN ('json', 'jsonb')
+      AND c.is_generated = 'NEVER'
+      AND c.is_updatable = 'YES';
+
+    SELECT count(*) INTO total FROM json_columns;
+
+    IF skip THEN
+        PERFORM sanitise.say(format(
+            'JSON sweep: %s columns, sizing skipped - ETA will be rough',
+            total));
+        INSERT INTO sanitise.json_plan (seq, tbl, col, udt, rows_todo, bytes)
+        SELECT row_number() OVER (ORDER BY est_rows DESC, tbl, col),
+               tbl, col, udt, est_rows, est_rows * 2000
+        FROM json_columns;
+    ELSE
+        PERFORM sanitise.say(format(
+            'JSON sweep: sizing %s columns (one scan each, then the real work)',
+            total));
+        FOR r IN SELECT * FROM json_columns ORDER BY est_rows DESC, tbl, col
+        LOOP
+            EXECUTE format(
+                'SELECT count(*), coalesce(sum(pg_column_size(%I)), 0)
+                 FROM public.%I
+                 WHERE %I IS NOT NULL
+                   AND %I::text NOT IN (''{}'', ''[]'', ''null'')',
+                r.col, r.tbl, r.col, r.col) INTO n, b;
+            INSERT INTO sanitise.json_plan (tbl, col, udt, rows_todo, bytes)
+            VALUES (r.tbl, r.col, r.udt, n, b);
+            measured := measured + 1;
+            IF measured % 50 = 0 THEN
+                PERFORM sanitise.say(format('  sized %s/%s columns',
+                    measured, total));
+            END IF;
+        END LOOP;
+        -- Biggest first: the worst of it is underway early, and the
+        -- projection is then based on representative work rather than on a
+        -- run of empty columns.
+        UPDATE sanitise.json_plan p
+        SET seq = ranked.seq
+        FROM (SELECT tbl, col,
+                     row_number() OVER (ORDER BY bytes DESC, rows_todo DESC,
+                                        tbl, col) AS seq
+              FROM sanitise.json_plan) ranked
+        WHERE p.tbl = ranked.tbl AND p.col = ranked.col;
+        PERFORM sanitise.say(format('  sizing took %s',
+            sanitise.human(clock_timestamp() - started)));
+    END IF;
+
+    DROP TABLE json_columns;
+
+    -- Columns with nothing in them are dropped from the plan rather than
+    -- walked and logged: on a fresh install most of the 188 are empty.
+    DELETE FROM sanitise.json_plan WHERE rows_todo = 0;
+END $$;
+
 DO $$
 DECLARE
     r record;
     started timestamptz := clock_timestamp();
-    touched int := 0;
+    now_ts timestamptz;
+    total_cols int;
+    total_rows bigint;
+    total_bytes bigint;
+    bytes_done bigint := 0;
+    rows_done bigint := 0;
+    col_elapsed interval;
+    col_started timestamptz;
+    updated bigint;
+    rate numeric;
+    eta interval;
 BEGIN
-    FOR r IN
-        SELECT c.table_name AS tbl, c.column_name AS col
-        FROM information_schema.columns c
-        JOIN information_schema.tables t
-          ON t.table_schema = c.table_schema
-         AND t.table_name = c.table_name
-         AND t.table_type = 'BASE TABLE'
-        WHERE c.table_schema = 'public'
-          AND c.udt_name IN ('json', 'jsonb')
-          AND c.is_generated = 'NEVER'
-          AND c.is_updatable = 'YES'
-        ORDER BY c.table_name, c.column_name
-    LOOP
+    SELECT count(*), coalesce(sum(rows_todo), 0), coalesce(sum(bytes), 0)
+    INTO total_cols, total_rows, total_bytes FROM sanitise.json_plan;
+
+    IF total_cols = 0 THEN
+        PERFORM sanitise.say('JSON sweep: nothing to walk');
+        RETURN;
+    END IF;
+
+    PERFORM sanitise.say(format(
+        'JSON sweep: %s non-empty columns, %s rows, %s MB of JSON.'
+        || ' This is the slow step.',
+        total_cols, sanitise.commas(total_rows),
+        sanitise.commas(total_bytes / 1048576)));
+    -- Measured on a real dump at 0.4-0.55 MB of JSON per second and 700-900
+    -- rows per second, so both bounds are applied and the worse one wins - a
+    -- table of many tiny documents is row-bound, one of large payloads is
+    -- byte-bound. Deliberately the pessimistic end: this is the number
+    -- someone uses to decide whether to leave it running overnight, and an
+    -- optimistic first guess is worse than a vague one.
+    --
+    -- Superseded by the observed rate as soon as the first column finishes.
+    PERFORM sanitise.say(format(
+        '  first estimate ~%s (0.4 MB/s, 700 rows/s) - refined after every'
+        || ' column',
+        sanitise.human(greatest(total_bytes / 419430.4,
+                                total_rows / 700.0) * interval '1 second')));
+
+    FOR r IN SELECT * FROM sanitise.json_plan ORDER BY seq LOOP
+        PERFORM sanitise.say(format('  [%s/%s] %s.%s (%s rows, %s MB)',
+            r.seq, total_cols, r.tbl, r.col,
+            sanitise.commas(r.rows_todo),
+            round(r.bytes / 1048576.0, 1)));
+
+        col_started := clock_timestamp();
         EXECUTE format(
             'UPDATE public.%I SET %I = sanitise.scrub_json(%I::jsonb)::%s
              WHERE %I IS NOT NULL
                AND %I::text NOT IN (''{}'', ''[]'', ''null'')',
-            r.tbl, r.col, r.col,
-            (SELECT udt_name FROM information_schema.columns
-             WHERE table_schema = 'public' AND table_name = r.tbl
-               AND column_name = r.col),
-            r.col, r.col);
-        touched := touched + 1;
+            r.tbl, r.col, r.col, r.udt, r.col, r.col);
+        GET DIAGNOSTICS updated = ROW_COUNT;
+        now_ts := clock_timestamp();
+        col_elapsed := now_ts - col_started;
+
+        bytes_done := bytes_done + r.bytes;
+        rows_done := rows_done + r.rows_todo;
+
+        IF bytes_done < total_bytes THEN
+            rate := bytes_done / greatest(
+                extract(epoch FROM (now_ts - started)), 0.001);
+            eta := ((total_bytes - bytes_done) / greatest(rate, 1.0))
+                   * interval '1 second';
+            PERFORM sanitise.say(format(
+                '        %s rows rewritten in %s | %s%% done | ETA ~%s',
+                sanitise.commas(updated), sanitise.human(col_elapsed),
+                round(100.0 * bytes_done / greatest(total_bytes, 1)),
+                sanitise.human(eta)));
+        ELSE
+            PERFORM sanitise.say(format('        %s rows rewritten in %s',
+                sanitise.commas(updated), sanitise.human(col_elapsed)));
+        END IF;
     END LOOP;
-    RAISE NOTICE 'walked % JSON columns in %',
-        touched, clock_timestamp() - started;
+
+    PERFORM sanitise.say(format(
+        'JSON sweep done: %s columns, %s rows, %s MB, in %s (%s MB/s,'
+        || ' %s rows/s)',
+        total_cols, sanitise.commas(rows_done),
+        sanitise.commas(total_bytes / 1048576),
+        sanitise.human(clock_timestamp() - started),
+        round((total_bytes / 1048576.0)
+              / greatest(extract(epoch FROM (clock_timestamp() - started)),
+                         0.001), 2),
+        round(rows_done
+              / greatest(extract(epoch FROM (clock_timestamp() - started)),
+                         0.001))));
 END $$;
 
 -- Every column whose NAME says it holds an account identifier, whichever app
@@ -1305,8 +1518,11 @@ END $$;
 DO $$
 DECLARE
     r record;
+    started timestamptz := clock_timestamp();
+    updated bigint;
     touched int := 0;
 BEGIN
+    PERFORM sanitise.say('Mapping account-identifier columns');
     FOR r IN
         SELECT c.table_name AS tbl, c.column_name AS col
         FROM information_schema.columns c
@@ -1327,17 +1543,39 @@ BEGIN
             'UPDATE public.%I SET %I = coalesce(sanitise.map_identifier(%I), %I)
              WHERE nullif(%I, '''') IS NOT NULL',
             r.tbl, r.col, r.col, r.col, r.col);
+        GET DIAGNOSTICS updated = ROW_COUNT;
         touched := touched + 1;
+        IF updated > 0 THEN
+            PERFORM sanitise.say(format('  %s.%s: %s rows',
+                r.tbl, r.col, sanitise.commas(updated)));
+        END IF;
     END LOOP;
-    RAISE NOTICE 'mapped % identifier columns', touched;
+    PERFORM sanitise.say(format(
+        'Identifier columns done: %s columns in %s',
+        touched, sanitise.human(clock_timestamp() - started)));
 END $$;
 
 DO $$
 DECLARE
     r record;
     started timestamptz := clock_timestamp();
+    updated bigint;
+    changed bigint := 0;
+    total_cols int;
     touched int := 0;
 BEGIN
+    SELECT count(*) INTO total_cols
+    FROM information_schema.columns c
+    JOIN information_schema.tables t
+      ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+     AND t.table_type = 'BASE TABLE'
+    WHERE c.table_schema = 'public'
+      AND c.udt_name IN ('varchar', 'text', 'bpchar')
+      AND c.is_generated = 'NEVER' AND c.is_updatable = 'YES'
+      AND c.table_name <> 'django_migrations';
+
+    PERFORM sanitise.say(format(
+        'Text sweep: %s columns to check for addresses and URLs', total_cols));
     FOR r IN
         SELECT c.table_name AS tbl, c.column_name AS col
         FROM information_schema.columns c
@@ -1359,10 +1597,24 @@ BEGIN
                  sanitise.scrub_urls(sanitise.scrub_emails(%I))
              WHERE %I LIKE ''%%@%%'' OR %I LIKE ''%%http%%''',
             r.tbl, r.col, r.col, r.col, r.col);
+        GET DIAGNOSTICS updated = ROW_COUNT;
         touched := touched + 1;
+        IF updated > 0 THEN
+            changed := changed + updated;
+            PERFORM sanitise.say(format('  %s.%s: %s rows',
+                r.tbl, r.col, sanitise.commas(updated)));
+        -- There are well over a thousand text columns and most hold nothing
+        -- of interest, so a line each would bury the ones that matter. A
+        -- heartbeat instead, to show it is still moving.
+        ELSIF touched % 250 = 0 THEN
+            PERFORM sanitise.say(format('  ... %s/%s columns',
+                touched, total_cols));
+        END IF;
     END LOOP;
-    RAISE NOTICE 'swept % text columns for addresses and URLs in %',
-        touched, clock_timestamp() - started;
+    PERFORM sanitise.say(format(
+        'Text sweep done: %s columns, %s rows rewritten, in %s',
+        touched, sanitise.commas(changed),
+        sanitise.human(clock_timestamp() - started)));
 END $$;
 
 -- ---------------------------------------------------------------------------
@@ -1373,6 +1625,8 @@ END $$;
 -- failed run cannot contain them either - the run rolled back entirely.
 -- ---------------------------------------------------------------------------
 
+SELECT sanitise.say('Dropping the maps and committing');
+
 DROP SCHEMA sanitise CASCADE;
 
 COMMIT;
@@ -1381,5 +1635,8 @@ COMMIT;
 
 -- Reclaim the space freed by the rewrites, so the dump that follows is not
 -- carrying dead tuples. Outside the transaction, since VACUUM cannot run in
--- one.
+-- one. On a large database this takes a while and reports nothing while it
+-- runs; it is the last step.
+\echo 'Vacuuming (last step, no output until it finishes)...'
 VACUUM (ANALYZE);
+\echo 'Sanitisation complete.'

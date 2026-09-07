@@ -46,12 +46,29 @@
 #   psql, pg_dump and a PostgreSQL server you can create databases on. The
 #   scratch database is created and dropped by this script.
 #
+# HOW LONG IT TAKES
+#
+# The JSON sweep dominates and is linear in row count - roughly 900 rows per
+# second on documents the size of OpenPortal's project payloads. It reports its
+# plan before starting (column count, total rows, a first estimate) and then a
+# refined ETA after each column, so within a minute of that step beginning you
+# know whether this is a coffee or an overnight job.
+#
+# Every step is stamped with the wall-clock time and the elapsed total, so the
+# output of an unattended run reads back as a log. Install `pv` if you want a
+# live throughput bar on the restore and the final dump as well.
+#
 # ENVIRONMENT
 #
 #   PGHOST, PGPORT, PGUSER, PGPASSWORD  as for any libpq client
 #   SANITISE_DB      name of the scratch database (default waldur_sanitise)
 #   KEEP_SCRATCH=1   leave the scratch database behind for inspection
 #   SKIP_RESTORE=1   the scratch database is already populated; just sanitise
+#   SANITISE_LOG     where to write the progress log
+#                    (default <output>.sanitise.log)
+#   SANITISE_SKIP_MEASURE=1
+#                    skip the up-front sizing pass and start work immediately,
+#                    at the cost of a much vaguer ETA
 set -euo pipefail
 
 usage() {
@@ -90,7 +107,28 @@ case "$SANITISE_DB" in
     *) echo "ERROR: SANITISE_DB must contain 'sanitise'." >&2; exit 1 ;;
 esac
 
-say() { printf '\n==> %s\n' "$*"; }
+START_EPOCH=$(date +%s)
+
+# Wall-clock and elapsed on every step, so an overnight run leaves a log you
+# can read back to see where the time went.
+elapsed() {
+    local secs=$(( $(date +%s) - START_EPOCH ))
+    printf '%dh%02dm%02ds' $((secs / 3600)) $(((secs % 3600) / 60)) \
+        $((secs % 60))
+}
+say() {
+    printf '\n==> [%s | +%s] %s\n' "$(date +%H:%M:%S)" "$(elapsed)" "$*"
+}
+
+# pv gives a live throughput and percentage on the two steps that just move
+# bytes. Optional: without it the steps run silently, as before.
+pipe_through() {
+    if command -v pv >/dev/null 2>&1; then
+        pv "$@"
+    else
+        cat
+    fi
+}
 
 decompress() {
     case "$1" in
@@ -136,15 +174,32 @@ if [ "${SKIP_RESTORE:-0}" != "1" ]; then
     # ON_ERROR_STOP is deliberately off: a dump taken as a non-superuser
     # normally fails on extension and ownership statements that do not matter
     # here. Missing tables would be caught by the sanitiser and the verifier.
-    decompress "$INPUT" | psql -q -d "$SANITISE_DB" >/dev/null
+    echo "    input is $(du -h "$INPUT" | cut -f1) compressed; the restore is"
+    echo "    usually the second-longest step after the JSON sweep."
+    decompress "$INPUT" | pipe_through -N restore \
+        | psql -q -d "$SANITISE_DB" >/dev/null
 fi
 
-say "Sanitising"
-psql -v ON_ERROR_STOP=1 -d "$SANITISE_DB" \
-     -c "ALTER DATABASE \"$SANITISE_DB\" SET waldur.sanitise_confirmed = 'yes'"
-PGOPTIONS="-c waldur.sanitise_confirmed=yes" \
+say "Sanitising (reports progress as it goes; the JSON sweep is the slow step)"
+# The sanitiser's progress goes out as psql notices, which arrive prefixed with
+# the script path and line number - longer than the messages themselves. Strip
+# that from notices only, so warnings and errors keep their location. Tee to a
+# log as well, since this is the step people leave running unattended.
+LOG="${SANITISE_LOG:-${OUTPUT%.gz}.sanitise.log}"
+echo "    progress is also being written to $LOG"
+echo "    (tail -f it, or read it back afterwards to see where time went)"
+
+PGOPTIONS="-c waldur.sanitise_confirmed=yes${SANITISE_SKIP_MEASURE:+ -c waldur.sanitise_skip_measure=yes}" \
     psql -v ON_ERROR_STOP=1 -d "$SANITISE_DB" \
-         -f "$HERE/sanitise_production_dump.sql"
+         -f "$HERE/sanitise_production_dump.sql" 2>&1 \
+    | sed -uE 's/^psql:[^ ]+: (NOTICE|INFO):  //' \
+    | tee "$LOG"
+
+# psql's status is what matters, not sed's or tee's.
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+    echo "ERROR: sanitisation failed; see $LOG" >&2
+    exit 1
+fi
 
 say "Verifying"
 VERIFY_OUT="$(mktemp)"
@@ -167,8 +222,10 @@ say "Writing $OUTPUT"
 # --no-owner and --no-privileges so the result loads as whatever role the local
 # deployment uses, rather than needing production's roles to exist.
 case "$OUTPUT" in
-    *.gz) pg_dump --no-owner --no-privileges -d "$SANITISE_DB" | gzip > "$OUTPUT" ;;
-    *)    pg_dump --no-owner --no-privileges -d "$SANITISE_DB" > "$OUTPUT" ;;
+    *.gz) pg_dump --no-owner --no-privileges -d "$SANITISE_DB" \
+              | pipe_through -N dump | gzip > "$OUTPUT" ;;
+    *)    pg_dump --no-owner --no-privileges -d "$SANITISE_DB" \
+              | pipe_through -N dump > "$OUTPUT" ;;
 esac
 
 # A last belt-and-braces pass over the bytes that are actually leaving. The SQL
@@ -214,7 +271,7 @@ if [ "$leaks" -gt 0 ]; then
     exit 1
 fi
 
-say "Done: $OUTPUT"
+say "Done: $OUTPUT ($(du -h "$OUTPUT" | cut -f1)), total $(elapsed)"
 cat <<'EOT'
 
 Load it into a local deployment with the containers down apart from the

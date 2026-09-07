@@ -33,6 +33,49 @@ The script restores the dump into a scratch database, rewrites it, verifies the
 result, and only writes the output dump if every check passes. On failure it
 leaves the scratch database behind so you can look at it.
 
+## How long it takes
+
+Long enough on a production database to be worth knowing before you start, so
+the script tells you. Every step is stamped with the wall-clock time and the
+elapsed total, and the progress is teed to `<output>.sanitise.log`, so an
+unattended run reads back as a log afterwards.
+
+The JSON sweep dominates. Before doing any of it, the script measures the real
+work -- the rows it will walk and the bytes of JSON in them, per column -- and
+prints a plan:
+
+```text
+[08:56:12] JSON sweep: sizing 188 columns (one scan each, then the real work)
+[08:56:12] JSON sweep: 27 non-empty columns, 33,780 rows, 24 MB of JSON.
+[08:56:12]   first estimate ~61s (0.4 MB/s, 700 rows/s) - refined after every column
+[08:56:12]   [1/27] waldur_openportal_remoteprojectauditentry.new_details (31,355 rows, 20.8 MB)
+[08:56:48]         31,355 rows rewritten in 36s | 84% done | ETA ~7s
+...
+[08:57:02] JSON sweep done: 27 columns, 33,780 rows, 24 MB, in 50s (0.50 MB/s, 682 rows/s)
+```
+
+Columns are done biggest-first, so the worst of it is underway in the first
+minute and the ETA is projected from representative work rather than from a run
+of empty columns. The cost tracks **bytes of JSON, not rows** -- three payload
+columns on an audit table can have identical row counts and take 36s, 4s and
+0s, because two of them are empty on most rows -- which is why the sizing pass
+exists and why the projection is byte-weighted.
+
+Measured throughput on a real dump is **0.4-0.55 MB/s and 700-900 rows/s**, so
+for a first guess of your own, take the total size of the JSON columns in your
+database and divide by 0.4 MB/s. The built-in first estimate uses the
+pessimistic end of both bounds on purpose: it is the number you would use to
+decide whether to leave it overnight, and an optimistic guess is worse than a
+vague one.
+
+The sizing pass costs one sequential scan per JSON column -- a rounding error
+against a walk three orders of magnitude slower per row, but minutes on a very
+large database. `SANITISE_SKIP_MEASURE=1` skips it and starts immediately, at
+the cost of a much vaguer ETA.
+
+Install `pv` if you want a throughput bar on the restore and the final dump as
+well; without it those two steps run silently.
+
 Loading the result is the same rehearsal the resync plan describes -- bring up
 only the database, load, reconcile, then start the rest:
 
@@ -175,8 +218,9 @@ that the scan agrees.
 
 ## Rehearsed against
 
-A full run against a real dump: 188 JSON columns walked, 29 identifier columns
-mapped, 1,555 text columns swept, both checks clean, and the result loads,
-reconciles and migrates to the resynced schema with `makemigrations --check`
-reporting no changes. Re-running the sanitiser over its own output changes
-nothing, so an interrupted run can simply be repeated.
+A full run against a real dump: 188 JSON columns sized and the 27 non-empty
+ones walked (33,780 rows, 24 MB, 50s), 29 identifier columns mapped, 1,555 text
+columns swept, both checks clean, and the result loads, reconciles and migrates
+to the resynced schema with `makemigrations --check` reporting no changes.
+Re-running the sanitiser over its own output changes nothing, so an interrupted
+run can simply be repeated.
