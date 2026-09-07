@@ -291,6 +291,8 @@ route than the reconciled one.
 5. Add migrations dropping `unix_username`, `short_name` and the attachment
    table.
 6. Write and rehearse the reconciliation script against a production dump.
+   For a rehearsal at production scale rather than against dev data, sanitise
+   a production dump first - see `docs/guides/production-data-sanitisation.md`.
 7. Run and extend the test suite.
 8. Resync waldur-homeport, per `homeport-resync-plan.md`. The removed-endpoint
    inventory that step depended on is done and recorded there: every dropped
@@ -474,6 +476,10 @@ dropped upstream code.
 | `docs/guides/homeport-resync-plan.md` | The frontend companion, temporary |
 | `scripts/resync_reconcile_db.sql` | One-time database reconciliation |
 | `scripts/resync_preflight_check.sql` | Read-only pre-flight for the above |
+| `scripts/sanitise_production_dump.sh` | Turning a production dump into local test data |
+| `scripts/sanitise_production_dump.sql` | The sanitisation itself |
+| `scripts/sanitise_verify.sql` | Proving the sanitised copy carries nothing |
+| `docs/guides/production-data-sanitisation.md` | How to use the three above |
 | `scripts/docker-test-entrypoint.sh` | Stale-image guard for the test container |
 | `docker-compose.test.yml` | Running the suite in Docker |
 | `src/waldur_core/server/my_test_settings.py` | Test database from the environment |
