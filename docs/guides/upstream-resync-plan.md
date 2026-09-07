@@ -383,18 +383,54 @@ Net gain: 13 upstream test modules covering OpenPortal code written here that
 previously had almost no coverage, and a base from which `waldur_openportal`
 can be developed against upstream directly.
 
-## 10. Current delta versus upstream
+## 10. The upstream base is pinned to a release candidate
+
+This branch tracks the tag **`8.1.3-rc.8`** (`f76a0bbce`, 2026-09-01), not
+`develop`. Merging a moving branch head is not reproducible: the same command a
+day later gives a different base, and the delta measured against it silently
+changes shape. A tag fixes that.
+
+Regenerate the audit below against the tag, not the branch:
+
+```bash
+git fetch upstream --tags
+git diff --name-status 8.1.3-rc.8 HEAD
+git diff --shortstat 8.1.3-rc.8 HEAD
+```
+
+The resync was originally merged against `b00cd9b18` (2026-09-03), 23 commits
+past the tag, and was rewound onto it. `rc.8` is an ancestor of that commit, so
+the rewind removed upstream work and added none: 59 files, mostly the VMware
+pyVmomi backend rewrite, Nova instance metadata, ToS consent gating and two
+migrations (`logging.0028`, `openstack.0082`) that no longer exist here.
+
+**One consequence to be aware of.** `rc.8` predates `8a474ddcb`, which bumped
+djangorestframework to 3.18.0 for two known vulnerabilities, so this branch
+ships **DRF 3.16.1** and those vulnerabilities are open. Whichever comes first
+— the next release candidate or `8.1.3` itself — should be picked up promptly,
+and will almost certainly carry the fix.
+
+`openportal` is held at exactly **0.92.0**. The pin in `pyproject.toml` is
+`>=0.92.0`, so re-locking drifts to whatever is newest (0.93.0 at the time of
+writing); the lock is deliberately held at the version the rehearsal and test
+suite actually ran against. Use `uv lock --upgrade-package openportal==<v>` to
+move it on purpose.
+
+Moving to a newer tag is cheap: the delta is 37 files, and the same rewind is
+`git read-tree -u --reset <tag>` followed by re-checking out those files.
+
+## 11. Current delta versus upstream
 
 An audit of where the branch actually sits, rather than what was intended.
 Regenerate it with:
 
 ```bash
-git fetch upstream develop
-git diff --name-status upstream/develop HEAD
-git diff --shortstat upstream/develop HEAD
+git fetch upstream --tags
+git diff --name-status 8.1.3-rc.8 HEAD
+git diff --shortstat 8.1.3-rc.8 HEAD
 ```
 
-At the time of writing: **38 files, +2,841 / -37**, and — importantly —
+At the time of writing: **37 files, +2,926 / -37**, and — importantly —
 **nothing upstream has that this branch deletes**. Every difference is either
 an addition or a local modification, so there is no risk of having silently
 dropped upstream code.

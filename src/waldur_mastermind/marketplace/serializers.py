@@ -2609,24 +2609,12 @@ class ProviderPlanDetailsSerializer(BaseProviderPlanSerializer):
 
     def validate(self, attrs):
         if not self.instance:
-            offering = attrs["offering"]
             if not has_permission(
                 self.context["request"],
                 PermissionEnum.CREATE_OFFERING_PLAN,
-                offering.customer,
+                attrs["offering"].customer,
             ):
                 raise PermissionDenied()
-            # Creation is guarded here rather than by an action validator:
-            # ActionsViewSet runs those for detail actions and update alone.
-            if not utils.offering_owns_pricing(offering):
-                raise ValidationError(
-                    {
-                        "offering": _(
-                            "This offering is a child offering, so its plans "
-                            "belong to the parent."
-                        )
-                    }
-                )
         return attrs
 
     def create(self, validated_data):

@@ -2245,24 +2245,6 @@ def setup_linux_related_data(
         instance.backend_metadata["homeDir"] = f"{homedir_prefix}{instance.username}"
 
 
-def offering_owns_pricing(offering: models.Offering) -> bool:
-    """Whether plans and prices belong to this offering rather than to its parent.
-
-    A child offering is an implementation detail of its parent — the OpenStack
-    per-tenant Instance and Volume offerings are the case in point: they carry no
-    components of their own, and both ordering and the API resolve the parent's
-    plans anyway. Plans, prices, quotas and discounts have nothing to act on
-    there, so the surfaces that manage them are refused rather than silently
-    ignored.
-
-    Being non-billable is a separate matter and deliberately not covered here: a
-    top-level offering that is not invoiced still needs a plan of its own, since
-    activation requires one (see offering_has_plans) and there is no parent to
-    inherit it from.
-    """
-    return offering.parent_id is None
-
-
 def get_plans_available_for_user(
     user, offering, allowed_customer_uuid=None, without_parents_plan=False
 ):
@@ -3170,17 +3152,12 @@ def build_glauth_tree(offering, *, resource_filter=None):
     # Offering users: queryset same as the existing endpoints. Exclude
     # accounts without a username — both "" and NULL, since the field is
     # nullable and ``.exclude(username="")`` alone does not drop NULL.
-    # When ToS enforcement is on, also drop users without active consent so
-    # LDAP export does not disclose PII after revoke / without consent.
     offering_users_qs = (
         models.OfferingUser.objects.filter(offering=offering)
         .exclude(username="")
         .exclude(username__isnull=True)
         .select_related("user")
         .prefetch_related("user__sshpublickey_set")
-    )
-    offering_users_qs = filter_offering_users_queryset_by_consent(
-        offering_users_qs, offering=offering
     )
     if resource_filter is not None:
         # Mirror Resource.glauth_users_config which scopes to project users.
@@ -6079,36 +6056,6 @@ def filter_users_with_active_offering_consent(users, offering):
     return users.filter(
         offering_consents__offering=offering,
         offering_consents__revocation_date__isnull=True,
-    ).distinct()
-
-
-def filter_offering_users_queryset_by_consent(queryset, offering=None):
-    """Exclude OfferingUsers without active consent when ToS enforcement is on.
-
-    Mirrors the predicate used by ``get_allowed_offering_users_for_user`` /
-    ``list_customer_users``: keep rows for offerings without an active ToS, or
-    where the linked user has an unrevoked consent for that offering.
-
-    When ``offering`` is passed (single-offering callers such as glauth), skip
-    the filter entirely if that offering has no active ToS.
-    """
-    if not config.ENFORCE_USER_CONSENT_FOR_OFFERINGS:
-        return queryset
-
-    if offering is not None:
-        if not offering.has_terms_of_service():
-            return queryset
-        return queryset.filter(
-            user__offering_consents__offering=offering,
-            user__offering_consents__revocation_date__isnull=True,
-        ).distinct()
-
-    return queryset.filter(
-        ~Q(offering__terms_of_service_configs__is_active=True)
-        | Q(
-            user__offering_consents__offering=F("offering"),
-            user__offering_consents__revocation_date__isnull=True,
-        )
     ).distinct()
 
 

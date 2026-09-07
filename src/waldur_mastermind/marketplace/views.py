@@ -1646,9 +1646,7 @@ class ServiceProviderComplianceViewSet(rf_viewsets.GenericViewSet):
         """List offering users with their compliance status."""
         service_provider = self.get_service_provider()
 
-        # Get all offering users for this service provider. When ToS
-        # enforcement is on, hide users without active consent for offerings
-        # that require ToS (same predicate as marketplace-offering-users).
+        # Get all offering users for this service provider
         queryset = (
             models.OfferingUser.objects.filter(
                 offering__customer=service_provider.customer
@@ -1656,7 +1654,6 @@ class ServiceProviderComplianceViewSet(rf_viewsets.GenericViewSet):
             .select_related("user", "offering", "offering__compliance_checklist")
             .order_by("offering__name", "user__last_name", "user__first_name")
         )
-        queryset = utils.filter_offering_users_queryset_by_consent(queryset)
 
         # Apply filters
         offering_uuid = request.query_params.get("offering_uuid")
@@ -6825,15 +6822,6 @@ def can_manage_plan(plan):
         )
 
 
-def validate_plan_pricing_is_owned(plan):
-    if not utils.offering_owns_pricing(plan.offering):
-        raise rf_exceptions.ValidationError(
-            _(
-                "This offering is a child offering, so its pricing belongs to the parent."
-            )
-        )
-
-
 def validate_plan_update(plan):
     if models.Resource.objects.filter(plan=plan).exists():
         raise rf_exceptions.ValidationError(
@@ -6927,7 +6915,7 @@ class ProviderPlanViewSet(
         return Response(status=status.HTTP_200_OK)
 
     update_prices_permissions = update_permissions
-    update_prices_validators = [can_manage_plan, validate_plan_pricing_is_owned]
+    update_prices_validators = [can_manage_plan]
 
     @extend_schema(
         summary="Update plan component quotas",
@@ -6946,7 +6934,7 @@ class ProviderPlanViewSet(
         return Response(status=status.HTTP_200_OK)
 
     update_quotas_permissions = update_permissions
-    update_quotas_validators = [can_manage_plan, validate_plan_pricing_is_owned]
+    update_quotas_validators = [can_manage_plan]
 
     @extend_schema(
         summary="Update plan component discounts",
@@ -6983,7 +6971,7 @@ class ProviderPlanViewSet(
         return Response(status=status.HTTP_200_OK)
 
     update_discounts_permissions = update_permissions
-    update_discounts_validators = [can_manage_plan, validate_plan_pricing_is_owned]
+    update_discounts_validators = [can_manage_plan]
 
     archive_permissions = [
         permission_factory(
