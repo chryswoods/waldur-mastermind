@@ -405,16 +405,34 @@ pyVmomi backend rewrite, Nova instance metadata, ToS consent gating and two
 migrations (`logging.0028`, `openstack.0082`) that no longer exist here.
 
 **One consequence to be aware of.** `rc.8` predates `8a474ddcb`, which bumped
-djangorestframework to 3.18.0 for two known vulnerabilities, so this branch
-ships **DRF 3.16.1** and those vulnerabilities are open. Whichever comes first
-— the next release candidate or `8.1.3` itself — should be picked up promptly,
-and will almost certainly carry the fix.
+djangorestframework to 3.18.0, so this branch ships **DRF 3.16.1**. The two
+advisories that bump addressed, both published 2026-08-05 and both affecting
+3.17.1 and earlier:
 
-`openportal` is held at exactly **0.92.0**. The pin in `pyproject.toml` is
-`>=0.92.0`, so re-locking drifts to whatever is newest (0.93.0 at the time of
-writing); the lock is deliberately held at the version the rehearsal and test
-suite actually ran against. Use `uv lock --upgrade-package openportal==<v>` to
-move it on purpose.
+| Advisory | Severity | Applies here? |
+| --- | --- | --- |
+| [CVE-2026-73228](https://github.com/encode/django-rest-framework/security/advisories/GHSA-2m8g-3cmr-wg3w) — DRF's JSON and urlencoded parsers read the request stream directly, bypassing Django's `DATA_UPLOAD_MAX_MEMORY_SIZE` on `request.data` | Moderate, CVSS 5.3 | **Yes**, but bounded. Availability only — no authentication, authorization, disclosure or integrity impact — and the local nginx caps bodies at `client_max_body_size 10M`, so the memory a request can provoke is bounded by that rather than unbounded. Multipart is unaffected, since DRF delegates it to Django. |
+| [CVE-2026-73229](https://github.com/encode/django-rest-framework/security/advisories/GHSA-g47c-3xmw-q6m2) — `AdminRenderer` calls the view's GET handler without a permission check when rendering an invalid write, disclosing GET-protected data | Moderate, CVSS 4.3 | **No.** It requires `AdminRenderer` to be enabled; Waldur's `DEFAULT_RENDERER_CLASSES` are `WaldurORJSONRenderer` and `BrowsableAPIRenderer`, and `AdminRenderer` appears nowhere in the tree. |
+
+So the residual exposure from pinning to `rc.8` is one moderate availability
+issue, already bounded by the proxy's body limit. Still worth taking the next
+release candidate or `8.1.3` promptly, since both carry the fix.
+
+`openportal` is pinned at **>=0.93.0** and locked to 0.93.0, the version
+released and tested on 2026-09-04. Because the pin is a floor rather than an
+equality, re-locking will drift to whatever is newest; move it deliberately
+with `uv lock --upgrade-package openportal`, and re-run the API surface check
+afterwards — every `openportal.*` attribute the OpenPortal modules reference
+must still resolve:
+
+```bash
+grep -rhoP "(?<![\w.])openportal\.\K[A-Za-z_][A-Za-z0-9_]*" \
+    src/waldur_openportal/ src/waldur_mastermind/marketplace_openportal*/ | sort -u
+```
+
+That check is what caught `Status.PENDING` no longer existing in 0.92, which
+upstream still calls in `sync_board`. Two names it reports are false
+positives: a notification key in a test, and a mention in a comment.
 
 Moving to a newer tag is cheap: the delta is 37 files, and the same rewind is
 `git read-tree -u --reset <tag>` followed by re-checking out those files.
