@@ -418,6 +418,19 @@ So the residual exposure from pinning to `rc.8` is one moderate availability
 issue, already bounded by the proxy's body limit. Still worth taking the next
 release candidate or `8.1.3` promptly, since both carry the fix.
 
+**Django, by contrast, is improved substantially by the resync.** The fork ran
+**4.2.24** (published 2025-09-03) on a branch whose extended support ended
+**2026-04-07**, with 4.2.30 as its final release — so it had missed the 4.2
+patches issued after 4.2.24 and, from April 2026 onwards, was receiving nothing
+at all. Django's own advisories now carry the line that unsupported series
+"were not evaluated and may also be affected", which is the real problem with
+sitting on 4.2: the exposure is not a list you can enumerate.
+
+This branch runs **6.0.8** (2026-08-04), which is the newest 6.0.x on PyPI and
+postdates every published Django advisory — the most recent, CVE-2026-53877,
+is patched in 6.0.7. Django is identical between `rc.8` and `develop`, so the
+tag choice does not affect this.
+
 `openportal` is pinned at **>=0.93.0** and locked to 0.93.0, the version
 released and tested on 2026-09-04. Because the pin is a floor rather than an
 equality, re-locking will drift to whatever is newest; move it deliberately
