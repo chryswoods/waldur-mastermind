@@ -26,8 +26,50 @@ Take the input with `pg_dump`, not `pg_dumpall` -- a cluster dump carries
 `CREATE DATABASE` and cannot be restored into one database:
 
 ```bash
-pg_dump -d waldur -Fp | gzip > production.sql.gz
+pg_dump --no-owner --no-privileges -d waldur -Fp | gzip > production.sql.gz
 ```
+
+### Without touching an existing PostgreSQL
+
+`--own-server` runs `initdb` into a temporary directory, starts a private
+server there, does everything against that, and destroys the cluster on the way
+out. Nothing existing is touched -- no scratch database on a production server,
+nothing on a shared access node's own PostgreSQL:
+
+```bash
+scripts/sanitise_production_dump.sh --own-server production.sql.gz sanitised.sql.gz
+```
+
+It needs no superuser rights and no configuration; the cluster belongs to
+whoever runs the script. It needs `initdb` and `pg_ctl`, which come with the
+server package rather than the client one -- the script looks for them on
+`PATH` and then under `/usr/lib/postgresql/*/bin` and `/usr/pgsql-*/bin`, and
+`PG_BIN` points it somewhere else.
+
+Three things worth knowing about that mode:
+
+- **Space.** The cluster holds the whole database, plus whatever `VACUUM` has
+  not reclaimed. Allow roughly ten times the compressed input. It goes next to
+  the output file by default; `SANITISE_PGDATA` moves it elsewhere. The script
+  prints what it expects to need and what is free before it starts.
+- **It is not reachable.** The temporary cluster trusts every connection, so it
+  is started with `listen_addresses=''` -- no TCP socket at all -- and its unix
+  socket lives inside the 0700 data directory. On a shared node that is the
+  difference between a private scratch database and an open one.
+- **Run it under tmux.** The script tears the cluster down if its shell goes
+  away, which is right for a Ctrl-C but means a dropped SSH connection would
+  end a long run. `tmux`, `screen` or `nohup` keeps it alive.
+
+Because the cluster is thrown away, it runs with `fsync`, `full_page_writes`,
+`synchronous_commit` and `autovacuum` all off, which roughly halves the restore
+time. There is nothing to crash-recover to.
+
+A dump carries `ALTER TABLE ... OWNER TO waldur` for whatever role owns the
+production database, and a cluster created seconds ago has no such role. Under
+`--own-server` the script reads the role names out of the dump's own header
+comments and creates them as login-less placeholders first, so the restore is
+silent instead of emitting one error per object. `--no-owner` on the original
+`pg_dump` avoids the issue entirely.
 
 The script restores the dump into a scratch database, rewrites it, verifies the
 result, and only writes the output dump if every check passes. On failure it
@@ -36,7 +78,7 @@ leaves the scratch database behind so you can look at it.
 ## How long it takes
 
 Long enough on a production database to be worth knowing before you start, so
-the script tells you. Every step is stamped with the wall-clock time and the
+the script tells you. Run it under `tmux` if it is going to be hours. Every step is stamped with the wall-clock time and the
 elapsed total, and the progress is teed to `<output>.sanitise.log`, so an
 unattended run reads back as a log afterwards.
 

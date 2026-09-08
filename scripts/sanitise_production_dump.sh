@@ -7,6 +7,15 @@
 # the result, and only then writes the output dump. If any check fails it stops
 # and writes nothing.
 #
+#   scripts/sanitise_production_dump.sh --own-server prod.sql.gz clean.sql.gz
+#
+# --own-server does not touch any existing PostgreSQL: it runs initdb into a
+# temporary directory, starts a private server there, does the work, and
+# destroys the whole cluster afterwards. Use this anywhere you would rather not
+# be creating scratch databases - a production server, or a shared access node.
+# It needs no superuser rights and no configuration: the cluster belongs to
+# whoever runs the script.
+#
 # WHY NOT MERGE TWO DUMPS
 #
 # The obvious shape for this is "splice the local dump's settings into the
@@ -43,8 +52,19 @@
 #
 # REQUIREMENTS
 #
-#   psql, pg_dump and a PostgreSQL server you can create databases on. The
-#   scratch database is created and dropped by this script.
+#   psql and pg_dump, plus either a PostgreSQL server you can create databases
+#   on, or - with --own-server - initdb and pg_ctl, which ship with the server
+#   package. The scratch database, or the whole temporary cluster, is created
+#   and destroyed by this script.
+#
+# DISK SPACE FOR --own-server
+#
+# The temporary cluster holds the whole database twice over by the end (the
+# restored copy, plus what VACUUM has not yet reclaimed), so allow roughly ten
+# times the size of the compressed input, and more if the dump compresses
+# unusually well. By default it goes next to the OUTPUT file, on the assumption
+# that you chose somewhere with room for the result; SANITISE_PGDATA moves it.
+# The script prints what it needs and what is free before starting.
 #
 # HOW LONG IT TAKES
 #
@@ -58,12 +78,22 @@
 # output of an unattended run reads back as a log. Install `pv` if you want a
 # live throughput bar on the restore and the final dump as well.
 #
+# For a run that will take hours, start it under tmux or screen (or nohup): the
+# script cleans up after itself if its shell goes away, which means a dropped
+# SSH connection would otherwise end the run.
+#
 # ENVIRONMENT
 #
-#   PGHOST, PGPORT, PGUSER, PGPASSWORD  as for any libpq client
+#   PGHOST, PGPORT, PGUSER, PGPASSWORD  as for any libpq client. Ignored under
+#                    --own-server, which points them at its own cluster.
 #   SANITISE_DB      name of the scratch database (default waldur_sanitise)
-#   KEEP_SCRATCH=1   leave the scratch database behind for inspection
+#   KEEP_SCRATCH=1   leave the scratch database - or the whole temporary
+#                    cluster, still running - behind for inspection
 #   SKIP_RESTORE=1   the scratch database is already populated; just sanitise
+#   SANITISE_PGDATA  where --own-server puts its cluster
+#                    (default alongside OUTPUT)
+#   PG_BIN           directory holding initdb and pg_ctl, if they are not on
+#                    PATH and not somewhere this script looks
 #   SANITISE_LOG     where to write the progress log
 #                    (default <output>.sanitise.log)
 #   SANITISE_SKIP_MEASURE=1
@@ -76,9 +106,20 @@ usage() {
     exit "${1:-1}"
 }
 
-case "${1:-}" in
-    -h|--help|"") usage 0 ;;
-esac
+OWN_SERVER=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage 0 ;;
+        --own-server) OWN_SERVER=1; shift ;;
+        --) shift; break ;;
+        -*) echo "ERROR: unknown option $1" >&2; usage ;;
+        *) break ;;
+    esac
+done
+
+if [ $# -eq 0 ]; then
+    usage 0
+fi
 
 INPUT="$1"
 OUTPUT="${2:-}"
@@ -140,8 +181,177 @@ decompress() {
     esac
 }
 
+OWN_PGDATA=""
+OWN_STARTED=0
+OWN_INITDB_LOG=""
+OWN_SERVER_LOG=""
+
+# Find initdb and pg_ctl. They are not on PATH on most distributions - Debian
+# hides them under /usr/lib/postgresql/<version>/bin and Red Hat under
+# /usr/pgsql-<version>/bin - so look there too, newest version first.
+find_pg_bin() {
+    if [ -n "${PG_BIN:-}" ]; then
+        if [ -x "$PG_BIN/initdb" ] && [ -x "$PG_BIN/pg_ctl" ]; then
+            echo "$PG_BIN"
+            return 0
+        fi
+        echo "ERROR: PG_BIN=$PG_BIN has no initdb and pg_ctl in it." >&2
+        return 1
+    fi
+    if command -v initdb >/dev/null 2>&1 \
+       && command -v pg_ctl >/dev/null 2>&1; then
+        dirname "$(command -v initdb)"
+        return 0
+    fi
+    local dir
+    # shellcheck disable=SC2012
+    for dir in $(ls -d /usr/lib/postgresql/*/bin /usr/pgsql-*/bin \
+                       /usr/local/pgsql/bin /opt/homebrew/opt/postgresql*/bin \
+                       2>/dev/null | sort -rV); do
+        if [ -x "$dir/initdb" ] && [ -x "$dir/pg_ctl" ]; then
+            echo "$dir"
+            return 0
+        fi
+    done
+    echo "ERROR: cannot find initdb and pg_ctl. They ship with the server" >&2
+    echo "       package, not the client one. Set PG_BIN to the directory" >&2
+    echo "       holding them, or drop --own-server and point PGHOST at a" >&2
+    echo "       server you can create databases on." >&2
+    return 1
+}
+
+start_own_server() {
+    local bin datadir needed avail
+    bin="$(find_pg_bin)" || exit 1
+
+    # initdb refuses to run as root, and rightly: this would leave a
+    # root-owned cluster and a root-owned dump behind.
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "ERROR: --own-server cannot run as root; initdb refuses to." >&2
+        echo "       Run it as the user who should own the output." >&2
+        exit 1
+    fi
+
+    if [ -n "${SANITISE_PGDATA:-}" ]; then
+        datadir="$SANITISE_PGDATA"
+    else
+        # Alongside the output file, on the assumption that you chose
+        # somewhere with room for the result.
+        datadir="$(cd "$(dirname "$OUTPUT")" && pwd)/waldur-sanitise-pgdata.$$"
+    fi
+    if [ -e "$datadir" ]; then
+        echo "ERROR: $datadir already exists; refusing to reuse it." >&2
+        exit 1
+    fi
+
+    # The restored copy plus what VACUUM has not reclaimed, against whatever is
+    # free where the cluster is going. A warning rather than a refusal: the
+    # multiplier depends entirely on how well the dump compressed, and getting
+    # it wrong in either direction is worse than letting an informed user
+    # decide.
+    needed=$(( $(du -k "$INPUT" | cut -f1) * 10 / 1024 ))
+    avail=$(df -Pk "$(dirname "$datadir")" | awk 'NR==2 {print int($4 / 1024)}')
+    say "Starting a private PostgreSQL for this run"
+    echo "    binaries: $bin"
+    echo "    cluster:  $datadir (destroyed on exit)"
+    echo "    space:    ~${needed} MB likely needed, ${avail} MB free here"
+    if [ "$avail" -lt "$needed" ]; then
+        echo "    WARNING: that may not be enough. Point SANITISE_PGDATA at a" \
+             "bigger filesystem" >&2
+        echo "             if the restore fails with 'no space left on" \
+             "device'." >&2
+    fi
+
+    # initdb creates the directory itself, with the 0700 the server insists
+    # on. Its own log and the server's go NEXT to it, not inside: initdb
+    # refuses to run in a directory that is not empty, so a log file written
+    # there first is enough to stop it.
+    OWN_PGDATA="$datadir"
+    OWN_INITDB_LOG="$datadir.initdb.log"
+    OWN_SERVER_LOG="$datadir.server.log"
+
+    # C.UTF-8 where it exists, C otherwise. The dump's own collation does not
+    # have to match: nothing here depends on text ordering, and a plain
+    # pg_dump carries no CREATE DATABASE to disagree with.
+    local locale_flag="--locale=C.UTF-8"
+    if ! locale -a 2>/dev/null | grep -qiE '^(C\.utf-?8|C\.UTF-?8)$'; then
+        locale_flag="--locale=C"
+    fi
+    "$bin/initdb" -D "$datadir" --encoding=UTF8 $locale_flag \
+        --auth=trust -U "$(id -un)" >"$OWN_INITDB_LOG" 2>&1 || {
+        echo "ERROR: initdb failed; see $OWN_INITDB_LOG" >&2
+        exit 1
+    }
+
+    # listen_addresses='' means no TCP socket at all, and the unix socket lives
+    # inside the 0700 data directory. On a shared access node that matters:
+    # this cluster trusts every connection, so it must not be reachable by
+    # anyone but its owner.
+    #
+    # The durability settings are off because the cluster is thrown away at the
+    # end - there is nothing to crash-recover to - and they roughly halve the
+    # time the restore takes. autovacuum is off for the same reason; the
+    # sanitiser runs one VACUUM ANALYZE at the end.
+    local opts
+    opts="-c listen_addresses='' -k $datadir"
+    opts="$opts -c fsync=off -c full_page_writes=off"
+    opts="$opts -c synchronous_commit=off -c autovacuum=off"
+    opts="$opts -c maintenance_work_mem=512MB -c work_mem=64MB"
+    opts="$opts -c max_wal_size=4GB"
+    "$bin/pg_ctl" -D "$datadir" -l "$OWN_SERVER_LOG" -w -o "$opts" \
+        start >/dev/null || {
+        echo "ERROR: could not start the temporary server; see" \
+             "$OWN_SERVER_LOG" >&2
+        exit 1
+    }
+    OWN_STARTED=1
+
+    # Point every client in this script at the cluster we just made, and clear
+    # anything in the environment that would send them somewhere else.
+    export PGHOST="$datadir"
+    export PGPORT=5432
+    PGUSER="$(id -un)"
+    export PGUSER
+    export PG_CTL="$bin/pg_ctl"
+    unset PGPASSWORD PGSERVICE PGDATABASE PGPASSFILE
+    echo "    started, socket in $datadir"
+}
+
 cleanup() {
     local rc=$?
+    if [ -n "$OWN_PGDATA" ] && [ "$OWN_STARTED" != "1" ]; then
+        # initdb or the server never came up, so there is nothing running to
+        # leave behind and nothing in the cluster worth keeping. The logs stay:
+        # they are the only record of why it failed.
+        rm -rf "$OWN_PGDATA"
+        echo "Temporary cluster removed. Logs kept:" >&2
+        echo "  $OWN_INITDB_LOG" >&2
+        [ -e "$OWN_SERVER_LOG" ] && echo "  $OWN_SERVER_LOG" >&2
+        return
+    fi
+    if [ -n "$OWN_PGDATA" ]; then
+        if [ "${KEEP_SCRATCH:-0}" = "1" ]; then
+            echo "Temporary cluster left running in $OWN_PGDATA" \
+                 "(KEEP_SCRATCH=1)."
+            echo "Stop and remove it with:"
+            echo "  ${PG_CTL:-pg_ctl} -D $OWN_PGDATA stop && rm -rf" \
+                 "$OWN_PGDATA"
+            return
+        fi
+        if [ "$rc" -ne 0 ]; then
+            echo "Failed. The temporary cluster is left running in" \
+                 "$OWN_PGDATA so you can" >&2
+            echo "look at it:  psql -h $OWN_PGDATA -d $SANITISE_DB" >&2
+            echo "Remove it with:  ${PG_CTL:-pg_ctl} -D $OWN_PGDATA stop &&" \
+                 "rm -rf $OWN_PGDATA" >&2
+            return
+        fi
+        echo "Removing the temporary cluster"
+        "${PG_CTL:-pg_ctl}" -D "$OWN_PGDATA" -m immediate stop >/dev/null \
+            2>&1 || true
+        rm -rf "$OWN_PGDATA" "$OWN_INITDB_LOG" "$OWN_SERVER_LOG"
+        return
+    fi
     if [ "${KEEP_SCRATCH:-0}" = "1" ]; then
         echo "Scratch database $SANITISE_DB left in place (KEEP_SCRATCH=1)."
     elif [ "$rc" -ne 0 ]; then
@@ -152,7 +362,24 @@ cleanup() {
             >/dev/null
     fi
 }
-trap cleanup EXIT
+# INT, TERM and HUP as well as EXIT. The likely way to run this is over SSH on
+# an access node, and an uncaught Ctrl-C or a dropped connection would
+# otherwise leave a PostgreSQL running and a data directory the size of the
+# database behind, with nothing to say what they were for.
+#
+# The flip side is that a dropped connection takes the run down with it. For
+# something that will run for hours, start it under tmux or screen, or with
+# nohup, so the shell going away does not reach it.
+trap cleanup EXIT INT TERM HUP
+
+if [ "$OWN_SERVER" = "1" ]; then
+    if [ "${SKIP_RESTORE:-0}" = "1" ]; then
+        echo "ERROR: --own-server and SKIP_RESTORE are contradictory: a" >&2
+        echo "       cluster this script just created has nothing in it." >&2
+        exit 1
+    fi
+    start_own_server
+fi
 
 if [ "${SKIP_RESTORE:-0}" != "1" ]; then
     say "Creating scratch database $SANITISE_DB"
@@ -166,18 +393,78 @@ if [ "${SKIP_RESTORE:-0}" != "1" ]; then
     if decompress "$INPUT" | head -200 | grep -q '^CREATE DATABASE'; then
         echo "ERROR: $INPUT looks like a pg_dumpall cluster dump." >&2
         echo "       Take a single-database dump instead:" >&2
-        echo "         pg_dump -d waldur -Fp | gzip > production.sql.gz" >&2
+        echo "         pg_dump --no-owner --no-privileges -d waldur -Fp | gzip > production.sql.gz" >&2
         echo "       or restore the cluster dump yourself and re-run with" >&2
         echo "       SKIP_RESTORE=1 SANITISE_DB=<the restored database>." >&2
         exit 1
     fi
+    # A dump carries "ALTER TABLE ... OWNER TO waldur" for whatever role owns
+    # the production database. A cluster this script just created has no such
+    # role, so every one of those statements fails - harmlessly, but there can
+    # be thousands of them, and an overnight log full of ERROR lines is
+    # indistinguishable from a run that actually went wrong.
+    #
+    # The role names are in the dump's own header comments ("; Owner: waldur"),
+    # which appear within the first few hundred lines, so they can be read from
+    # the same peek that checks the dump type - no second pass over what may be
+    # tens of gigabytes. Creating them costs nothing: they are login-less roles
+    # in a cluster that is deleted at the end.
+    #
+    # Only under --own-server. On a server that is not ours, creating roles is
+    # not something this script should be doing.
+    if [ "$OWN_SERVER" = "1" ]; then
+        roles="$(decompress "$INPUT" | head -2000 \
+            | sed -nE 's/^-- .*; Owner: ([A-Za-z0-9_-]+)$/\1/p;
+                        s/^ALTER [A-Z ]+ OWNER TO ([A-Za-z0-9_-]+);$/\1/p' \
+            | sort -u | grep -v '^-$' || true)"
+        for role in $roles; do
+            [ "$role" = "$PGUSER" ] && continue
+            psql -q -d postgres \
+                -c "CREATE ROLE \"$role\" NOLOGIN" >/dev/null 2>&1 || true
+        done
+        if [ -n "$roles" ]; then
+            echo "    created placeholder roles: $(echo "$roles" | tr '\n' ' ')"
+        fi
+    fi
+
+    echo "    input is $(du -h "$INPUT" | cut -f1) compressed; the restore is"
+    echo "    usually the second-longest step after the JSON sweep."
+
     # ON_ERROR_STOP is deliberately off: a dump taken as a non-superuser
     # normally fails on extension and ownership statements that do not matter
     # here. Missing tables would be caught by the sanitiser and the verifier.
-    echo "    input is $(du -h "$INPUT" | cut -f1) compressed; the restore is"
-    echo "    usually the second-longest step after the JSON sweep."
+    #
+    # Diagnostics go to a log and are then summarised, rather than streamed:
+    # thousands of repetitions of one harmless error are noise, a count of
+    # each distinct one is information. stdout is dropped - a plain dump's
+    # stdout is one result row per setval, which is not diagnostics.
+    RESTORE_LOG="${OUTPUT%.gz}.restore.log"
     decompress "$INPUT" | pipe_through -N restore \
-        | psql -q -d "$SANITISE_DB" >/dev/null
+        | psql -q -d "$SANITISE_DB" >/dev/null 2>"$RESTORE_LOG" || true
+
+    if [ -s "$RESTORE_LOG" ]; then
+        echo "    the restore reported:"
+        # Strip the row-specific detail so that the same error on ten thousand
+        # rows counts as one kind of error.
+        sed -E 's/^(ERROR|WARNING|DETAIL|HINT):  //; s/"[^"]*"/"..."/g' \
+            "$RESTORE_LOG" | sort | uniq -c | sort -rn | head -8 \
+            | sed 's/^/      /'
+        echo "    full output in $RESTORE_LOG"
+    else
+        # Nothing on stderr at all: do not leave an empty file behind.
+        rm -f "$RESTORE_LOG"
+        echo "    the restore reported no errors"
+    fi
+
+    # A restore that produced no tables did not work, whatever it printed.
+    tables="$(psql -tAq -d "$SANITISE_DB" -c "SELECT count(*) FROM
+        information_schema.tables WHERE table_schema = 'public'")"
+    if [ "${tables:-0}" -lt 50 ]; then
+        echo "ERROR: only ${tables:-0} tables in the restored database; the" >&2
+        echo "       restore did not work. See $RESTORE_LOG." >&2
+        exit 1
+    fi
+    echo "    restored $tables tables"
 fi
 
 say "Sanitising (reports progress as it goes; the JSON sweep is the slow step)"
