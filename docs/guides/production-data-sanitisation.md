@@ -216,6 +216,41 @@ Mail relay credentials were never in the database: Waldur reads `EMAIL_HOST`,
   and `django_migrations`. The migration history is left strictly alone --
   rehearsing the migration is what this data is for.
 
+## Things production data does that a test database does not
+
+Every one of these was found by running against a real dump, not by reading the
+schema, and each is worth knowing if you extend the script.
+
+- **Two accounts on one address.** `core_user.email` has no unique constraint,
+  and a real installation has people with a second account, or one left over
+  from a rename. Both keep their own name and login -- they must, because
+  `core_user.username` *is* unique -- and they go on sharing an address, the
+  lower person number naming it. Giving them separate addresses would be tidier
+  and would quietly destroy the condition `OIDC_MATCHMAKING_BY_EMAIL` exists to
+  handle.
+- **Addresses that are not addresses**, stored with stray whitespace, in mixed
+  case, with nothing after the `@`, or with no `@` at all. All of them are
+  harvested and mapped; none reach the sink.
+- **Short surnames.** Substituting a name into prose with a plain `replace()`
+  turns "Maybe" into "Person Number7be" for anyone called May. Names are
+  substituted on word boundaries only.
+- **Keys that look personal and are not.** The event log carries
+  `resource_full_name`, which is a *resource's* name. Matching every
+  `*_full_name` key replaced those with "Person Number0" and destroyed a field
+  the homeport UI renders, so the fallback applies only to keys with a
+  person-ish prefix.
+- **Robot accounts whose names collide with type strings.** An account called
+  "OpenPortal Robot" put the bare word "OpenPortal" in the name map, which then
+  rewrote every `"service_settings_type": "OpenPortal"` into a person's
+  pseudonym. Whole JSON leaves are matched only against multi-token names; bare
+  first and last names stay available to the prose substitution, where they
+  legitimately appear mid-sentence.
+
+The last three are over-replacements: they fail safe for privacy but damage
+exactly the realism the copy exists for, and none of them announce themselves.
+Diffing two consecutive runs is what surfaces them, because anything that is
+not a fixed point shows up immediately.
+
 ## Why not merge two dumps
 
 The obvious approach is to splice the local dump's settings into the production
@@ -264,5 +299,7 @@ A full run against a real dump: 188 JSON columns sized and the 27 non-empty
 ones walked (33,780 rows, 24 MB, 50s), 29 identifier columns mapped, 1,555 text
 columns swept, both checks clean, and the result loads, reconciles and migrates
 to the resynced schema with `makemigrations --check` reporting no changes.
-Re-running the sanitiser over its own output changes nothing, so an interrupted
-run can simply be repeated.
+Re-running the sanitiser over its own output changes nothing -- verified by
+diffing two consecutive dumps, which is the only way to be sure of it -- so an
+interrupted run can simply be repeated. `--reuse-server` re-runs against a
+cluster a previous attempt left behind, skipping the restore.

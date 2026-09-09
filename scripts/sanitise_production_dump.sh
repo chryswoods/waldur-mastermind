@@ -9,6 +9,16 @@
 #
 #   scripts/sanitise_production_dump.sh --own-server prod.sql.gz clean.sql.gz
 #
+#   scripts/sanitise_production_dump.sh --reuse-server <datadir> \
+#       prod.sql.gz clean.sql.gz
+#
+# --reuse-server picks up a cluster an earlier --own-server run left behind and
+# skips the restore. The sanitiser is one transaction, so a failure rolls back
+# completely and leaves the restored copy pristine: after fixing whatever went
+# wrong, this re-runs against it in seconds rather than restoring tens of
+# gigabytes again. It starts the cluster if it is not running, and leaves it
+# alone afterwards - you named it, so removing it is your call.
+#
 # --own-server does not touch any existing PostgreSQL: it runs initdb into a
 # temporary directory, starts a private server there, does the work, and
 # destroys the whole cluster afterwards. Use this anywhere you would rather not
@@ -92,6 +102,7 @@
 #   SKIP_RESTORE=1   the scratch database is already populated; just sanitise
 #   SANITISE_PGDATA  where --own-server puts its cluster
 #                    (default alongside OUTPUT)
+#   OVERWRITE=1      replace an existing OUTPUT rather than refusing
 #   PG_BIN           directory holding initdb and pg_ctl, if they are not on
 #                    PATH and not somewhere this script looks
 #   SANITISE_LOG     where to write the progress log
@@ -107,10 +118,18 @@ usage() {
 }
 
 OWN_SERVER=0
+REUSE_SERVER=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage 0 ;;
         --own-server) OWN_SERVER=1; shift ;;
+        --reuse-server)
+            REUSE_SERVER="${2:-}"
+            if [ -z "$REUSE_SERVER" ]; then
+                echo "ERROR: --reuse-server needs a data directory." >&2
+                exit 1
+            fi
+            shift 2 ;;
         --) shift; break ;;
         -*) echo "ERROR: unknown option $1" >&2; usage ;;
         *) break ;;
@@ -132,10 +151,12 @@ if [ ! -r "$INPUT" ]; then
     echo "ERROR: cannot read input dump $INPUT" >&2
     exit 1
 fi
-if [ -e "$OUTPUT" ]; then
+if [ -e "$OUTPUT" ] && [ "${OVERWRITE:-0}" != "1" ]; then
     echo "ERROR: $OUTPUT already exists; refusing to overwrite." >&2
+    echo "       Re-run with OVERWRITE=1 if that is what you want." >&2
     exit 1
 fi
+rm -f "$OUTPUT"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SANITISE_DB="${SANITISE_DB:-waldur_sanitise}"
@@ -220,6 +241,62 @@ find_pg_bin() {
     return 1
 }
 
+# The durability settings are off because the cluster is thrown away at the end
+# - there is nothing to crash-recover to - and they roughly halve the time the
+# restore takes. autovacuum is off for the same reason; the sanitiser runs one
+# VACUUM ANALYZE at the end.
+#
+# listen_addresses='' means no TCP socket at all, and the unix socket lives
+# inside the 0700 data directory. On a shared access node that matters: this
+# cluster trusts every connection, so it must not be reachable by anyone but
+# its owner.
+server_opts() {
+    local datadir="$1" opts
+    opts="-c listen_addresses='' -k $datadir"
+    opts="$opts -c fsync=off -c full_page_writes=off"
+    opts="$opts -c synchronous_commit=off -c autovacuum=off"
+    opts="$opts -c maintenance_work_mem=512MB -c work_mem=64MB"
+    opts="$opts -c max_wal_size=4GB"
+    printf '%s' "$opts"
+}
+
+reuse_server() {
+    local bin datadir
+    bin="$(find_pg_bin)" || exit 1
+    datadir="$(cd "$REUSE_SERVER" 2>/dev/null && pwd)" || {
+        echo "ERROR: $REUSE_SERVER is not a directory." >&2
+        exit 1
+    }
+    if [ ! -f "$datadir/PG_VERSION" ]; then
+        echo "ERROR: $datadir is not a PostgreSQL data directory." >&2
+        exit 1
+    fi
+
+    say "Reusing the cluster in $datadir"
+    if "$bin/pg_ctl" -D "$datadir" status >/dev/null 2>&1; then
+        echo "    already running"
+    else
+        echo "    not running; starting it"
+        "$bin/pg_ctl" -D "$datadir" -l "$datadir.server.log" -w \
+            -o "$(server_opts "$datadir")" start >/dev/null || {
+            echo "ERROR: could not start it; see $datadir.server.log" >&2
+            exit 1
+        }
+    fi
+
+    export PGHOST="$datadir"
+    export PGPORT=5432
+    PGUSER="$(id -un)"
+    export PGUSER
+    export PG_CTL="$bin/pg_ctl"
+    unset PGPASSWORD PGSERVICE PGDATABASE PGPASSFILE
+
+    # Deliberately NOT recorded in OWN_PGDATA: cleanup must not destroy a
+    # cluster the caller named and may want to re-run against again.
+    echo "    left in place on exit; remove it yourself with:"
+    echo "      $bin/pg_ctl -D $datadir stop && rm -rf $datadir"
+}
+
 start_own_server() {
     local bin datadir needed avail
     bin="$(find_pg_bin)" || exit 1
@@ -283,21 +360,8 @@ start_own_server() {
         exit 1
     }
 
-    # listen_addresses='' means no TCP socket at all, and the unix socket lives
-    # inside the 0700 data directory. On a shared access node that matters:
-    # this cluster trusts every connection, so it must not be reachable by
-    # anyone but its owner.
-    #
-    # The durability settings are off because the cluster is thrown away at the
-    # end - there is nothing to crash-recover to - and they roughly halve the
-    # time the restore takes. autovacuum is off for the same reason; the
-    # sanitiser runs one VACUUM ANALYZE at the end.
     local opts
-    opts="-c listen_addresses='' -k $datadir"
-    opts="$opts -c fsync=off -c full_page_writes=off"
-    opts="$opts -c synchronous_commit=off -c autovacuum=off"
-    opts="$opts -c maintenance_work_mem=512MB -c work_mem=64MB"
-    opts="$opts -c max_wal_size=4GB"
+    opts="$(server_opts "$datadir")"
     "$bin/pg_ctl" -D "$datadir" -l "$OWN_SERVER_LOG" -w -o "$opts" \
         start >/dev/null || {
         echo "ERROR: could not start the temporary server; see" \
@@ -372,6 +436,10 @@ cleanup() {
 # nohup, so the shell going away does not reach it.
 trap cleanup EXIT INT TERM HUP
 
+if [ "$OWN_SERVER" = "1" ] && [ -n "$REUSE_SERVER" ]; then
+    echo "ERROR: --own-server and --reuse-server are contradictory." >&2
+    exit 1
+fi
 if [ "$OWN_SERVER" = "1" ]; then
     if [ "${SKIP_RESTORE:-0}" = "1" ]; then
         echo "ERROR: --own-server and SKIP_RESTORE are contradictory: a" >&2
@@ -379,6 +447,12 @@ if [ "$OWN_SERVER" = "1" ]; then
         exit 1
     fi
     start_own_server
+fi
+if [ -n "$REUSE_SERVER" ]; then
+    reuse_server
+    # The whole point of reusing a cluster is that it already holds the
+    # restored copy.
+    SKIP_RESTORE=1
 fi
 
 if [ "${SKIP_RESTORE:-0}" != "1" ]; then

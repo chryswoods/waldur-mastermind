@@ -67,6 +67,47 @@ END $$;
 DROP SCHEMA IF EXISTS sanitise CASCADE;
 CREATE SCHEMA sanitise;
 
+-- Is this value already one this script wrote? Every rewrite consults this
+-- first, so that a second pass is a genuine no-op rather than pseudonymising
+-- the pseudonyms. Getting this wrong is not cosmetic: an earlier version
+-- turned "Person Number8" into "Person Number1 Number8" on a re-run, and
+-- compounded it further on every run after that.
+CREATE FUNCTION sanitise.is_pseudonym(val text)
+RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
+    SELECT val ~ '^Person Number[0-9]+$'
+        OR val ~ '^person[0-9]+([._-][A-Za-z0-9._-]*)?$'
+        OR val ~ '^person[0-9]+@example_org[0-9]+\.com$'
+        OR val = 'Person'
+        OR val ~ '^Number[0-9]+$'
+        OR val = '198.51.100.1'
+        OR val = 'Mozilla/5.0 (redacted)'
+        OR val = 'https://example.com/redacted'
+$$;
+
+-- Replace whole words only.
+--
+-- The naive replace() is wrong for substituting a name into prose: a real
+-- surname of three or four letters - May, Cook, Green - occurs inside ordinary
+-- words, and "Maybe" would become "Person Number7be". Word boundaries are
+-- added only at ends that actually start or end with a word character, since
+-- \y next to punctuation would never match.
+--
+-- The needle is a literal, so its regex metacharacters are escaped; the
+-- replacement's only special character in this position is a backslash.
+CREATE FUNCTION sanitise.replace_word(hay text, needle text, sub text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+    SELECT CASE
+        WHEN hay IS NULL OR needle IS NULL OR needle = '' THEN hay
+        ELSE regexp_replace(
+            hay,
+            CASE WHEN needle ~ '^\w' THEN '\y' ELSE '' END
+            || regexp_replace(needle, '([\\^$.|?*+()\[\]{}])', '\\\1', 'g')
+            || CASE WHEN needle ~ '\w$' THEN '\y' ELSE '' END,
+            regexp_replace(sub, '\\', '\\\\', 'g'),
+            'g')
+    END
+$$;
+
 -- Progress reporting.
 --
 -- Notices reach the client as they are raised rather than at commit, so these
@@ -114,7 +155,7 @@ DECLARE
     missing text;
 BEGIN
     IF to_regclass('public.' || quote_ident(tbl)) IS NULL THEN
-        RAISE NOTICE 'skip (no table %): %', tbl, left(stmt, 60);
+        RAISE NOTICE 'skip: no table %', tbl;
         RETURN;
     END IF;
     SELECT c INTO missing FROM unnest(cols) AS c
@@ -123,7 +164,7 @@ BEGIN
         WHERE table_schema = 'public' AND table_name = tbl AND column_name = c
     ) LIMIT 1;
     IF missing IS NOT NULL THEN
-        RAISE NOTICE 'skip (no column %.%): %', tbl, missing, left(stmt, 60);
+        RAISE NOTICE 'skip: no column %.%', tbl, missing;
         RETURN;
     END IF;
     EXECUTE stmt;
@@ -221,8 +262,12 @@ CREATE TABLE sanitise.person (
     new_username text
 );
 
+-- btrim as well as lower, because map_email() btrims its lookup key: an
+-- address stored with a stray leading space would otherwise be harvested in
+-- one form and looked up in another, and quietly land on the sink.
 INSERT INTO sanitise.person (n, user_id, user_uuid, orig_email)
-SELECT row_number() OVER (ORDER BY id), id, uuid::text, lower(nullif(email, ''))
+SELECT row_number() OVER (ORDER BY id), id, uuid::text,
+       lower(btrim(nullif(btrim(email), '')))
 FROM public.core_user;
 
 -- Every address anywhere in the database, so that domains are numbered across
@@ -251,8 +296,8 @@ BEGIN
         PERFORM sanitise.exec_if(
             split_part(spec, '.', 1), ARRAY[split_part(spec, '.', 2)],
             format('INSERT INTO sanitise.found_email
-                    SELECT lower(%I) FROM public.%I
-                    WHERE %I IS NOT NULL AND %I <> %L',
+                    SELECT lower(btrim(%I)) FROM public.%I
+                    WHERE %I IS NOT NULL AND btrim(%I) <> %L',
                    split_part(spec, '.', 2), split_part(spec, '.', 1),
                    split_part(spec, '.', 2), split_part(spec, '.', 2), ''));
     END LOOP;
@@ -262,16 +307,16 @@ END $$;
 -- newline separated string.
 SELECT sanitise.exec_if('logging_emaillog', ARRAY['emails'],
     $$INSERT INTO sanitise.found_email
-      SELECT lower(e) FROM public.logging_emaillog, unnest(emails) AS e
-      WHERE e <> ''$$);
+      SELECT lower(btrim(e)) FROM public.logging_emaillog, unnest(emails) AS e
+      WHERE btrim(e) <> ''$$);
 
 SELECT sanitise.exec_if('notifications_broadcastmessage', ARRAY['emails'],
     $$INSERT INTO sanitise.found_email
-      SELECT lower(e) FROM public.notifications_broadcastmessage,
+      SELECT lower(btrim(e)) FROM public.notifications_broadcastmessage,
              jsonb_array_elements_text(
                  CASE WHEN jsonb_typeof(emails) = 'array' THEN emails
                       ELSE '[]'::jsonb END) AS e
-      WHERE e <> ''$$);
+      WHERE btrim(e) <> ''$$);
 
 SELECT sanitise.exec_if('structure_customer', ARRAY['notification_emails'],
     $$INSERT INTO sanitise.found_email
@@ -321,12 +366,47 @@ CREATE TABLE sanitise.email_map (
     new_email  text NOT NULL
 );
 
+-- One row per DISTINCT address, not one per person: core_user.email carries no
+-- unique constraint, and a real installation has people with two accounts on
+-- one address, or one account left over from a rename.
+--
+-- Both of those accounts keep their own name and login - Person Number5 and
+-- Person Number9, person5 and person9, which they must, because
+-- core_user.username IS unique - but they keep SHARING an address, the lower
+-- person number naming it. Giving them separate addresses would be tidier and
+-- would quietly destroy a property of the data worth testing against:
+-- OIDC_MATCHMAKING_BY_EMAIL exists precisely to decide what to do when two
+-- accounts share an address.
+-- LEFT JOIN, not JOIN: a stored address with nothing after the @, or no @ at
+-- all, has no domain to number. Those still need a pseudonym - dropping them
+-- here would send them to the sink and make the verifier's count of genuinely
+-- unharvested addresses useless - so they get domain zero.
 INSERT INTO sanitise.email_map (orig_email, new_email)
-SELECT p.orig_email,
-       'person' || p.n || '@example_org' || d.m || '.com'
+SELECT DISTINCT ON (p.orig_email)
+       p.orig_email,
+       'person' || p.n || '@example_org' || coalesce(d.m, 0) || '.com'
 FROM sanitise.person p
-JOIN sanitise.domain d ON d.orig_domain = split_part(p.orig_email, '@', 2)
-WHERE p.orig_email IS NOT NULL;
+LEFT JOIN sanitise.domain d
+       ON d.orig_domain = split_part(p.orig_email, '@', 2)
+WHERE p.orig_email IS NOT NULL
+ORDER BY p.orig_email, p.n;
+
+DO $$
+DECLARE
+    shared int;
+BEGIN
+    SELECT count(*) INTO shared FROM (
+        SELECT orig_email FROM sanitise.person
+        WHERE orig_email IS NOT NULL
+        GROUP BY orig_email HAVING count(*) > 1
+    ) dupes;
+    IF shared > 0 THEN
+        PERFORM sanitise.say(format(
+            '  %s addresses are shared by more than one account; each keeps'
+            || ' its own name and login and they go on sharing an address',
+            shared));
+    END IF;
+END $$;
 
 CREATE INDEX ON sanitise.email_map (orig_email);
 
@@ -561,6 +641,17 @@ CROSS JOIN LATERAL (
            (nullif(btrim(u.native_name), ''))
 ) AS t(orig)
 WHERE t.orig IS NOT NULL AND length(t.orig) >= 3
+  -- Skip users this script has already pseudonymised, at the ROW level rather
+  -- than by filtering the candidates. On a re-run core_user holds first_name
+  -- 'Person' and last_name 'NumberN', and the combinations above then include
+  -- the reversed 'Number8 Person', which the substitution pass would find
+  -- inside "...Person Number8 Person Number13..." and rewrite - compounding
+  -- further on every run after that. Filtering candidate strings means
+  -- enumerating every form the VALUES list can produce and missing one; this
+  -- says the thing actually meant, which is that an already-pseudonymised
+  -- account contributes no names at all.
+  AND NOT (u.first_name = 'Person' AND u.last_name ~ '^Number[0-9]+$')
+  AND NOT sanitise.is_pseudonym(t.orig)
 ORDER BY t.orig, p.n;
 
 CREATE INDEX ON sanitise.name_map (length(orig) DESC);
@@ -632,7 +723,7 @@ DECLARE
     nested jsonb;
     brace int;
 BEGIN
-    IF val IS NULL OR val = '' THEN
+    IF val IS NULL OR val = '' OR sanitise.is_pseudonym(val) THEN
         RETURN val;
     END IF;
 
@@ -670,7 +761,14 @@ BEGIN
     -- leaving project and offering names intact.
     mapped := sanitise.map_identifier(val);
     IF mapped IS NULL THEN
-        mapped := (SELECT new FROM sanitise.name_map WHERE orig = val);
+        -- Multi-token names only. A single-token entry is a bare first or last
+        -- name, and matching a whole JSON leaf against those is how a robot
+        -- account called "OpenPortal Robot" turned every
+        -- "service_settings_type": "OpenPortal" into a person's pseudonym.
+        -- Bare names stay available to the prose substitution, where they
+        -- legitimately appear mid-sentence.
+        mapped := (SELECT new FROM sanitise.name_map
+                   WHERE orig = val AND orig LIKE '% %');
     END IF;
     IF mapped IS NOT NULL THEN
         RETURN mapped;
@@ -696,8 +794,7 @@ BEGIN
        AND k ~* '(^|_)(author|owner|reviewer|approver|manager|contact)$'
        OR k ~* '_by$' THEN
         IF val ~ '[A-Za-z]' AND val !~ '^https?://'
-           AND val !~ '^person[0-9]+([._-]|$)'
-           AND val !~ '^Person Number[0-9]+$' THEN
+           AND NOT sanitise.is_pseudonym(val) THEN
             RETURN 'Person Number0';
         END IF;
     END IF;
@@ -969,12 +1066,18 @@ SELECT sanitise.exec_if('waldur_openportal_remoteproject', ARRAY['notes'], $$
             note
             || jsonb_build_object(
                 'author',
-                coalesce(
-                    (SELECT new FROM sanitise.token_map
-                     WHERE orig = note->>'author'),
-                    (SELECT new FROM sanitise.name_map
-                     WHERE orig = note->>'author'),
-                    'person0'))
+                CASE
+                    WHEN sanitise.is_pseudonym(note->>'author')
+                        THEN note->>'author'
+                    ELSE coalesce(
+                        (SELECT new FROM sanitise.name_map
+                         WHERE orig = note->>'author'),
+                        (SELECT new FROM sanitise.token_map
+                         WHERE orig = note->>'author'),
+                        -- An author is a person's rendered name, so the sink
+                        -- is a name, not a login.
+                        'Person Number0')
+                END)
             || jsonb_build_object('text',
                                   sanitise.filler(note->>'text'))
             ORDER BY ord)
@@ -1043,7 +1146,7 @@ BEGIN
     END IF;
 
     FOR k, v IN SELECT key, value FROM jsonb_each_text(ctx) LOOP
-        IF v IS NULL OR v = '' THEN
+        IF v IS NULL OR v = '' OR sanitise.is_pseudonym(v) THEN
             CONTINUE;
         END IF;
 
@@ -1057,11 +1160,24 @@ BEGIN
             replacement := sanitise.map_email(v);
         ELSIF k = 'username' OR k ~ '_username$' THEN
             replacement := sanitise.map_token(v);
-        ELSIF k ~ '_full_name$' OR k ~ '_native_name$' OR k = 'full_name'
-              OR k = 'native_name' THEN
+        -- A person's rendered name, on a key that can only be about a
+        -- person. The event log also carries resource_full_name, which is a
+        -- RESOURCE's name: matching every *_full_name key replaced those with
+        -- "Person Number0" and quietly destroyed a field the homeport UI
+        -- renders. So the sink applies only to these prefixes.
+        ELSIF k ~ ('^(user|affected_user|created_by|initiated_by|author'
+                   || '|owner|reviewer|approver|manager|caller|assignee'
+                   || '|reporter|consumer_reviewed_by|provider_reviewed_by'
+                   || '|performed_by|requested_by|submitted_by)'
+                   || '_(full_name|native_name)$')
+              OR k IN ('full_name', 'native_name') THEN
             replacement := coalesce(
                 (SELECT new FROM sanitise.name_map WHERE orig = v),
                 'Person Number0');
+        -- Any other *_full_name: replace it if it really is a name we know,
+        -- and otherwise leave it alone rather than assuming.
+        ELSIF k ~ '_full_name$' OR k ~ '_native_name$' THEN
+            replacement := (SELECT new FROM sanitise.name_map WHERE orig = v);
         ELSIF k ~ '(^|_)(contact_details|phone_number|civil_number|address)$'
         THEN
             replacement := '';
@@ -1075,7 +1191,7 @@ BEGIN
         IF replacement IS NOT NULL AND replacement <> v THEN
             new_ctx := jsonb_set(new_ctx, ARRAY[k], to_jsonb(replacement));
             IF new_msg IS NOT NULL AND length(v) >= 3 THEN
-                new_msg := replace(new_msg, v, replacement);
+                new_msg := sanitise.replace_word(new_msg, v, replacement);
             END IF;
         END IF;
     END LOOP;
@@ -1110,7 +1226,7 @@ BEGIN
     FOR r IN SELECT orig, new FROM sanitise.name_map ORDER BY length(orig) DESC
     LOOP
         UPDATE public.logging_event
-        SET message = replace(message, r.orig, r.new)
+        SET message = sanitise.replace_word(message, r.orig, r.new)
         WHERE message LIKE '%' || r.orig || '%';
     END LOOP;
 END $$;
