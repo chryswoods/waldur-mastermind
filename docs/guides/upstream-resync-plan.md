@@ -440,6 +440,19 @@ Two things it gives that a rehearsal against dev data cannot:
   Django does not report them, so the script timestamps each `Applying ...` line
   and reports the slowest by subtraction.
 
+A copy needs as much space again as the database, and the sanitising run has
+usually just filled a good part of the disk -- so the script checks free space
+first and refuses with the way out rather than running out half way through.
+`--in-place` skips the copy and rehearses on the sanitised database itself.
+That is destructive to it, which is acceptable because the sanitised *dump*
+reproduces it in minutes against the hours the sanitising took: have that dump,
+ideally off the machine, first.
+
+A full disk is worth ruling out before anything else here. PostgreSQL's errors
+under it point somewhere else entirely -- a `CREATE DATABASE ... TEMPLATE` on a
+full filesystem reported `buffer is pinned in InvalidateBuffer`, which reads
+like a concurrency problem and is not one.
+
 It runs with `waldur_core.server.rehearsal_settings`, which is `base_settings`
 plus a database connection from the environment. Deliberately **not**
 `test_settings`: that adds `waldur_core.quotas.tests`,

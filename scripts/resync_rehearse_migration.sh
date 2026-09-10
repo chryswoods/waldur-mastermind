@@ -3,6 +3,15 @@
 #
 #   scripts/resync_rehearse_migration.sh --datadir <the sanitise cluster>
 #
+#   scripts/resync_rehearse_migration.sh --datadir <dir> --in-place
+#
+# --in-place skips the copy and rehearses on the sanitised database itself.
+# Use it when the filesystem cannot hold a second copy - a copy needs as much
+# space again as the database, and the sanitising run will already have filled
+# a good part of the disk. It is destructive to the sanitised database, which
+# is acceptable because the sanitised DUMP reproduces it in minutes; make sure
+# you have that dump, and preferably off this machine, first.
+#
 # Runs, in order, against a COPY of the sanitised database:
 #
 #   1. scripts/resync_preflight_check.sql   (read-only)
@@ -53,6 +62,7 @@
 #   REHEARSAL_DB       database to create        (default waldur_rehearsal)
 #   KEEP_REHEARSAL=1   keep an existing REHEARSAL_DB instead of recreating it,
 #                      to resume after a failure part-way through migrate
+#   --in-place         rehearse on the sanitised database itself, no copy
 #   PG_BIN             directory holding pg_ctl, if not on PATH
 #   REHEARSAL_LOG_DIR  where the three logs go (default: working directory)
 set -euo pipefail
@@ -63,10 +73,12 @@ usage() {
 }
 
 DATADIR=""
+IN_PLACE=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage 0 ;;
         --datadir) DATADIR="${2:-}"; shift 2 ;;
+        --in-place) IN_PLACE=1; shift ;;
         *) echo "ERROR: unexpected argument $1" >&2; usage ;;
     esac
 done
@@ -124,6 +136,15 @@ if [ -n "$DATADIR" ]; then
     unset PGPASSWORD PGSERVICE PGDATABASE PGPASSFILE
 fi
 
+# Where the data actually lives, for the free-space check. The data directory
+# when we know it, otherwise ask the server.
+if [ -n "$DATADIR" ]; then
+    DATADIR_FOR_DF="$DATADIR"
+else
+    DATADIR_FOR_DF="$(psql -tAq -d postgres -c 'SHOW data_directory' \
+        2>/dev/null || echo /)"
+fi
+
 if ! psql -tAq -d postgres -c 'SELECT 1' >/dev/null 2>&1; then
     echo "ERROR: cannot connect to PostgreSQL. Pass --datadir, or set" >&2
     echo "       PGHOST/PGPORT/PGUSER for the cluster holding $SOURCE_DB." >&2
@@ -144,20 +165,59 @@ fi
 # ---------------------------------------------------------------------------
 # The copy.
 # ---------------------------------------------------------------------------
-if exists "$REHEARSAL_DB" && [ "${KEEP_REHEARSAL:-0}" = "1" ]; then
+SOURCE_BYTES="$(psql -tAq -d postgres -c \
+    "SELECT pg_database_size('$SOURCE_DB')")"
+SOURCE_MB=$(( SOURCE_BYTES / 1048576 ))
+
+if [ "$IN_PLACE" = "1" ]; then
+    say "Rehearsing IN PLACE on $SOURCE_DB (no copy)"
+    echo "    this is destructive to $SOURCE_DB. It is reproducible from the"
+    echo "    sanitised dump in minutes, so make sure you have that dump -"
+    echo "    ideally off this machine - before continuing."
+    REHEARSAL_DB="$SOURCE_DB"
+elif exists "$REHEARSAL_DB" && [ "${KEEP_REHEARSAL:-0}" = "1" ]; then
     say "Reusing the existing $REHEARSAL_DB (KEEP_REHEARSAL=1)"
 else
+    # A TEMPLATE copy needs as much space again as the database, and the
+    # sanitising run has usually just filled a good part of the disk. Checking
+    # first turns "out of space half way through" into a clear refusal, and
+    # names the way out.
+    AVAIL_MB=$(df -Pk "$DATADIR_FOR_DF" 2>/dev/null \
+        | awk 'NR==2 {print int($4 / 1024)}')
     say "Copying $SOURCE_DB to $REHEARSAL_DB"
+    echo "    $SOURCE_DB is ${SOURCE_MB} MB; ${AVAIL_MB:-?} MB free"
+    if [ -n "${AVAIL_MB:-}" ] && [ "$AVAIL_MB" -lt "$SOURCE_MB" ]; then
+        echo >&2
+        echo "ERROR: not enough space for a copy: the database is" >&2
+        echo "       ${SOURCE_MB} MB and only ${AVAIL_MB} MB is free." >&2
+        echo >&2
+        echo "       Either free some space, or rehearse without a copy:" >&2
+        echo >&2
+        echo "         $0 ${DATADIR:+--datadir $DATADIR} --in-place" >&2
+        echo >&2
+        echo "       --in-place is destructive to $SOURCE_DB, which is fine" >&2
+        echo "       if you still have the sanitised dump: restoring it takes" >&2
+        echo "       minutes against the hours the sanitising took." >&2
+        exit 1
+    fi
     echo "    a TEMPLATE copy: a filesystem copy, not a restore"
     psql -q -d postgres -c "DROP DATABASE IF EXISTS \"$REHEARSAL_DB\""
     # CREATE DATABASE ... TEMPLATE needs no other session connected to the
-    # template, which is why nothing else should be using the sanitised copy
-    # while this runs.
+    # template.
     if ! psql -q -d postgres \
         -c "CREATE DATABASE \"$REHEARSAL_DB\" TEMPLATE \"$SOURCE_DB\""; then
-        echo "ERROR: the copy failed. The usual cause is another session" >&2
-        echo "       connected to $SOURCE_DB - close any psql you have" >&2
-        echo "       open on it and try again." >&2
+        echo >&2
+        echo "ERROR: the copy failed. Check, in this order:" >&2
+        echo "  1. free space - df on the filesystem holding the cluster." >&2
+        echo "     A full disk breaks this in ways whose error messages point" >&2
+        echo "     somewhere else entirely, including 'buffer is pinned in" >&2
+        echo "     InvalidateBuffer'." >&2
+        echo "  2. another session connected to $SOURCE_DB, which a TEMPLATE" >&2
+        echo "     copy does not allow. Check with:" >&2
+        echo "       psql -d postgres -c \"SELECT pid, application_name FROM" >&2
+        echo "         pg_stat_activity WHERE datname = '$SOURCE_DB'\"" >&2
+        echo >&2
+        echo "  Or skip the copy entirely with --in-place." >&2
         exit 1
     fi
     echo "    $(psql -tAq -d "$REHEARSAL_DB" -c \
@@ -299,7 +359,17 @@ cat <<EOT
   plan         $LOG_DIR/rehearsal-plan.log
   migrate      $MIGRATE_LOG
 
-$REHEARSAL_DB is left in place. To rehearse again from the unmigrated copy,
-just re-run this script: it recreates the copy from $SOURCE_DB, which is
-untouched.
+$REHEARSAL_DB is left in place, now migrated.
 EOT
+if [ "$IN_PLACE" = "1" ]; then
+    cat <<EOT
+That was $SOURCE_DB itself, so there is no longer an unmigrated sanitised
+database here. Restore the sanitised dump if you need one again - minutes,
+against the hours the sanitising took.
+EOT
+else
+    cat <<EOT
+To rehearse again from the unmigrated copy, just re-run this script: it
+recreates the copy from $SOURCE_DB, which is untouched.
+EOT
+fi
