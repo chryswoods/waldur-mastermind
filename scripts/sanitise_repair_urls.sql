@@ -129,12 +129,19 @@ BEGIN
         GET DIAGNOSTICS n = ROW_COUNT;
         IF n > 0 THEN
             total := total + n;
-            RAISE NOTICE '  %.%: % rows', r.tbl, r.col, n;
+            -- Rows TOUCHED, not rows changed. The prefilter matches any row
+            -- containing "http", and most of those hold only allowlisted URLs
+            -- that scrub_urls leaves alone - but rewriting a row to the same
+            -- value still counts as an update. Reading these as a leak count
+            -- overstates it by orders of magnitude; the output scan is what
+            -- says how much actually leaked.
+            RAISE NOTICE '  %.%: % rows examined', r.tbl, r.col, n;
         END IF;
     END LOOP;
 
-    RAISE NOTICE 'repair done: % rows in %',
+    RAISE NOTICE 'repair done: % rows examined in % - re-run the output scan',
         total, clock_timestamp() - started;
+    RAISE NOTICE 'to see how many URLs actually needed redacting';
 
     IF wanted_cols IS NOT NULL THEN
         -- A named list only fixes what it names. Say so, because the output
