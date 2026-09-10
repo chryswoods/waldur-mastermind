@@ -280,6 +280,54 @@ Upstream added `0001_squashed_0039` (openportal) and `0001_squashed_0074`
 existing database, but confirm a fresh `migrate` does not take a different
 route than the reconciled one.
 
+## 6.5 Production scale
+
+Measured from the sanitised copy of production (September 2026), so these are
+the real numbers the deployment has to get through:
+
+| | rows |
+| --- | --- |
+| people (`core_user`) | 4,276 |
+| organisations | 23 |
+| projects | 1,651 |
+| resources | 1,956 |
+| events (`logging_event`) | 2,851,926 |
+| invoices | 473 |
+
+What that means for the migration window:
+
+- **No expensive DDL lands on the big table.** The recent `logging` migrations
+  touch `emaillog` and model options, not `event`, so the 2.85 million events
+  are not rewritten or reindexed. The index-creating migrations on `event`
+  (`0015`, `0018`) long predate this branch and are already applied.
+- **The proposal replay is free**, however long the series. Production holds no
+  proposals, so upstream's `0047`-`0077` run against empty tables.
+- **The two column drops are cheap.** `ALTER TABLE ... DROP COLUMN` in
+  PostgreSQL only marks the attribute dropped; it does not rewrite the table.
+  1,651 projects and 4,276 users would be quick even if it did.
+- **The data migrations that scale with these counts** are
+  `core/0041_backfill_user_initial_revisions` (one revision per user, so 4,276)
+  and `core/0048_backfill_notificationtemplate_initial_revisions`. Both are
+  exercised representatively by the sanitised copy, since it keeps the user and
+  template counts.
+
+### What the sanitised copy does NOT rehearse
+
+The sanitiser empties or blanks three things, so the copy cannot time the
+migrations that read them. All three are worth knowing before the deployment
+rather than during it:
+
+| dropped by the sanitiser | migration that reads it | risk |
+| --- | --- | --- |
+| `reversion_version`, `reversion_revision` | `marketplace/0270_scrub_secret_options_from_reversion` | Low. It filters with `serialized_data__contains` and walks id-ordered keyset batches, so only Offering versions mentioning the key reach Python. But the copy has no history at all, so the copy proves nothing either way. |
+| `structure_servicesettings.password`, `.token`, `.options` | `structure/0080`, `structure/0081` (encrypt in place) | Low: few rows. |
+| `marketplace_offering.secret_options` | `marketplace/0269_encrypt_existing_secret_options` | Low: few rows. |
+
+`reversion_version` is the one to check, because it is plausibly the second
+largest table in production after `logging_event` and nothing here measures it.
+`scripts/resync_preflight_check.sql` reports the ten largest tables with sizes,
+which settles it.
+
 ## 7. Sequencing
 
 1. Scope the OpenPortal 0.32 → 0.92 library and service upgrade. This can
