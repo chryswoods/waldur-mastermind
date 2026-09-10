@@ -78,7 +78,10 @@ leaves the scratch database behind so you can look at it.
 The sanitiser **commits before the verification runs**, so a failure in the
 verifier or in the output scan costs only the checking, not the rewriting.
 `SKIP_SANITISE=1` picks up an already-sanitised database and does just the
-verify, dump and scan -- seconds rather than hours. Combined with
+verify, dump and scan -- seconds rather than hours.
+`scripts/sanitise_repair_urls.sql` goes with it: it redacts leaked URLs in an
+already-sanitised database at the text level rather than by walking JSON
+structure, which is minutes rather than the hours the full rewrite takes. Combined with
 `KEEP_SCRATCH=1` so that a successful run does not drop the database you may
 still want:
 
@@ -251,6 +254,22 @@ schema, and each is worth knowing if you extend the script.
   `*_full_name` key replaced those with "Person Number0" and destroyed a field
   the homeport UI renders, so the fallback applies only to keys with a
   person-ish prefix.
+- **URLs in prose, not just in URL fields.** The check for a deployment URL
+  inside JSON was anchored to the start of the value, so it caught a `link_url`
+  field and missed `"see https://some.ac.uk/data for detail"` in a project
+  description. Plain text columns were covered and JSON leaves were not. Found
+  by the output scan on a production dump, with nothing in any test resembling
+  it.
+
+  What it turned up was not deployment configuration at all: 263 occurrences
+  of `doi.org`, `arxiv.org`, `turing.ac.uk`, `opendata.cern.ch` and a dozen
+  research-group sites, typed by applicants into project descriptions. They
+  are redacted anyway -- a few of them name small organisations, and 263
+  occurrences against 2.8 million events is no loss of realism -- but the
+  premise the scan started from, that any external URL is a deployment
+  endpoint, is worth knowing to be wrong. If you would rather keep public
+  reference hosts, add them to `sanitise.is_local_url` in the sanitiser AND to
+  `ALLOW_URL` in the driver.
 - **A PostgreSQL built without libxml.** `query_to_xml()` is the standard
   trick for running dynamic SQL from a read-only transaction, and a
   source-built server frequently does not have it. An earlier verifier used it

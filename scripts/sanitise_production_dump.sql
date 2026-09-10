@@ -702,6 +702,25 @@ CREATE INDEX ON sanitise.name_map (length(orig) DESC);
 
 -- Replace every address occurrence in a string, consistently with everywhere
 -- else the same address appears.
+-- Is this URL one that may stay? A public standards or documentation host, or
+-- something local. Everything else names a host of this deployment's - the
+-- portal, the helpdesk, whatever an integration was pointed at.
+--
+-- Its own function because scrub_leaf and scrub_urls both need the decision,
+-- and having one ask the other made them mutually recursive: an allowlisted
+-- URL fell past scrub_leaf's early return, into scrub_urls, which asked
+-- scrub_leaf again, forever.
+--
+-- The list mirrors the one in scripts/sanitise_production_dump.sh; keep them
+-- in step.
+CREATE FUNCTION sanitise.is_local_url(val text)
+RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
+    SELECT val ~* ('^https?://([^/]*\.)?('
+        || 'localhost|127\.0\.0\.1|example\.com|example\.org|example\.net'
+        || '|w3\.org|schema\.org|json-schema\.org|creativecommons\.org'
+        || '|opensource\.org|github\.com|waldur\.com)([:/]|$)')
+$$;
+
 -- Replace every deployment URL occurrence in a string.
 CREATE FUNCTION sanitise.scrub_urls(val text)
 RETURNS text LANGUAGE plpgsql STABLE AS $$
@@ -717,7 +736,7 @@ BEGIN
                             'g') AS match
         ORDER BY 1
     LOOP
-        IF sanitise.scrub_leaf(NULL, m) <> m THEN
+        IF NOT sanitise.is_local_url(m) THEN
             val := replace(val, m, 'https://example.com/redacted');
         END IF;
     END LOOP;
@@ -784,6 +803,16 @@ BEGIN
         val := sanitise.scrub_emails(val);
     END IF;
 
+    -- A URL mentioned INSIDE a longer string. The check above is anchored, so
+    -- it only catches a leaf that is nothing but a URL; a note field reading
+    -- "See https://portal.example.ac.uk/awards/1 for detail" went straight
+    -- through it. Plain text columns were covered by the sweep's scrub_urls
+    -- and JSON leaves were not, which is a gap the output scan found on a
+    -- production dump and no test had.
+    IF position('http' IN val) > 0 THEN
+        val := sanitise.scrub_urls(val);
+    END IF;
+
     -- A leaf that IS a login name or a person's name, rather than one that
     -- mentions one. Whole-value matching keeps member lists joinable while
     -- leaving project and offering names intact.
@@ -806,11 +835,7 @@ BEGIN
     -- helpdesk, whatever an integration was pointed at. Kept as a URL so the
     -- UI still renders a link, pointing nowhere. The host allowlist mirrors
     -- the one in scripts/sanitise_production_dump.sh; keep them in step.
-    IF val ~ '^https?://' AND val !~* ('^https?://([^/]*\.)?('
-            || 'localhost|127\.0\.0\.1|example\.com|example\.org'
-            || '|example\.net|w3\.org|schema\.org|json-schema\.org'
-            || '|creativecommons\.org|opensource\.org|github\.com'
-            || '|waldur\.com)([:/]|$)') THEN
+    IF val ~ '^https?://' AND NOT sanitise.is_local_url(val) THEN
         RETURN 'https://example.com/redacted';
     END IF;
 

@@ -612,6 +612,13 @@ esac
 # checks assert on shape per column; this catches an address or a URL in a
 # column nobody thought to check.
 say "Scanning the output for anything that looks like a live address or URL"
+# One definition each, shared by the scan and by the hint printed on failure.
+RE_EMAIL='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+ALLOW_EMAIL='^person[0-9]+@example_org[0-9]+\.com$|^admin@example\.com$'
+RE_URL='https?://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+'
+ALLOW_URL='localhost|127\.0\.0\.1|example\.(com|org|net)|www\.w3\.org|schemas\.|creativecommons\.org|docs\.waldur\.com|waldur\.com|github\.com|opensource\.org|json-schema\.org'
+leak_email=""
+leak_url=""
 leaks=0
 scan() {
     local label="$1" pattern="$2" allow="${3:-}"
@@ -625,28 +632,48 @@ scan() {
     if [ "${n:-0}" -gt 0 ]; then
         printf '  LEAK  %-24s %s occurrences\n' "$label" "$n"
         leaks=$((leaks + 1))
-    else
-        printf '  ok    %-24s\n' "$label"
+        return 0
     fi
+    printf '  ok    %-24s\n' "$label"
+    return 1
 }
-scan "email addresses" \
-     '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' \
-     '^person[0-9]+@example_org[0-9]+\.com$|^admin@example\.com$'
-scan "http(s) URLs" \
-     'https?://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+' \
-     'localhost|127\.0\.0\.1|example\.(com|org|net)|www\.w3\.org|schemas\.|creativecommons\.org|docs\.waldur\.com|waldur\.com|github\.com|opensource\.org|json-schema\.org'
+scan "email addresses" "$RE_EMAIL" "$ALLOW_EMAIL" && leak_email=yes
+scan "http(s) URLs" "$RE_URL" "$ALLOW_URL" && leak_url=yes
 
 if [ "$leaks" -gt 0 ]; then
     echo >&2
     echo "ERROR: the output dump still contains addresses or URLs that are" >&2
     echo "       not on the allowlist. It has been left in place so you can" >&2
-    echo "       look at what matched:" >&2
+    echo "       look at what matched. For whichever line above says LEAK:" >&2
     echo >&2
-    echo "         zgrep -Eo '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'" \
-         "$OUTPUT | sort -u | head" >&2
+    # One command per scan, so the hint matches what actually failed. Printing
+    # the address command for a URL failure - which an earlier version did -
+    # sends you looking for something that is not there.
+    if [ -n "$leak_email" ]; then
+        echo "         # addresses" >&2
+        echo "         zgrep -Eo '$RE_EMAIL' $OUTPUT \\" >&2
+        echo "           | grep -Ev '$ALLOW_EMAIL' | sort | uniq -c |" \
+             "sort -rn | head -20" >&2
+        echo >&2
+    fi
+    if [ -n "$leak_url" ]; then
+        echo "         # URLs, reduced to their hosts" >&2
+        echo "         zgrep -Eo '$RE_URL' $OUTPUT \\" >&2
+        echo "           | grep -Ev '$ALLOW_URL' \\" >&2
+        echo "           | sed -E 's#(https?://[^/]+).*#\\1#' | sort |" \
+             "uniq -c | sort -rn | head -20" >&2
+        echo >&2
+    fi
+    echo "       And to find which table a match is in:" >&2
     echo >&2
-    echo "       Either add the column to the sanitiser or add the host to the" >&2
-    echo "       allowlist in this script, then re-run from the original dump." >&2
+    echo "         zcat $OUTPUT | awk '/^COPY /{t=\$2} /<the match>/{print t}' \\" >&2
+    echo "           | sort | uniq -c | sort -rn | head" >&2
+    echo >&2
+    echo "       Either add the column to the sanitiser or add the host to" >&2
+    echo "       the allowlist in this script. The sanitiser has already" >&2
+    echo "       committed, so after a fix you can re-run with" >&2
+    echo "       SKIP_SANITISE=1 only if the fix was to the allowlist here;" >&2
+    echo "       a change to the sanitiser needs the data rewritten again." >&2
     KEEP_SCRATCH=1
     exit 1
 fi
