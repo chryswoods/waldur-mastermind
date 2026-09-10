@@ -100,6 +100,11 @@
 #   KEEP_SCRATCH=1   leave the scratch database - or the whole temporary
 #                    cluster, still running - behind for inspection
 #   SKIP_RESTORE=1   the scratch database is already populated; just sanitise
+#   SKIP_SANITISE=1  the scratch database is already SANITISED; just verify,
+#                    dump and scan. The sanitiser commits before the
+#                    verification runs, so a failure in the verifier or the
+#                    output scan costs you nothing but the checking - use this
+#                    rather than repeating hours of rewriting
 #   SANITISE_PGDATA  where --own-server puts its cluster
 #                    (default alongside OUTPUT)
 #   OVERWRITE=1      replace an existing OUTPUT rather than refusing
@@ -541,31 +546,45 @@ if [ "${SKIP_RESTORE:-0}" != "1" ]; then
     echo "    restored $tables tables"
 fi
 
-say "Sanitising (reports progress as it goes; the JSON sweep is the slow step)"
-# The sanitiser's progress goes out as psql notices, which arrive prefixed with
-# the script path and line number - longer than the messages themselves. Strip
-# that from notices only, so warnings and errors keep their location. Tee to a
-# log as well, since this is the step people leave running unattended.
-LOG="${SANITISE_LOG:-${OUTPUT%.gz}.sanitise.log}"
-echo "    progress is also being written to $LOG"
-echo "    (tail -f it, or read it back afterwards to see where time went)"
+if [ "${SKIP_SANITISE:-0}" = "1" ]; then
+    say "Skipping sanitisation (SKIP_SANITISE=1); the database is already done"
+else
+    say "Sanitising (reports progress as it goes; the JSON sweep is the slow step)"
+    # The sanitiser's progress goes out as psql notices, which arrive prefixed
+    # with the script path and line number - longer than the messages
+    # themselves. Strip that from notices only, so warnings and errors keep
+    # their location. Tee to a log as well, since this is the step people leave
+    # running unattended.
+    LOG="${SANITISE_LOG:-${OUTPUT%.gz}.sanitise.log}"
+    echo "    progress is also being written to $LOG"
+    echo "    (tail -f it, or read it back afterwards to see where time went)"
 
-PGOPTIONS="-c waldur.sanitise_confirmed=yes${SANITISE_SKIP_MEASURE:+ -c waldur.sanitise_skip_measure=yes}" \
-    psql -v ON_ERROR_STOP=1 -d "$SANITISE_DB" \
-         -f "$HERE/sanitise_production_dump.sql" 2>&1 \
-    | sed -uE 's/^psql:[^ ]+: (NOTICE|INFO):  //' \
-    | tee "$LOG"
+    PGOPTIONS="-c waldur.sanitise_confirmed=yes${SANITISE_SKIP_MEASURE:+ -c waldur.sanitise_skip_measure=yes}" \
+        psql -v ON_ERROR_STOP=1 -d "$SANITISE_DB" \
+             -f "$HERE/sanitise_production_dump.sql" 2>&1 \
+        | sed -uE 's/^psql:[^ ]+: (NOTICE|INFO):  //' \
+        | tee "$LOG"
 
-# psql's status is what matters, not sed's or tee's.
-if [ "${PIPESTATUS[0]}" -ne 0 ]; then
-    echo "ERROR: sanitisation failed; see $LOG" >&2
-    exit 1
+    # psql's status is what matters, not sed's or tee's.
+    if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+        echo "ERROR: sanitisation failed; see $LOG" >&2
+        exit 1
+    fi
 fi
 
 say "Verifying"
 VERIFY_OUT="$(mktemp)"
+# The verifier reports through notices as well, for the reasons its header
+# explains, so its output needs the same prefix stripping.
 psql -v ON_ERROR_STOP=1 -d "$SANITISE_DB" \
-     -f "$HERE/sanitise_verify.sql" | tee "$VERIFY_OUT"
+     -f "$HERE/sanitise_verify.sql" 2>&1 \
+    | sed -uE 's/^psql:[^ ]+: (NOTICE|INFO):  //' \
+    | tee "$VERIFY_OUT"
+
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+    echo "ERROR: the verifier itself failed to run; see above." >&2
+    exit 1
+fi
 
 # Match the status cell of a result row, not the word FAIL in the closing
 # explanation the verifier prints.

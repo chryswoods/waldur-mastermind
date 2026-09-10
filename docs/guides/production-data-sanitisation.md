@@ -75,6 +75,18 @@ The script restores the dump into a scratch database, rewrites it, verifies the
 result, and only writes the output dump if every check passes. On failure it
 leaves the scratch database behind so you can look at it.
 
+The sanitiser **commits before the verification runs**, so a failure in the
+verifier or in the output scan costs only the checking, not the rewriting.
+`SKIP_SANITISE=1` picks up an already-sanitised database and does just the
+verify, dump and scan -- seconds rather than hours. Combined with
+`KEEP_SCRATCH=1` so that a successful run does not drop the database you may
+still want:
+
+```bash
+KEEP_SCRATCH=1 SKIP_SANITISE=1 scripts/sanitise_production_dump.sh \
+    --reuse-server <datadir> production.sql.gz sanitised.sql.gz
+```
+
 ## How long it takes
 
 Long enough on a production database to be worth knowing before you start, so
@@ -239,6 +251,12 @@ schema, and each is worth knowing if you extend the script.
   `*_full_name` key replaced those with "Person Number0" and destroyed a field
   the homeport UI renders, so the fallback applies only to keys with a
   person-ish prefix.
+- **A PostgreSQL built without libxml.** `query_to_xml()` is the standard
+  trick for running dynamic SQL from a read-only transaction, and a
+  source-built server frequently does not have it. An earlier verifier used it
+  and died *after* two hours of sanitising had already committed. The checks
+  now run as `EXECUTE ... INTO` inside a `DO` block, which is a read, needs no
+  extensions, and works on any build; results come out as notices.
 - **A schema older than the one you developed against.** The first production
   run reached the end of the event-log rewrite -- the expensive part -- and
   then died on `core_user.organization_address`, a column added after the
