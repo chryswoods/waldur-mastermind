@@ -415,6 +415,45 @@ Coverage to add for the carried-forward code, which currently has little:
 `test_validate_end_date_falls_back_to_customer_grace_period`. Upstream's own
 `GracePeriodTest` covers the model-level grace behaviour.
 
+## 8.1 Rehearsing against production-scale data
+
+`scripts/resync_rehearse_migration.sh` runs the whole deployment sequence
+against a copy of the sanitised production database:
+
+```bash
+scripts/resync_rehearse_migration.sh --datadir <the sanitise cluster>
+```
+
+Pre-flight, reconcile, `migrate`, `makemigrations --check`. It works on
+`waldur_rehearsal`, created from `waldur_sanitise` with `CREATE DATABASE ...
+TEMPLATE` -- a filesystem copy, so it costs disk rather than the hours a
+re-restore would, and the sanitised database is left untouched. The rehearsal
+is therefore repeatable: every fix gets a clean starting point in seconds.
+
+Two things it gives that a rehearsal against dev data cannot:
+
+- **The pre-flight's verdict on real data.** Whether any of the 1,651 projects
+  would lose a `short_name` that is not recoverable from a slug or a
+  `ProjectInfo` row. On the dev database 16 of 31 projects had `short_name` and
+  `slug` differing, so this is not hypothetical, and the drop is irreversible.
+- **Per-migration timings**, which is what a deployment window is built from.
+  Django does not report them, so the script timestamps each `Applying ...` line
+  and reports the slowest by subtraction.
+
+It runs with `waldur_core.server.rehearsal_settings`, which is `base_settings`
+plus a database connection from the environment. Deliberately **not**
+`test_settings`: that adds `waldur_core.quotas.tests`,
+`waldur_core.structure.tests` and `waldur_pid.tests` to `INSTALLED_APPS`, whose
+migrations would then run and create tables production never has -- which
+applies migrations the real deployment does not, and can mask a real one. If
+the deployment's own settings module is importable, `DJANGO_SETTINGS_MODULE`
+overrides it and is closer still.
+
+Steps 1 and 2 need only `psql`. If no Python that can import waldur is found,
+the script stops after them with the reconciled copy in place and prints what
+to run -- worth doing on its own, since the pre-flight is the part that decides
+whether the irreversible drops are safe.
+
 ## 9. Effort
 
 | Task | Estimate |
@@ -524,6 +563,8 @@ dropped upstream code.
 | `docs/guides/homeport-resync-plan.md` | The frontend companion, temporary |
 | `scripts/resync_reconcile_db.sql` | One-time database reconciliation |
 | `scripts/resync_preflight_check.sql` | Read-only pre-flight for the above |
+| `scripts/resync_rehearse_migration.sh` | Rehearses the whole sequence against a copy of production |
+| `src/waldur_core/server/rehearsal_settings.py` | Settings for that rehearsal |
 | `scripts/sanitise_production_dump.sh` | Turning a production dump into local test data |
 | `scripts/sanitise_production_dump.sql` | The sanitisation itself |
 | `scripts/sanitise_verify.sql` | Proving the sanitised copy carries nothing |

@@ -133,6 +133,21 @@ the cost of a much vaguer ETA.
 Install `pv` if you want a throughput bar on the restore and the final dump as
 well; without it those two steps run silently.
 
+### Rehearsing the migration without moving the dump
+
+If the sanitised database is still sitting in the temporary cluster, rehearse
+the migration there rather than shipping the dump somewhere first:
+
+```bash
+scripts/resync_rehearse_migration.sh --datadir <the cluster>
+```
+
+It copies `waldur_sanitise` to `waldur_rehearsal` with `CREATE DATABASE ...
+TEMPLATE`, then runs the pre-flight, the reconciliation, `migrate` and
+`makemigrations --check` against the copy, reporting per-migration timings. The
+sanitised database is untouched, so the rehearsal can be repeated as often as
+it takes. See `docs/guides/upstream-resync-plan.md`.
+
 Loading the result is the same rehearsal the resync plan describes -- bring up
 only the database, load, reconcile, then start the rest:
 
