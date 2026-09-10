@@ -679,28 +679,53 @@ if [ "$leaks" -gt 0 ]; then
 fi
 
 say "Done: $OUTPUT ($(du -h "$OUTPUT" | cut -f1)), total $(elapsed)"
-cat <<'EOT'
+cat <<EOT
+
+FIRST, check the version that will read this dump is not older than the one
+that wrote it. A dump from a newer PostgreSQL can carry syntax an older server
+rejects, and recent minor versions emit \\restrict meta-commands that an older
+psql does not know:
+
+  gzip -dc $(basename "$OUTPUT") | head -20 | grep -i version
+  docker compose exec -T waldur-db psql --version
 
 Load it into a local deployment with the containers down apart from the
-database, since Waldur migrates at startup:
+database, since Waldur migrates at startup. NOTE the DROP: this destroys
+whatever is in your local waldur database now.
 
   docker compose up -d waldur-db
-  docker compose exec -T waldur-db psql -U waldur -d postgres \
+  docker compose exec -T waldur-db psql -U waldur -d postgres \\
       -c 'DROP DATABASE waldur' -c 'CREATE DATABASE waldur OWNER waldur'
-  gzip -dc sanitised.sql.gz | docker compose exec -T waldur-db \
+  gzip -dc $(basename "$OUTPUT") | docker compose exec -T waldur-db \\
       psql -U waldur -d waldur
 
-Then run the resync reconciliation and let the rest of the stack start, which
-is the migration rehearsal this data is for:
+Then the pre-flight. Read it: it must report no FAIL before you reconcile,
+because the reconciliation drops two columns irreversibly and the pre-flight
+is what says whether anything would be lost.
 
-  docker compose exec -T waldur-db psql -U waldur -d waldur \
+  docker compose exec -T waldur-db psql -U waldur -d waldur \\
       < scripts/resync_preflight_check.sql
-  docker compose exec -T waldur-db psql -U waldur -d waldur \
+
+  docker compose exec -T waldur-db psql -U waldur -d waldur \\
       < scripts/resync_reconcile_db.sql
+
+Now let the stack start, which migrates:
+
   docker compose up -d
+
+And confirm the schema matches the models. This is the check that catches a
+migration recorded as applied whose DDL never actually ran, so do not skip it:
+
+  docker compose exec waldur-mastermind-api \\
+      waldur makemigrations --check --dry-run
 
 Finally, make an account, since no password in the copy is usable:
 
-  docker compose exec waldur-mastermind-api \
+  docker compose exec waldur-mastermind-api \\
       waldur createsuperuser --username admin --email admin@example.com
+
+scripts/resync_rehearse_migration.sh is NOT the tool for this path - it is for
+a sanitised database sitting in a bare cluster. The sequence above is closer to
+production, because it uses the deployment's own settings and its own startup
+path rather than a settings module written for rehearsing.
 EOT

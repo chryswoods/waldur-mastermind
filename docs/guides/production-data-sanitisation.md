@@ -1,3 +1,43 @@
+### Loading it into a local deployment
+
+Check first that the PostgreSQL which will read the dump is not older than the
+one that wrote it. A dump from a newer major version can carry syntax an older
+server rejects, and recent minor versions of `pg_dump` emit `\restrict` and
+`\unrestrict` meta-commands that an older `psql` does not know -- harmless in
+themselves, since the restore continues, but a sign the versions do not match:
+
+```bash
+gzip -dc sanitised.sql.gz | head -20 | grep -i version
+docker compose exec -T waldur-db psql --version
+```
+
+Then, with the containers down apart from the database, since Waldur migrates
+at startup. **The `DROP` destroys whatever is in the local `waldur` database
+now:**
+
+```bash
+docker compose up -d waldur-db
+docker compose exec -T waldur-db psql -U waldur -d postgres \
+    -c 'DROP DATABASE waldur' -c 'CREATE DATABASE waldur OWNER waldur'
+gzip -dc sanitised.sql.gz | docker compose exec -T waldur-db psql -U waldur -d waldur
+docker compose exec -T waldur-db psql -U waldur -d waldur < scripts/resync_preflight_check.sql
+docker compose exec -T waldur-db psql -U waldur -d waldur < scripts/resync_reconcile_db.sql
+docker compose up -d
+docker compose exec waldur-mastermind-api waldur makemigrations --check --dry-run
+docker compose exec waldur-mastermind-api \
+    waldur createsuperuser --username admin --email admin@example.com
+```
+
+Read the pre-flight output rather than just running it: it must report no
+`FAIL` before the reconciliation, which drops two columns irreversibly. And do
+not skip `makemigrations --check` -- it is what catches a migration recorded as
+applied whose DDL never actually ran.
+
+`scripts/resync_rehearse_migration.sh` is **not** for this path. It exists for a
+sanitised database sitting in a bare cluster. The sequence above is closer to
+production, because it uses the deployment's own settings and its own startup
+path rather than a settings module written for rehearsing.
+
 # Sanitising a production dump for local testing
 
 A production database makes far better test data than anything generated: real
