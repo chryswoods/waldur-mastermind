@@ -1,7 +1,12 @@
 ### Loading it into a local deployment
 
 Check first that the PostgreSQL which will read the dump is not older than the
-one that wrote it. A dump from a newer major version can carry syntax an older
+one that wrote it. **Match the version of the cluster the sanitiser runs in to
+production's**, or this bites: a production database on 17.2, sanitised in a
+cluster built from PostgreSQL 18.4, produces an output dump that a `postgres:16`
+image -- which is what `docker-compose.yml` defaults to -- cannot
+straightforwardly read. The script now says so when it notices the mismatch,
+early enough to act on. A dump from a newer major version can carry syntax an older
 server rejects, and recent minor versions of `pg_dump` emit `\restrict` and
 `\unrestrict` meta-commands that an older `psql` does not know -- harmless in
 themselves, since the restore continues, but a sign the versions do not match:

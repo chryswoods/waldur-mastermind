@@ -506,6 +506,40 @@ if [ "${SKIP_RESTORE:-0}" != "1" ]; then
         fi
     fi
 
+    # The output dump is written by the LOCAL pg_dump, so it is flavoured for
+    # the local server's version - not production's. pg_dump's contract is that
+    # its output restores into a server of the same or a NEWER version, so a
+    # local cluster newer than production makes an output dump that is harder
+    # to load anywhere production-shaped, including the deployment you are
+    # rehearsing against.
+    #
+    # This bit us: an 18.4 initdb on the staging box, holding a dump from a
+    # 17.2 production server, produced an output dump that a PostgreSQL 16
+    # docker image could not straightforwardly read.
+    # || true on both: head closes the pipe early, and under pipefail that
+    # SIGPIPE is a non-zero status that set -e would treat as fatal. A version
+    # check must not be able to abort the run.
+    src_ver="$(decompress "$INPUT" 2>/dev/null | head -40 \
+        | sed -nE 's/^-- Dumped from database version ([0-9]+).*/\1/p' \
+        | head -1 || true)"
+    local_ver="$(psql -tAq -d postgres -c 'SHOW server_version_num' || true)"
+    local_major=$(( ${local_ver:-0} / 10000 ))
+    if [ -n "$src_ver" ] && [ "$local_major" -gt 0 ] \
+       && [ "$src_ver" != "$local_major" ]; then
+        echo "    NOTE: the dump came from PostgreSQL $src_ver, this cluster is" \
+             "$local_major."
+        if [ "$local_major" -gt "$src_ver" ]; then
+            echo "          The output dump will be written by pg_dump" \
+                 "$local_major, and pg_dump output only loads into a server of" >&2
+            echo "          the same version or newer - so it may not load into" \
+                 "a $src_ver-or-older" >&2
+            echo "          target. Either use a PostgreSQL $src_ver for this" \
+                 "cluster (PG_BIN), or make sure" >&2
+            echo "          whatever restores the result is $local_major or" \
+                 "newer." >&2
+        fi
+    fi
+
     echo "    input is $(du -h "$INPUT" | cut -f1) compressed; the restore is"
     echo "    usually the second-longest step after the JSON sweep."
 
