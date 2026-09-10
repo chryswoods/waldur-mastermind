@@ -67,6 +67,13 @@ END $$;
 DROP SCHEMA IF EXISTS sanitise CASCADE;
 CREATE SCHEMA sanitise;
 
+CREATE FUNCTION sanitise.has_col(tbl text, col text)
+RETURNS boolean LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = 'public' AND table_name = tbl
+                     AND column_name = col)
+$$;
+
 -- Is this value already one this script wrote? Every rewrite consults this
 -- first, so that a second pass is a genuine no-op rather than pseudonymising
 -- the pseudonyms. Getting this wrong is not cosmetic: an earlier version
@@ -503,30 +510,33 @@ RETURNS text LANGUAGE sql STABLE AS $$
         CASE WHEN tok IS NULL OR tok = '' THEN tok ELSE 'person0' END)
 $$;
 
--- Names we can attribute to a person.
-INSERT INTO sanitise.token_map (orig, new)
-SELECT DISTINCT ON (t.orig) t.orig, p.new_username
-FROM sanitise.person p
-JOIN public.core_user u ON u.id = p.user_id
-CROSS JOIN LATERAL (
-    VALUES (nullif(u.username, '')),
-           (nullif(u.slug, ''))
-) AS t(orig)
-WHERE t.orig IS NOT NULL
-ORDER BY t.orig, p.n;
+-- Names we can attribute to a person, from whichever of core_user's login-name
+-- columns this installation has: username is always there, slug and
+-- unix_username depend on the release.
+DO $$
+DECLARE
+    cols text[] := ARRAY[]::text[];
+    col text;
+BEGIN
+    FOREACH col IN ARRAY ARRAY['username', 'slug', 'unix_username'] LOOP
+        IF sanitise.has_col('core_user', col) THEN
+            cols := cols || format('(nullif(u.%I, %L))', col, '');
+        END IF;
+    END LOOP;
+
+    EXECUTE format($q$
+        INSERT INTO sanitise.token_map (orig, new)
+        SELECT DISTINCT ON (t.orig) t.orig, p.new_username
+        FROM sanitise.person p
+        JOIN public.core_user u ON u.id = p.user_id
+        CROSS JOIN LATERAL (VALUES %s) AS t(orig)
+        WHERE t.orig IS NOT NULL
+        ORDER BY t.orig, p.n
+    $q$, array_to_string(cols, ', '));
+END $$;
 
 DO $$
 BEGIN
-    -- unix_username only exists before the resync drops it.
-    PERFORM sanitise.exec_if('core_user', ARRAY['unix_username'],
-        $q$INSERT INTO sanitise.token_map (orig, new)
-           SELECT DISTINCT ON (u.unix_username) u.unix_username, p.new_username
-           FROM public.core_user u JOIN sanitise.person p ON p.user_id = u.id
-           WHERE nullif(u.unix_username, '') IS NOT NULL
-             AND NOT EXISTS (SELECT 1 FROM sanitise.token_map m
-                             WHERE m.orig = u.unix_username)
-           ORDER BY u.unix_username, p.n$q$);
-
     PERFORM sanitise.exec_if('waldur_openportal_userinfo',
         ARRAY['shortname', 'user_id'],
         $q$INSERT INTO sanitise.token_map (orig, new)
@@ -620,39 +630,57 @@ CREATE TABLE sanitise.name_map (
 
 -- Long strings first: replacing "Ada Lovelace" before "Ada" avoids leaving a
 -- surname stranded next to a pseudonym.
-INSERT INTO sanitise.name_map (orig, new)
-SELECT DISTINCT ON (t.orig) t.orig, p.new_name
-FROM sanitise.person p
-JOIN public.core_user u ON u.id = p.user_id
-CROSS JOIN LATERAL (
-    -- Not only first_name || ' ' || last_name: a display name assembled
-    -- elsewhere often uses just the first given name, so "Christopher John"
-    -- and "Woods" also have to combine as "Christopher Woods". Both orders,
-    -- because some backends render surname first.
-    VALUES (nullif(btrim(u.first_name || ' ' || u.last_name), '')),
-           (nullif(btrim(u.last_name || ' ' || u.first_name), '')),
-           (nullif(btrim(split_part(btrim(u.first_name), ' ', 1)
-                         || ' ' || u.last_name), '')),
-           (nullif(btrim(u.last_name || ' '
-                         || split_part(btrim(u.first_name), ' ', 1)), '')),
-           (nullif(btrim(u.last_name || ', ' || u.first_name), '')),
-           (nullif(btrim(u.first_name), '')),
-           (nullif(btrim(u.last_name), '')),
-           (nullif(btrim(u.native_name), ''))
-) AS t(orig)
-WHERE t.orig IS NOT NULL AND length(t.orig) >= 3
-  -- Skip users this script has already pseudonymised, at the ROW level rather
-  -- than by filtering the candidates. On a re-run core_user holds first_name
-  -- 'Person' and last_name 'NumberN', and the combinations above then include
-  -- the reversed 'Number8 Person', which the substitution pass would find
-  -- inside "...Person Number8 Person Number13..." and rewrite - compounding
-  -- further on every run after that. Filtering candidate strings means
-  -- enumerating every form the VALUES list can produce and missing one; this
-  -- says the thing actually meant, which is that an already-pseudonymised
-  -- account contributes no names at all.
-  AND NOT (u.first_name = 'Person' AND u.last_name ~ '^Number[0-9]+$')
-  AND NOT sanitise.is_pseudonym(t.orig)
-ORDER BY t.orig, p.n;
+--
+-- Built dynamically for the same reason as the login-name map: native_name is
+-- Waldur's own column and not every release has it.
+DO $$
+DECLARE
+    parts text[] := ARRAY[
+        $q$(nullif(btrim(u.first_name || ' ' || u.last_name), ''))$q$,
+        $q$(nullif(btrim(u.last_name || ' ' || u.first_name), ''))$q$,
+        $q$(nullif(btrim(split_part(btrim(u.first_name), ' ', 1)
+                         || ' ' || u.last_name), ''))$q$,
+        $q$(nullif(btrim(u.last_name || ' '
+                         || split_part(btrim(u.first_name), ' ', 1)), ''))$q$,
+        $q$(nullif(btrim(u.last_name || ', ' || u.first_name), ''))$q$,
+        $q$(nullif(btrim(u.first_name), ''))$q$,
+        $q$(nullif(btrim(u.last_name), ''))$q$
+    ];
+BEGIN
+    IF sanitise.has_col('core_user', 'native_name') THEN
+        parts := array_append(parts,
+            $q$(nullif(btrim(u.native_name), ''))$q$);
+    END IF;
+
+    EXECUTE format($q$
+        INSERT INTO sanitise.name_map (orig, new)
+        SELECT DISTINCT ON (t.orig) t.orig, p.new_name
+        FROM sanitise.person p
+        JOIN public.core_user u ON u.id = p.user_id
+        CROSS JOIN LATERAL (
+            -- Not only first_name || ' ' || last_name: a display name
+            -- assembled elsewhere often uses just the first given name, so
+            -- "Christopher John" and "Woods" also have to combine as
+            -- "Christopher Woods". Both orders, because some backends render
+            -- surname first.
+            VALUES %s
+        ) AS t(orig)
+        WHERE t.orig IS NOT NULL AND length(t.orig) >= 3
+          -- Skip users this script has already pseudonymised, at the ROW
+          -- level rather than by filtering the candidates. On a re-run
+          -- core_user holds first_name 'Person' and last_name 'NumberN', and
+          -- the combinations above then include the reversed 'Number8
+          -- Person', which the substitution pass would find inside
+          -- "...Person Number8 Person Number13..." and rewrite - compounding
+          -- further on every run after that. Filtering candidate strings
+          -- means enumerating every form the VALUES list can produce and
+          -- missing one; this says the thing actually meant, which is that an
+          -- already-pseudonymised account contributes no names at all.
+          AND NOT (u.first_name = 'Person' AND u.last_name ~ '^Number[0-9]+$')
+          AND NOT sanitise.is_pseudonym(t.orig)
+        ORDER BY t.orig, p.n
+    $q$, array_to_string(parts, ', '));
+END $$;
 
 CREATE INDEX ON sanitise.name_map (length(orig) DESC);
 
@@ -1199,36 +1227,147 @@ END $$;
 
 SELECT sanitise.say('Rewriting the event log');
 
-SELECT sanitise.exec_if('logging_event', ARRAY['context', 'message'], $$
-    UPDATE public.logging_event e
-    SET context = r.new_ctx, message = r.new_msg
-    FROM (
-        SELECT src.id, w.new_ctx, w.new_msg
-        FROM public.logging_event src,
-             LATERAL sanitise.rewrite_event(src.context, src.message) AS w
-        WHERE src.context IS NOT NULL
-    ) r
-    WHERE e.id = r.id
-$$);
+-- Done in batches by id so that it reports progress. It is one statement's
+-- worth of work either way, but on a production event log it runs for a long
+-- time, and a single silent UPDATE is indistinguishable from a hang.
+DO $$
+DECLARE
+    lo bigint;
+    hi bigint;
+    batch bigint;
+    cur bigint;
+    total bigint;
+    done bigint := 0;
+    n bigint;
+    started timestamptz := clock_timestamp();
+    eta interval;
+    last_pct int := -1;
+    pct int;
+BEGIN
+    IF to_regclass('public.logging_event') IS NULL
+       OR NOT sanitise.has_col('logging_event', 'context') THEN
+        RETURN;
+    END IF;
 
--- A message on an event with no context, or naming someone the context does
--- not identify, is left unrewritten by the pass above. Catch those by
--- substituting every known name, longest first. This is the one place where
--- the whole name map is scanned, so it is restricted to the rows that pass
--- above could not have covered.
+    SELECT min(id), max(id), count(*) INTO lo, hi, total
+    FROM public.logging_event WHERE context IS NOT NULL;
+
+    IF total IS NULL OR total = 0 THEN
+        PERFORM sanitise.say('  no events with context to rewrite');
+        RETURN;
+    END IF;
+
+    PERFORM sanitise.say(format('  %s events to rewrite',
+        sanitise.commas(total)));
+
+    -- Sized for roughly fifty batches, so the progress is readable whether
+    -- there are ten thousand events or ten million.
+    batch := greatest(10000, (hi - lo + 1) / 50);
+    cur := lo;
+    WHILE cur <= hi LOOP
+        UPDATE public.logging_event e
+        SET context = r.new_ctx, message = r.new_msg
+        FROM (
+            SELECT src.id, w.new_ctx, w.new_msg
+            FROM public.logging_event src,
+                 LATERAL sanitise.rewrite_event(src.context, src.message) AS w
+            WHERE src.context IS NOT NULL
+              AND src.id >= cur AND src.id < cur + batch
+        ) r
+        WHERE e.id = r.id;
+        GET DIAGNOSTICS n = ROW_COUNT;
+        done := done + n;
+        cur := cur + batch;
+
+        pct := round(100.0 * least(cur - lo, hi - lo + 1)
+                     / greatest(hi - lo + 1, 1));
+        IF pct <> last_pct THEN
+            last_pct := pct;
+            eta := ((100 - pct) / greatest(pct, 1)::numeric)
+                   * (clock_timestamp() - started);
+            PERFORM sanitise.say(format(
+                '  %s%% | %s events rewritten | ETA ~%s',
+                pct, sanitise.commas(done), sanitise.human(eta)));
+        END IF;
+    END LOOP;
+
+    PERFORM sanitise.say(format('  event contexts done: %s in %s',
+        sanitise.commas(done), sanitise.human(clock_timestamp() - started)));
+END $$;
+
+-- A message on an event with no context names someone the pass above had no
+-- way to identify, so it is caught by substituting every known name.
+--
+-- Two things make this affordable. It is restricted to the rows the pass above
+-- could not have covered, which the previous version claimed in a comment and
+-- did not do. And the candidates are copied into a temporary table first: the
+-- loop is one statement per name, and with a few thousand users the name map
+-- holds tens of thousands of entries, so running those against the real
+-- logging_event meant tens of thousands of sequential scans of the largest
+-- table in the database. That is what made this step take hours.
 DO $$
 DECLARE
     r record;
+    candidates bigint;
+    names bigint;
+    seen bigint := 0;
+    started timestamptz := clock_timestamp();
+    last_pct int := -1;
+    pct int;
+    changed bigint;
 BEGIN
     IF to_regclass('public.logging_event') IS NULL THEN
         RETURN;
     END IF;
-    FOR r IN SELECT orig, new FROM sanitise.name_map ORDER BY length(orig) DESC
+
+    CREATE TEMP TABLE fallback_events ON COMMIT DROP AS
+    SELECT id, message
+    FROM public.logging_event
+    WHERE nullif(message, '') IS NOT NULL
+      AND (context IS NULL
+           OR jsonb_typeof(context) <> 'object'
+           OR context = '{}'::jsonb);
+    GET DIAGNOSTICS candidates = ROW_COUNT;
+
+    SELECT count(*) INTO names FROM sanitise.name_map;
+
+    IF candidates = 0 OR names = 0 THEN
+        PERFORM sanitise.say(format(
+            '  no context-less events to sweep for names (%s rows, %s names)',
+            sanitise.commas(candidates), sanitise.commas(names)));
+        RETURN;
+    END IF;
+
+    PERFORM sanitise.say(format(
+        '  sweeping %s context-less events for %s names',
+        sanitise.commas(candidates), sanitise.commas(names)));
+
+    -- Long strings first: replacing "Ada Lovelace" before "Ada" avoids
+    -- leaving a surname stranded next to a pseudonym.
+    FOR r IN SELECT orig, new FROM sanitise.name_map
+             ORDER BY length(orig) DESC, orig
     LOOP
-        UPDATE public.logging_event
+        UPDATE fallback_events
         SET message = sanitise.replace_word(message, r.orig, r.new)
         WHERE message LIKE '%' || r.orig || '%';
+        seen := seen + 1;
+        pct := round(100.0 * seen / names);
+        IF pct <> last_pct AND pct % 10 = 0 THEN
+            last_pct := pct;
+            PERFORM sanitise.say(format('  %s%% of names', pct));
+        END IF;
     END LOOP;
+
+    UPDATE public.logging_event e
+    SET message = f.message
+    FROM fallback_events f
+    WHERE e.id = f.id AND e.message IS DISTINCT FROM f.message;
+    GET DIAGNOSTICS changed = ROW_COUNT;
+
+    PERFORM sanitise.say(format(
+        '  context-less sweep done: %s messages changed, in %s',
+        sanitise.commas(changed),
+        sanitise.human(clock_timestamp() - started)));
 END $$;
 
 -- ---------------------------------------------------------------------------
@@ -1239,30 +1378,56 @@ END $$;
 
 SELECT sanitise.say('Pseudonymising people');
 
-UPDATE public.core_user u SET
-    first_name = 'Person',
-    last_name  = 'Number' || p.n,
-    native_name = p.new_name,
-    username   = p.new_username,
-    slug       = p.new_username,
-    email      = CASE WHEN nullif(u.email, '') IS NULL THEN u.email
-                      ELSE sanitise.map_email(u.email) END,
-    -- Rendered by the search box; a concatenation of name, login and address.
-    query_field = p.new_name || ' ' || p.new_username,
-    -- An unusable hash: Django rejects any password against it, so the copy
-    -- cannot be logged into with a password guessed from production.
-    password   = '!',
-    civil_number = NULL,
-    birth_date = NULL,
-    phone_number = '',
-    job_title  = '',
-    organization = '',
-    organization_address = '',
-    address    = '',
-    backend_id = 'redacted-' || p.n,
-    last_login = NULL
-FROM sanitise.person p
-WHERE p.user_id = u.id;
+-- Built from the columns this installation actually has.
+--
+-- Naming them in a literal UPDATE fails outright on an older schema - the
+-- first production run died here on organization_address, a column added after
+-- the snapshot this was developed against - and it fails only after the event
+-- log has been rewritten, which is the expensive part. A column that is not
+-- there is now simply not set.
+DO $$
+DECLARE
+    sets text[] := ARRAY[]::text[];
+    spec record;
+BEGIN
+    FOR spec IN
+        SELECT * FROM (VALUES
+            ('first_name',           $q$'Person'$q$),
+            ('last_name',            $q$'Number' || p.n$q$),
+            ('native_name',          $q$p.new_name$q$),
+            ('username',             $q$p.new_username$q$),
+            ('slug',                 $q$p.new_username$q$),
+            ('email',                $q$CASE WHEN nullif(u.email, '') IS NULL
+                                            THEN u.email
+                                            ELSE sanitise.map_email(u.email)
+                                       END$q$),
+            -- Rendered by the search box; a concatenation of name and login.
+            ('query_field',          $q$p.new_name || ' ' || p.new_username$q$),
+            -- An unusable hash: Django rejects any password against it, so
+            -- the copy cannot be logged into with a password guessed from
+            -- production.
+            ('password',             $q$'!'$q$),
+            ('civil_number',         $q$NULL$q$),
+            ('birth_date',           $q$NULL$q$),
+            ('phone_number',         $q$''$q$),
+            ('job_title',            $q$''$q$),
+            ('organization',         $q$''$q$),
+            ('organization_address', $q$''$q$),
+            ('address',              $q$''$q$),
+            ('backend_id',           $q$'redacted-' || p.n$q$),
+            ('last_login',           $q$NULL$q$)
+        ) AS t(col, expr)
+    LOOP
+        IF sanitise.has_col('core_user', spec.col) THEN
+            sets := sets || format('%I = %s', spec.col, spec.expr);
+        ELSE
+            RAISE NOTICE 'skip: no column core_user.%', spec.col;
+        END IF;
+    END LOOP;
+
+    EXECUTE 'UPDATE public.core_user u SET ' || array_to_string(sets, ', ')
+            || ' FROM sanitise.person p WHERE p.user_id = u.id';
+END $$;
 
 -- Columns that only exist on some releases, and the rest of the identity
 -- attributes an identity provider may have supplied.

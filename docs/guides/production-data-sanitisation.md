@@ -239,6 +239,13 @@ schema, and each is worth knowing if you extend the script.
   `*_full_name` key replaced those with "Person Number0" and destroyed a field
   the homeport UI renders, so the fallback applies only to keys with a
   person-ish prefix.
+- **A schema older than the one you developed against.** The first production
+  run reached the end of the event-log rewrite -- the expensive part -- and
+  then died on `core_user.organization_address`, a column added after the
+  snapshot the script was written against. Both the sanitiser and the verifier
+  now build their statements from the columns that are actually there, and say
+  which ones they skipped. A verifier that hard-codes column names fails at the
+  worst possible moment: after all the work, before the dump is written.
 - **Robot accounts whose names collide with type strings.** An account called
   "OpenPortal Robot" put the bare word "OpenPortal" in the name map, which then
   rewrote every `"service_settings_type": "OpenPortal"` into a person's
