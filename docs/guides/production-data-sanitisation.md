@@ -357,6 +357,22 @@ schema, and each is worth knowing if you extend the script.
   parse-or-blank rather than assume JSON, since the same column is an
   `EncryptedOptionsField` on installations that have applied
   `structure/0081`.
+
+  A copy already loaded from a dump made by the version that blanked the
+  column does not need re-dumping:
+  `scripts/repair_sanitised_openportal_options.py` puts `instance_name` back,
+  deriving it from `RemoteProject.destination` and from the `resource` on the
+  cached usage reports (joined to `ServiceSettings` through
+  `Allocation.backend_id`). It is a dry run unless `REPAIR_APPLY=1`, reports
+  rather than guesses where it cannot derive, and takes the rest as
+  `REPAIR_EXTRA='<settings-id>=<identifier>'`. It writes through the ORM
+  because `structure/0081` encrypts that column, so a raw `UPDATE` would
+  store something the application cannot decrypt.
+
+  ```bash
+  docker compose exec -T waldur-mastermind-api waldur shell \
+      -c "$(cat scripts/repair_sanitised_openportal_options.py)"
+  ```
 - **A PostgreSQL built without libxml.** `query_to_xml()` is the standard
   trick for running dynamic SQL from a read-only transaction, and a
   source-built server frequently does not have it. An earlier verifier used it
