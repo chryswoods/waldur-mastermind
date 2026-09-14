@@ -265,7 +265,22 @@ at a point where the graph allows it is something only Django can get right,
 because only Django knows the graph.
 
 So the faking lives in `scripts/resync_migrate.sh`, which runs after the
-reconciliation instead of a plain `migrate`:
+reconciliation instead of a plain `migrate`, **with the application down and
+only the database up**:
+
+```bash
+docker compose up -d waldur-db
+docker compose exec -T waldur-db psql -U waldur -d waldur < scripts/resync_reconcile_db.sql
+scripts/resync_migrate.sh --manage \
+    'docker compose run --rm --no-deps -T --entrypoint waldur waldur-mastermind-api'
+docker compose up -d
+```
+
+`run --rm`, not `exec`: Waldur migrates at startup, so a running API container
+has already migrated -- or tried to and failed -- and would be racing this.
+`--no-deps` keeps `docker compose run` from starting the queue, worker and beat
+alongside it, which would otherwise be reading and writing a schema changing
+underneath them. The steps are:
 
 1. `migrate structure` -- forward, no target, bringing in `0078`.
 2. `migrate waldur_openportal 0034` -- for real, adding `can_be_managed`.

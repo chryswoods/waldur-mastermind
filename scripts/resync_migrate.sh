@@ -3,8 +3,23 @@
 #
 # Run this AFTER scripts/resync_reconcile_db.sql, instead of a plain `migrate`.
 #
-#   scripts/resync_migrate.sh --manage 'docker compose exec -T waldur-mastermind-api waldur'
+#   scripts/resync_migrate.sh --manage \
+#       'docker compose run --rm --no-deps -T --entrypoint waldur waldur-mastermind-api'
+#
 #   scripts/resync_migrate.sh --manage 'uv run python -m waldur_core.server.manage'
+#
+# RUN THIS WITH THE APPLICATION DOWN, DATABASE ONLY
+#
+# `run --rm`, not `exec`: exec needs a container already running, and a running
+# API container is precisely what you do not want. Waldur migrates at startup,
+# so an API container that is up has already migrated - or tried to and failed -
+# and this script would be racing it. The workers and beat are worse: they would
+# be reading and writing a schema that is changing underneath them.
+#
+# --no-deps stops `docker compose run` starting the queue, worker and beat as
+# linked services. Bring up waldur-db on its own, run the reconciliation, run
+# this, then `docker compose up -d`. By then every migration is applied and the
+# API's own startup migrate is a no-op.
 #
 # WHY NOT JUST `migrate`
 #
