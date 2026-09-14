@@ -10,11 +10,14 @@
 --   1. Take a full dump.
 --   2. Run this script. It is a single transaction, so it either applies
 --      completely or not at all.
---   3. Run:  python -m waldur_core.server.manage migrate
---      which replays upstream's proposal 0047-0077 and anything else new.
+--   3. Run:  scripts/resync_migrate.sh
+--      NOT a plain `migrate`. Five upstream openportal migrations have to be
+--      faked, and one of them depends on a structure migration production has
+--      not applied, so the order matters and only Django can enforce it.
 --      Where migrations run automatically at startup, bring up only the
---      database first, run this script, and start the rest afterwards -
---      otherwise startup migrates before the reconciliation lands.
+--      database first, run this script and then that one, and start the rest
+--      afterwards - otherwise startup migrates before the reconciliation
+--      lands.
 --   4. Verify:  python -m waldur_core.server.manage makemigrations --check --dry-run
 --      must report "No changes detected".
 --
@@ -24,12 +27,15 @@
 BEGIN;
 
 -- ---------------------------------------------------------------------------
--- 1. waldur_openportal: almost all bookkeeping, with one exception.
+-- 1. waldur_openportal: bookkeeping only.
 --
 -- The local 0034-0043 series and upstream's 0035-0039 reach the same objects
--- by a different route, so those five are recorded here as already-applied
--- rather than deleted, which would make step 3 re-run them against tables
--- that already exist:
+-- by a different route, so those five must be recorded as applied without
+-- running - otherwise they re-run against tables that already exist. That
+-- FAKING happens in scripts/resync_migrate.sh, not here; this section only
+-- clears the local rows. See the note further down for why.
+--
+-- What the five upstream migrations would do, and why faking them is right:
 --
 --   upstream 0035  creates the two cached report tables and their indexes,
 --                  which local 0034, 0035 and 0036 already created
@@ -65,21 +71,33 @@ WHERE app = 'waldur_openportal'
     '0043_alter_remoteproject_allowed_domains'
   );
 
-INSERT INTO django_migrations (app, name, applied)
-SELECT 'waldur_openportal', upstream_migrations.name, now()
-FROM (
-    VALUES
-      -- 0034 is intentionally absent: it carries real DDL. See above.
-      ('0035_add_cached_reports_and_available_mixin'),
-      ('0036_remote_projects'),
-      ('0037_alter_allocation_options_and_more'),
-      ('0038_alter_managedprojectauditentry_options_and_more'),
-      ('0039_alter_remoteprojectattachment_options')
-) AS upstream_migrations(name)
-WHERE NOT EXISTS (
-    SELECT 1 FROM django_migrations dm
-    WHERE dm.app = 'waldur_openportal' AND dm.name = upstream_migrations.name
-);
+-- The five upstream migrations that reach the same objects by a different
+-- route are NOT recorded as applied here. An earlier version of this script
+-- inserted them, and that is wrong: upstream's 0036_remote_projects depends on
+-- structure.0078_alter_servicesettings_certificate, and production has not
+-- applied that yet. Django's check_consistent_history then refuses every
+-- migrate invocation - including migrate --plan - with
+--
+--   InconsistentMigrationHistory: Migration waldur_openportal.0036_remote_projects
+--   is applied before its dependency structure.0078_alter_servicesettings_certificate
+--
+-- Recording a migration as applied before its dependencies are applied is
+-- something only Django can get right, because only Django knows the graph.
+-- So the faking moved to scripts/resync_migrate.sh, which applies the
+-- dependency first and then fakes with `migrate ... --fake`.
+--
+-- This DELETE is here so that a database reconciled by the older version of
+-- this script is put back into the state the migrate script expects. It is a
+-- no-op on a database that never had them.
+DELETE FROM django_migrations
+WHERE app = 'waldur_openportal'
+  AND name IN (
+    '0035_add_cached_reports_and_available_mixin',
+    '0036_remote_projects',
+    '0037_alter_allocation_options_and_more',
+    '0038_alter_managedprojectauditentry_options_and_more',
+    '0039_alter_remoteprojectattachment_options'
+  );
 
 -- ---------------------------------------------------------------------------
 -- 2. proposal: clean reset.

@@ -247,6 +247,47 @@ Diffing the model **base classes** as well as their declared fields catches
 this, and confirms `AvailableMixin` on `Allocation` and `RemoteAllocation` is
 the only such difference in the app.
 
+**The faking cannot be done in SQL.** An earlier version of the reconciliation
+inserted the five `django_migrations` rows directly. That is wrong, and only a
+database in production's migration state shows it:
+
+```text
+InconsistentMigrationHistory: Migration waldur_openportal.0036_remote_projects
+is applied before its dependency structure.0078_alter_servicesettings_certificate
+```
+
+Upstream's `0036_remote_projects` depends on
+`structure.0078_alter_servicesettings_certificate`, which production has not
+applied. Django checks that every applied migration has its dependencies
+applied *before doing anything at all*, so those rows make every `migrate`
+invocation fail -- including `migrate --plan`. Recording a migration as applied
+at a point where the graph allows it is something only Django can get right,
+because only Django knows the graph.
+
+So the faking lives in `scripts/resync_migrate.sh`, which runs after the
+reconciliation instead of a plain `migrate`:
+
+1. `migrate structure` -- forward, no target, bringing in `0078`.
+2. `migrate waldur_openportal 0034` -- for real, adding `can_be_managed`.
+3. `migrate waldur_openportal 0039 --fake` -- recording `0035`-`0039`.
+4. `migrate` -- everything else.
+5. `makemigrations --check --dry-run` -- proof the fakes matched reality.
+
+Two traps that shaped it. `migrate app NNNN` migrates *to* that migration, so
+on a database already past it Django starts **unapplying** -- reversing real
+migrations and removing fields. Steps 2 and 3 therefore check
+`showmigrations` first, which also makes the script re-runnable after a
+failure. And both apps are squashed (`structure/0041_squashed_0085`,
+`waldur_openportal/0001_squashed_0039`), so naming `0078` as a target is not
+reliably a node Django will accept; migrating the app forward sidesteps the
+question.
+
+Why this was not caught earlier: the dev database used for the first
+rehearsals already had `structure` at `0085` and upstream
+`waldur_openportal.0034` applied, left behind by the first, failed migration
+attempt. It was never a faithful starting state. Only the sanitised copy of
+production was.
+
 ### 6.2 Proposal — clean reset
 
 The portal holds no proposals, so the app is reset rather than migrated:
@@ -593,6 +634,7 @@ dropped upstream code.
 | `docs/guides/homeport-resync-plan.md` | The frontend companion, temporary |
 | `scripts/resync_reconcile_db.sql` | One-time database reconciliation |
 | `scripts/resync_preflight_check.sql` | Read-only pre-flight for the above |
+| `scripts/resync_migrate.sh` | Applies the migration in the one order that works |
 | `scripts/resync_rehearse_migration.sh` | Rehearses the whole sequence against a copy of production |
 | `src/waldur_core/server/rehearsal_settings.py` | Settings for that rehearsal |
 | `scripts/sanitise_production_dump.sh` | Turning a production dump into local test data |
