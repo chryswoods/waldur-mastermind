@@ -261,6 +261,23 @@ Upstream's `submitted_at` is on `ReviewerBid`, not `Proposal`, and its notes
 fields are `internal_notes` / `review_notes` / `manager_notes`, distinct from
 the local `Proposal.notes`.
 
+**Expect a WARN on `local_proposal_rows_to_delete`.** Production applied seven
+of the eight local proposal migrations: it was deployed from a commit before
+`0054_round_fixed_review_end_date`, so that row is absent and so is the column
+it would have added. The reconciliation copes by construction -- every drop is
+`IF EXISTS` and every delete is keyed on rows that may already be gone -- so
+seven of eight is a pass, not a problem.
+
+What would NOT be benign is an *extra* `proposal` migration at 0047 or above
+that the reconciliation does not name. A `django_migrations` row pointing at a
+migration file no longer in the tree makes `migrate` fail on an unknown node.
+Check for one with:
+
+```sql
+SELECT name FROM django_migrations
+WHERE app = 'proposal' AND name >= '0047' ORDER BY name;
+```
+
 ### 6.3 Dropped columns
 
 `core.User.unix_username`, `structure.Project.short_name` and the broadcast
