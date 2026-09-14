@@ -330,6 +330,22 @@ schema, and each is worth knowing if you extend the script.
   endpoint, is worth knowing to be wrong. If you would rather keep public
   reference hosts, add them to `sanitise.is_local_url` in the sanitiser AND to
   `ALLOW_URL` in the driver.
+- **JSON stored in a text column.** Waldur has its own
+  `waldur_core.core.fields.JSONField`, which is a `TextField` to the database
+  and JSON to the ORM -- `structure_project.termination_metadata` is one.
+  Filling it with prose, because the column type said `text`, made every read
+  of the row raise `ValidationError: ['Enter valid JSON']`, surfacing as a 500
+  on the projects list. Choosing columns by name cannot tell prose from
+  JSON-in-a-text-column, so `sanitise.filler()` now decides from the value:
+  anything parsing as a JSON object or array becomes an empty one of the same
+  kind.
+
+  It took a browser to find it, which is why `scripts/resync_smoke_test.py`
+  exists -- it reads every model through the ORM, and the rehearsal script runs
+  it as a last step. Note that it reads through `_base_manager`: the corrupted
+  row was a *terminated* project, so only `?include_terminated=true` reached
+  it, and a smoke test using the soft-delete-filtered default manager walks
+  straight past exactly the rows most likely to be damaged.
 - **Columns that mix secrets with configuration.**
   `structure_servicesettings.options` holds credentials *and* the settings a
   backend needs to work -- OpenPortal reads `instance_name`,

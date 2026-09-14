@@ -18,6 +18,7 @@
 #   2. scripts/resync_reconcile_db.sql      (the one-time reconciliation)
 #   3. manage.py migrate                    (upstream's history replayed)
 #   4. manage.py makemigrations --check     (must report no changes)
+#   5. scripts/resync_smoke_test.py         (every model reads back)
 #
 # WHY A COPY
 #
@@ -349,6 +350,22 @@ else
     echo "       reconciled schema does not match the models. Resolve this" >&2
     echo "       before deploying: it is the check that catches a faked" >&2
     echo "       migration whose DDL never actually ran." >&2
+    exit 1
+fi
+
+say "6/6  Reading every model through the ORM"
+# Django's field converters run on READ. A column holding something its field
+# cannot parse is invisible until something reads the row, and then it is a
+# 500 from whatever page touched it - nothing in the migration itself looks.
+if $MANAGE shell -c "$(cat "$HERE/resync_smoke_test.py")"; then
+    :
+else
+    echo >&2
+    echo "ERROR: at least one model could not be read. On a database that has" >&2
+    echo "       been rewritten by hand, the usual cause is a column holding" >&2
+    echo "       something its field cannot parse - a text-backed JSONField" >&2
+    echo "       with prose in it, say. Fix that before drawing conclusions" >&2
+    echo "       about the migration." >&2
     exit 1
 fi
 

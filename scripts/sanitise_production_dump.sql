@@ -233,17 +233,44 @@ END $$;
 
 -- Filler of the same length as the original, so a description that filled a
 -- panel still fills it. Preserves shape without preserving content.
+--
+-- JSON-aware, and that is not a nicety. Waldur has a text-backed JSONField
+-- (waldur_core.core.fields.JSONField) whose columns are `text` in the database
+-- and JSON to the ORM - structure_project.termination_metadata is one. Writing
+-- prose into one of those makes EVERY read of the row fail:
+--
+--   django.core.exceptions.ValidationError: ['Enter valid JSON']
+--
+-- which surfaces as a 500 on the projects list, looking for all the world like
+-- a bug in the code under test. Choosing columns by name cannot tell prose
+-- from JSON-in-a-text-column, so the value itself decides: anything parsing as
+-- a JSON object or array becomes an empty one of the same kind, and only
+-- genuine prose gets prose.
 CREATE FUNCTION sanitise.filler(original text)
-RETURNS text LANGUAGE sql IMMUTABLE AS $$
-    SELECT CASE
-        WHEN original IS NULL THEN NULL
-        WHEN original = '' THEN ''
-        ELSE left(
-            repeat('redacted placeholder text ',
-                   (length(original) / 26) + 1),
-            length(original))
-    END
-$$;
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    parsed jsonb;
+BEGIN
+    IF original IS NULL OR original = '' THEN
+        RETURN original;
+    END IF;
+
+    IF left(btrim(original), 1) IN ('{', '[') THEN
+        BEGIN
+            parsed := original::jsonb;
+        EXCEPTION WHEN others THEN
+            parsed := NULL;
+        END;
+        IF parsed IS NOT NULL THEN
+            RETURN CASE jsonb_typeof(parsed) WHEN 'array' THEN '[]'
+                                             ELSE '{}' END;
+        END IF;
+    END IF;
+
+    RETURN left(
+        repeat('redacted placeholder text ', (length(original) / 26) + 1),
+        length(original));
+END $$;
 
 
 -- ---------------------------------------------------------------------------
