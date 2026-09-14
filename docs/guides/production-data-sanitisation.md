@@ -330,6 +330,17 @@ schema, and each is worth knowing if you extend the script.
   endpoint, is worth knowing to be wrong. If you would rather keep public
   reference hosts, add them to `sanitise.is_local_url` in the sanitiser AND to
   `ALLOW_URL` in the driver.
+- **Columns that mix secrets with configuration.**
+  `structure_servicesettings.options` holds credentials *and* the settings a
+  backend needs to work -- OpenPortal reads `instance_name`,
+  `project_template` and the allocation limits from it. Blanking the column
+  wholesale, which is the obvious thing to do with a column full of
+  credentials, left every OpenPortal sync task failing with `Instance name
+  cannot be None`: an error that looks exactly like a bug in the code under
+  test and is not. Only secret-shaped keys are removed now. It also has to
+  parse-or-blank rather than assume JSON, since the same column is an
+  `EncryptedOptionsField` on installations that have applied
+  `structure/0081`.
 - **A PostgreSQL built without libxml.** `query_to_xml()` is the standard
   trick for running dynamic SQL from a read-only transaction, and a
   source-built server frequently does not have it. An earlier verifier used it

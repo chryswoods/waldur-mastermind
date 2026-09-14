@@ -1010,7 +1010,54 @@ SELECT sanitise.blank('structure_servicesettings', 'certificate');
 SELECT sanitise.blank('structure_servicesettings', 'username');
 SELECT sanitise.blank('structure_servicesettings', 'backend_url');
 SELECT sanitise.blank('structure_servicesettings', 'domain');
-SELECT sanitise.blank('structure_servicesettings', 'options', $$'{}'$$);
+-- NOT blanked wholesale. structure_servicesettings.options mixes credentials
+-- with plain configuration, and emptying it takes out both: OpenPortal reads
+-- instance_name, project_template and the allocation settings from here, so a
+-- copy with an empty options column fails every sync task with "Instance name
+-- cannot be None" - an error that looks like a bug in the resync and is not.
+--
+-- Only secret-shaped keys are removed. URLs and addresses inside the
+-- remaining keys are still caught by the JSON sweep further down, so this is
+-- narrower than it looks.
+--
+-- The residual risk is a real credential stored under a key whose name does
+-- not say so. The separate password, token and certificate columns are
+-- blanked outright, so anything here is already a second home for one.
+CREATE FUNCTION sanitise.scrub_options(val text)
+RETURNS text LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    parsed jsonb;
+BEGIN
+    IF val IS NULL OR btrim(val) = '' THEN
+        RETURN val;
+    END IF;
+    BEGIN
+        parsed := val::jsonb;
+    EXCEPTION WHEN others THEN
+        -- Not JSON. Either an EncryptedOptionsField value from an installation
+        -- that has applied structure/0081, or something unexpected. Either way
+        -- it cannot be inspected, so it is treated as an opaque secret.
+        RETURN '{}';
+    END;
+    IF jsonb_typeof(parsed) <> 'object' THEN
+        RETURN '{}';
+    END IF;
+    RETURN coalesce((
+        SELECT jsonb_object_agg(
+            key,
+            CASE WHEN key ~* ('(password|passwd|secret|token|api_?key'
+                              || '|credential|passphrase|private|cert)')
+                 THEN '""'::jsonb
+                 ELSE value END)
+        FROM jsonb_each(parsed)
+    ), '{}'::jsonb)::text;
+END $$;
+
+SELECT sanitise.exec_if('structure_servicesettings', ARRAY['options'],
+    $$UPDATE public.structure_servicesettings
+      SET options = sanitise.scrub_options(options)
+      WHERE nullif(btrim(options), '') IS NOT NULL$$);
+
 SELECT sanitise.blank('marketplace_offering', 'secret_options', $$'{}'$$);
 SELECT sanitise.blank('openstack_tenant', 'user_password');
 SELECT sanitise.blank('openstack_tenant', 'user_username');
