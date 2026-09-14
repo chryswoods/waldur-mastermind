@@ -401,6 +401,41 @@ largest table in production after `logging_event` and nothing here measures it.
 `scripts/resync_preflight_check.sql` reports the ten largest tables with sizes,
 which settles it.
 
+## 6.6 Rehearsal result
+
+The whole sequence has been run against a sanitised copy of production
+(4,276 users, 1,651 projects, 1,956 resources, 2.85 million events), on
+PostgreSQL 17 to match production's 17.2:
+
+| step | outcome |
+| --- | --- |
+| `resync_preflight_check.sql` | One WARN, explained in 6.2. **`irreversible_gate` passed** -- no user or project would lose a value the two column drops cannot recover. |
+| `resync_reconcile_db.sql` | Applied clean |
+| `resync_migrate.sh` | **5m58s**, ending in `No changes detected` |
+
+`No changes detected` is the result that matters: it proves the five faked
+openportal migrations really did correspond to objects already present in the
+shape upstream expects. A fake that did not match would show up here as a
+migration Django wants to create.
+
+So the deployment window is **about six minutes of migration**, plus the
+restore-and-reconcile time, plus whatever margin you want. Two things that
+figure does not include:
+
+- `marketplace/0270_scrub_secret_options_from_reversion`, which walks reversion
+  history. The sanitiser empties `reversion_version`, so it completed instantly
+  here and this rehearsal says nothing about it. See 6.5; the pre-flight's
+  `largest_table` output is what sizes it.
+- The `VACUUM`/autovacuum catch-up after a migration that rewrites table data.
+
+What the rehearsal also established, which no amount of reading could:
+
+- The reconciliation could not fake migrations in SQL (6.1). That surfaced only
+  against production's migration graph.
+- The dev database used for the earlier rehearsals was not a faithful starting
+  state -- it carried `structure` at `0085` and upstream
+  `waldur_openportal.0034`, left by the first failed attempt.
+
 ## 7. Sequencing
 
 1. Scope the OpenPortal 0.32 → 0.92 library and service upgrade. This can
