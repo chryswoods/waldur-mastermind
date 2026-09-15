@@ -1167,7 +1167,6 @@ BEGIN
         -- names that happen to be in the maps would still leave everything
         -- else the writer typed, so the text goes.
         'structure_project.staff_notes',
-        'structure_project.termination_metadata',
         'waldur_openportal_remoteprojectauditentry.note',
         'waldur_openportal_managedprojectauditentry.note',
         'waldur_openportal_managedproject.review_comment'
@@ -1181,6 +1180,14 @@ BEGIN
                    split_part(spec, '.', 2), ''));
     END LOOP;
 END $$;
+
+-- structure_project.termination_metadata records who terminated a project and
+-- which roles the members had, so it cannot stay. It is EMPTIED rather than
+-- filled, because it is a text column that the ORM reads as JSON: filler()
+-- recognises a JSON document and empties it, but that is a guess made from the
+-- value, and a guess is the wrong thing to rely on where a wrong answer breaks
+-- every read of the row. Here the column is known, so say so.
+SELECT sanitise.blank('structure_project', 'termination_metadata');
 
 -- OpenPortal's remote-project notes are an append-only list of
 -- {timestamp, author, text}. Keep the timestamps and the number of notes, so
@@ -1995,6 +2002,144 @@ BEGIN
         'Text sweep done: %s columns, %s rows rewritten, in %s',
         touched, sanitise.commas(changed),
         sanitise.human(clock_timestamp() - started)));
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- 7c. Make every text column that the ORM reads as JSON parse as JSON.
+--
+-- waldur_core.core.fields.JSONField is a text column to PostgreSQL and a JSON
+-- document to Django: from_db_value() runs json.loads on every READ. Anything
+-- in one of these columns that is not JSON therefore breaks reading the row,
+-- not writing it, and the failure surfaces as
+--
+--   django.core.exceptions.ValidationError: ['Enter valid JSON']
+--
+-- wherever the row is touched - a 500 on a list endpoint, a task that cannot
+-- load its own object - looking exactly like a bug in the code under test.
+-- That is the worst possible way for a sanitising artefact to present itself,
+-- because the whole point of the copy is to test the code against it.
+--
+-- Every stage above is careful not to do this. This is the net under all of
+-- them: a column named here is checked and emptied if it no longer parses,
+-- whichever stage broke it, and the column list comes from Django's field
+-- registry rather than from guesswork (scripts/repair_sanitised_json_text.py
+-- derives the same list live, and repairs a copy that is already loaded).
+--
+-- Columns that do not exist on this release are skipped, so it is safe either
+-- side of the resync.
+-- ---------------------------------------------------------------------------
+
+SELECT sanitise.say('Checking the text columns that the ORM reads as JSON');
+
+-- A cast that reports rather than raises.
+CREATE FUNCTION sanitise.is_json(v text)
+RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    parsed jsonb;
+BEGIN
+    IF v IS NULL OR v = '' THEN
+        RETURN true;
+    END IF;
+    BEGIN
+        parsed := v::jsonb;
+    EXCEPTION WHEN others THEN
+        RETURN false;
+    END;
+    RETURN true;
+END $$;
+
+DO $$
+DECLARE
+    spec record;
+    nullable text;
+    empty text;
+    n bigint;
+    bad_total bigint := 0;
+BEGIN
+    FOR spec IN
+        SELECT * FROM (VALUES
+            ('structure_project',                  'termination_metadata'),
+            ('structure_projectdigestconfiguration', 'enabled_sections'),
+            ('logging_alert',                      'context'),
+            ('logging_emailhook',                  'event_groups'),
+            ('logging_emailhook',                  'event_types'),
+            ('logging_pushhook',                   'event_groups'),
+            ('logging_pushhook',                   'event_types'),
+            ('logging_webhook',                    'event_groups'),
+            ('logging_webhook',                    'event_types'),
+            ('logging_systemnotification',         'event_groups'),
+            ('logging_systemnotification',         'event_types'),
+            ('logging_systemnotification',         'roles'),
+            ('user_actions_useraction',            'corrective_actions'),
+            ('user_actions_useraction',            'metadata'),
+            ('user_actions_useraction',            'route_params'),
+            ('user_actions_useractionexecution',   'execution_metadata'),
+            ('waldur_auth_saml2_identityprovider', 'metadata'),
+            ('waldur_aws_instance',                'private_ips'),
+            ('waldur_aws_instance',                'public_ips'),
+            ('waldur_azure_virtualmachine',        'private_ips'),
+            ('waldur_azure_virtualmachine',        'public_ips'),
+            ('openstack_backup',                   'metadata'),
+            ('openstack_instance',                 'action_details'),
+            ('openstack_port',                     'allowed_address_pairs'),
+            ('openstack_port',                     'fixed_ips'),
+            ('openstack_router',                   'external_fixed_ips'),
+            ('openstack_router',                   'fixed_ips'),
+            ('openstack_router',                   'routes'),
+            ('openstack_snapshot',                 'action_details'),
+            ('openstack_snapshot',                 'metadata'),
+            ('openstack_subnet',                   'allocation_pools'),
+            ('openstack_subnet',                   'dns_nameservers'),
+            ('openstack_subnet',                   'host_routes'),
+            ('openstack_volume',                   'action_details'),
+            ('openstack_volume',                   'image_metadata'),
+            ('openstack_volume',                   'metadata'),
+            ('waldur_openstack_replication_migration', 'mappings')
+            -- structure_servicesettings.options is one of these too, and is
+            -- deliberately absent. It is an EncryptedOptionsField: only the
+            -- values under credential-shaped keys are encrypted, so the
+            -- column is still JSON either way, and emptying it is what broke
+            -- OpenPortal's instance_name once already. scrub_options() owns
+            -- that column and parses-or-blanks it there.
+        ) AS t(tbl, col)
+    LOOP
+        CONTINUE WHEN to_regclass('public.' || quote_ident(spec.tbl)) IS NULL;
+
+        SELECT is_nullable INTO nullable
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = spec.tbl
+          AND column_name = spec.col;
+        CONTINUE WHEN nullable IS NULL;
+
+        EXECUTE format(
+            'SELECT count(*) FROM public.%I WHERE NOT sanitise.is_json(%I)',
+            spec.tbl, spec.col) INTO n;
+        CONTINUE WHEN n = 0;
+
+        -- NULL where the column allows it, an empty document otherwise. The
+        -- content is gone either way; what matters is that the row reads.
+        empty := CASE WHEN nullable = 'YES' THEN 'NULL' ELSE '''{}''' END;
+        EXECUTE format(
+            'UPDATE public.%I SET %I = %s WHERE NOT sanitise.is_json(%I)',
+            spec.tbl, spec.col, empty, spec.col);
+
+        bad_total := bad_total + n;
+        PERFORM sanitise.say(format(
+            '  %s.%s: %s rows did not parse, emptied', spec.tbl, spec.col,
+            sanitise.commas(n)));
+    END LOOP;
+
+    IF bad_total = 0 THEN
+        PERFORM sanitise.say('  all of them parse');
+    ELSE
+        -- Not an error - the row is readable again - but it means a stage
+        -- above wrote something it should not have, and the next person
+        -- should know which column to look at.
+        PERFORM sanitise.say(format(
+            '  %s rows repaired. A stage above wrote non-JSON into a'
+            || ' JSON-backed column; worth fixing at the source.',
+            sanitise.commas(bad_total)));
+    END IF;
 END $$;
 
 -- ---------------------------------------------------------------------------

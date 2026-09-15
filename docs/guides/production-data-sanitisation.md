@@ -340,6 +340,24 @@ schema, and each is worth knowing if you extend the script.
   anything parsing as a JSON object or array becomes an empty one of the same
   kind.
 
+  Value-sniffing turned out to be the wrong tool for the one column that
+  mattered. `structure_project.termination_metadata` is a JSON-backed text
+  column *by declaration*, so it is now emptied by name rather than by what
+  `filler()` makes of its contents -- a guess is the wrong thing to rely on
+  where a wrong answer breaks every read of the row. Behind that, the
+  sanitiser ends with a pass over every column of this kind (the list comes
+  from Django's field registry) that empties anything no longer parsing,
+  whichever earlier stage broke it, and says which column it had to repair so
+  the real cause can be fixed. The verifier asserts the same thing with
+  `IS JSON`, so the next one of these fails the run rather than the browser.
+  `scripts/repair_sanitised_json_text.py` does the same repair on a copy that
+  is already loaded, deriving the column list live from the ORM:
+
+  ```bash
+  docker compose exec -T waldur-mastermind-api waldur shell \
+      -c "$(cat scripts/repair_sanitised_json_text.py)"
+  ```
+
   It took a browser to find it, which is why `scripts/resync_smoke_test.py`
   exists -- it reads every model through the ORM, and the rehearsal script runs
   it as a last step. Note that it reads through `_base_manager`: the corrupted

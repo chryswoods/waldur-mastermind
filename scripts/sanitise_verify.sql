@@ -61,6 +61,7 @@ DECLARE
     login_shape text := '^person[0-9]+([._-][A-Za-z0-9][A-Za-z0-9._-]*)?$';
 
     r record;
+    spec text;
     present boolean;
     n bigint;
     pass int := 0;
@@ -324,6 +325,93 @@ BEGIN
             fail := fail + 1;
             RAISE NOTICE '| FAIL   | % | % |',
                 rpad(r.name, 38), lpad(n::text, 12);
+        END IF;
+    END LOOP;
+
+    ------------------------------------------------------------------
+    -- The text columns that the ORM reads as JSON.
+    --
+    -- waldur_core.core.fields.JSONField is `text` in the database and a JSON
+    -- document to Django, parsed on every READ. A value in one of these that
+    -- does not parse breaks reading the row, and presents as a 500 that looks
+    -- like a bug in the code rather than like bad data - which is the worst
+    -- way for a sanitising artefact to show up, given the copy exists to test
+    -- that code. The sanitiser repairs these; this is the assertion that it
+    -- did.
+    --
+    -- IS JSON needs PostgreSQL 16. On an older server the check is skipped
+    -- rather than approximated: a check that cannot run must not report PASS.
+    ------------------------------------------------------------------
+    FOREACH spec IN ARRAY ARRAY[
+        'structure_project.termination_metadata',
+        'structure_projectdigestconfiguration.enabled_sections',
+        'logging_alert.context',
+        'logging_emailhook.event_groups',
+        'logging_emailhook.event_types',
+        'logging_pushhook.event_groups',
+        'logging_pushhook.event_types',
+        'logging_webhook.event_groups',
+        'logging_webhook.event_types',
+        'logging_systemnotification.event_groups',
+        'logging_systemnotification.event_types',
+        'logging_systemnotification.roles',
+        'user_actions_useraction.corrective_actions',
+        'user_actions_useraction.metadata',
+        'user_actions_useraction.route_params',
+        'user_actions_useractionexecution.execution_metadata',
+        'waldur_auth_saml2_identityprovider.metadata',
+        'waldur_aws_instance.private_ips',
+        'waldur_aws_instance.public_ips',
+        'waldur_azure_virtualmachine.private_ips',
+        'waldur_azure_virtualmachine.public_ips',
+        'openstack_backup.metadata',
+        'openstack_instance.action_details',
+        'openstack_port.allowed_address_pairs',
+        'openstack_port.fixed_ips',
+        'openstack_router.external_fixed_ips',
+        'openstack_router.fixed_ips',
+        'openstack_router.routes',
+        'openstack_snapshot.action_details',
+        'openstack_snapshot.metadata',
+        'openstack_subnet.allocation_pools',
+        'openstack_subnet.dns_nameservers',
+        'openstack_subnet.host_routes',
+        'openstack_volume.action_details',
+        'openstack_volume.image_metadata',
+        'openstack_volume.metadata',
+        'waldur_openstack_replication_migration.mappings'
+    ] LOOP
+        SELECT to_regclass('public.' || quote_ident(split_part(spec, '.', 1)))
+                   IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM information_schema.columns ic
+                   WHERE ic.table_schema = 'public'
+                     AND ic.table_name = split_part(spec, '.', 1)
+                     AND ic.column_name = split_part(spec, '.', 2))
+        INTO present;
+
+        IF NOT present OR current_setting('server_version_num')::int < 160000
+        THEN
+            skip := skip + 1;
+            RAISE NOTICE '| SKIP   | % | % |',
+                rpad(right('json:' || spec, 38), 38), lpad('n/a', 12);
+            CONTINUE;
+        END IF;
+
+        EXECUTE format(
+            'SELECT count(*) FROM public.%I
+             WHERE nullif(%I, '''') IS NOT NULL AND %I IS NOT JSON',
+            split_part(spec, '.', 1), split_part(spec, '.', 2),
+            split_part(spec, '.', 2)) INTO n;
+
+        IF n = 0 THEN
+            pass := pass + 1;
+            RAISE NOTICE '| PASS   | % | % |',
+                rpad(right('json:' || spec, 38), 38), lpad(n::text, 12);
+        ELSE
+            fail := fail + 1;
+            RAISE NOTICE '| FAIL   | % | % |',
+                rpad(right('json:' || spec, 38), 38), lpad(n::text, 12);
         END IF;
     END LOOP;
 
