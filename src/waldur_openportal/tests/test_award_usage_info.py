@@ -9,9 +9,7 @@ from waldur_openportal import models, utils
 
 
 def _dt(year, month, day, hour=0, minute=0):
-    return datetime.datetime(
-        year, month, day, hour, minute, tzinfo=datetime.UTC
-    )
+    return datetime.datetime(year, month, day, hour, minute, tzinfo=datetime.UTC)
 
 
 def _make_managed_project(project, project_template=None, **kwargs):
@@ -299,7 +297,10 @@ def _patch_report(total_hours_per_day):
         mock.patch.object(
             models.CachedProjectUsageReport, "get_report", return_value=_FakeReport()
         ),
-        mock.patch("waldur_openportal.op.DateRange", _FakeDateRange),
+        # Patched on the source module, not on a waldur_openportal alias: the
+        # op shim is gone and utils.py imports openportal directly, so that is
+        # where the name resolves at call time.
+        mock.patch("openportal.DateRange", _FakeDateRange),
     ):
         yield
 
