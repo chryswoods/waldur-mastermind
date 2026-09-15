@@ -183,6 +183,19 @@ class ProjectAccountingSummaryFilter(django_filters.FilterSet):
         fields = []
 
 
+class ManagedProjectAccountingSummaryFilter(django_filters.FilterSet):
+    # RelatedUUIDFilter rather than a plain UUIDFilter: it carries view_name,
+    # which is what lets the schema hook attach x-waldur-operation-id. A UUID
+    # query parameter without one fails schema generation.
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="uuid"
+    )
+
+    class Meta:
+        model = structure_models.Project
+        fields = []
+
+
 class ManagedProjectFilter(django_filters.FilterSet):
     identifier = django_filters.CharFilter(
         field_name="identifier", lookup_expr="icontains"

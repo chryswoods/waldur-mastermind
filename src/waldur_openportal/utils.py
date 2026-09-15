@@ -607,6 +607,196 @@ def get_project_credits(project, silent: bool = False) -> decimal.Decimal:
     return total_credits + total_spend
 
 
+def _get_managed_project_windows(
+    managed_project: "models.ManagedProject",
+) -> list[tuple[datetime.date, datetime.date | None]]:
+    """
+    Return the list of (start_date, end_date) windows during which the passed
+    ManagedProject was attached to a Waldur project, merged so that windows
+    sharing a boundary day (e.g. detached and reattached on the same day)
+    become a single window. end_date is None for the current, still-open
+    window.
+
+    Backed by ManagedProject.get_attachments() (ManagedProjectAttachment
+    rows), which reconstructs history from ManagedProjectAuditEntry on first
+    read for a ManagedProject that predates that tracking.
+    """
+    windows = [
+        (
+            attachment.attached_at.date(),
+            attachment.detached_at.date() if attachment.detached_at else None,
+        )
+        for attachment in managed_project.get_attachments().order_by("attached_at")
+    ]
+
+    return _merge_adjacent_windows(windows)
+
+
+def _merge_adjacent_windows(
+    windows: list[tuple[datetime.date, datetime.date | None]],
+) -> list[tuple[datetime.date, datetime.date | None]]:
+    """
+    Merge windows that touch or overlap (end_date of one is on or after
+    start_date of the next) so that a shared boundary day - e.g. detached and
+    reattached on the same day - is only counted once.
+    """
+    if not windows:
+        return []
+
+    merged = [windows[0]]
+
+    for start, end in windows[1:]:
+        last_start, last_end = merged[-1]
+
+        if last_end is not None and start <= last_end:
+            merged[-1] = (last_start, end)
+        else:
+            merged.append((start, end))
+
+    return merged
+
+
+def _clip_window_to_range(
+    start: datetime.date,
+    end: datetime.date | None,
+    range_start: datetime.date,
+    range_end: datetime.date,
+) -> tuple[datetime.date, datetime.date] | None:
+    """
+    Clip a (start, end) window - end may be None for a still-open window -
+    to [range_start, range_end]. Returns (clip_start, clip_end), or None if
+    the window and the range don't overlap at all.
+    """
+    window_end = end or range_end
+    clip_start = max(range_start, start)
+    clip_end = min(range_end, window_end)
+
+    if clip_start > clip_end:
+        return None
+
+    return (clip_start, clip_end)
+
+
+def get_managed_project_attached_date_ranges(
+    managed_project: "models.ManagedProject",
+    range_start: datetime.date,
+    range_end: datetime.date,
+) -> list[tuple[datetime.date, datetime.date]]:
+    """
+    Return the closed [start, end] date sub-ranges within
+    [range_start, range_end] during which managed_project was attached to a
+    project, clipped to that range. Sub-ranges with no overlap are dropped -
+    an empty result means the award was not connected to any project at any
+    point during the requested range.
+
+    Used to trim an OpenPortal usage/storage report down to only the days an
+    award was actually connected, rather than every day in a requested
+    range: report.filter() one DateRange per returned sub-range, then
+    combine() the results back into a single report.
+    """
+    windows = _get_managed_project_windows(managed_project)
+
+    clipped_ranges = []
+    for start, end in windows:
+        clipped = _clip_window_to_range(start, end, range_start, range_end)
+        if clipped is not None:
+            clipped_ranges.append(clipped)
+
+    return clipped_ranges
+
+
+def _sum_usage_over_windows(
+    windows: list[tuple[datetime.date, datetime.date | None]],
+    project_identifier: str | None,
+    resource: str | None,
+) -> float:
+    """
+    Sum the node-hours from cached usage reports that fall within the passed
+    windows. Each cached report covers a calendar month; where a window
+    starts or ends partway through a month, the report is filtered down to
+    the exact overlapping days before summing.
+    """
+    if not windows or not project_identifier or not resource:
+        return 0.0
+
+    import openportal
+
+    total_hours = 0.0
+
+    cached_reports = models.CachedProjectUsageReport.objects.filter(
+        project_identifier=project_identifier, resource=resource
+    )
+
+    for cached_report in cached_reports:
+        month_start = datetime.date(cached_report.year, cached_report.month, 1)
+        month_end = get_last_day_of_month(month_start)
+
+        for start_date, end_date in windows:
+            clipped = _clip_window_to_range(
+                start_date, end_date, month_start, month_end
+            )
+            if clipped is None:
+                continue
+            overlap_start, overlap_end = clipped
+
+            report = cached_report.get_report()
+            date_range = openportal.DateRange(overlap_start, overlap_end)
+            total_hours += float(report.filter(date_range).total_usage.hours)
+
+    return total_hours
+
+
+def get_award_usage_info(project) -> tuple[float | None, float]:
+    """
+    Return (allocation_credits, usage_credits) for the award (ManagedProject)
+    currently attached to the passed project, both on the same credits scale
+    used elsewhere for accounting (ProjectCredit, InvoiceItem prices).
+
+    allocation_credits is the award's AwardDetails.allocation converted via
+    the award's ProjectTemplate.convert_to_credits(). It is None if there is
+    no attached ManagedProject, or if it has no resolvable ProjectTemplate or
+    allocation to convert. Note this deliberately reads project_template
+    directly rather than calling ManagedProject.get_project_template(),
+    which can delete the ManagedProject as a side effect of failing to
+    resolve one - not something a read-only report should risk triggering.
+
+    usage_credits is the sum of cached usage report node-hours over exactly
+    the dates the award was connected to the project - see
+    _get_managed_project_windows for how those dates are determined.
+    """
+    if not isinstance(project, structure_models.Project):
+        raise TypeError("project must be an instance of Project")
+
+    try:
+        managed_project = models.ManagedProject.objects.get(project=project)
+    except models.ManagedProject.DoesNotExist:
+        return (None, 0.0)
+
+    allocation_credits = None
+    project_template = managed_project.project_template
+    if project_template is None:
+        logger.warning(
+            f"Managed project {managed_project} has no project template set; "
+            "cannot convert its allocation to credits."
+        )
+    else:
+        details = managed_project.get_details()
+        if details.allocation is None:
+            logger.warning(
+                f"Managed project {managed_project} has no allocation in its details."
+            )
+        else:
+            allocation_credits = project_template.convert_to_credits(details.allocation)
+
+    usage_credits = _sum_usage_over_windows(
+        _get_managed_project_windows(managed_project),
+        project_identifier=managed_project.local_identifier,
+        resource=managed_project.destination,
+    )
+
+    return (allocation_credits, usage_credits)
+
+
 def set_project_credits(
     project, credits: decimal.Decimal | float, silent: bool = False
 ):
