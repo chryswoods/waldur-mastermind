@@ -141,8 +141,13 @@ print('APPLIED' if ('$1', '$2') in loader.applied_migrations else 'PENDING')
 " 2>/dev/null | grep -q '^APPLIED$'
 }
 
+# What `run` echoes before the command. A payload passed with `shell -c` is a
+# whole script, and echoing it buries the step's real output under a hundred
+# lines of source in a log someone reads during a deployment window.
+RUN_LABEL=""
+
 run() {
-    echo "    \$ $MANAGE $*"
+    echo "    \$ ${RUN_LABEL:-$MANAGE $*}"
     # Timestamped, so subtracting gives the per-migration cost that a
     # deployment window is built from. Django does not report it.
     $MANAGE "$@" 2>&1 | while IFS= read -r line; do
@@ -188,8 +193,10 @@ if [ ! -f "$GRACE_SCRIPT" ]; then
     echo "ERROR: cannot find $GRACE_SCRIPT" >&2
     exit 1
 fi
+RUN_LABEL="$MANAGE shell -c \"\$(cat scripts/set_default_grace_period.py)\""
 run shell -c "import os; os.environ['GRACE_APPLY'] = '1'
 $(cat "$GRACE_SCRIPT")"
+RUN_LABEL=""
 
 say "6/6  does the schema match the models?"
 if run makemigrations --check --dry-run; then
