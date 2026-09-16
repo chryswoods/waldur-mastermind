@@ -455,6 +455,70 @@ What the rehearsal also established, which no amount of reading could:
   state -- it carried `structure` at `0085` and upstream
   `waldur_openportal.0034`, left by the first failed attempt.
 
+## 6.7 Periodic tasks the resync adds
+
+43 new beat-scheduled tasks arrive with upstream and 6 go away. Most are
+harmless, but several delete or terminate things on a schedule, and they start
+running the moment the workers come back up. Enumerate them with:
+
+```bash
+git grep -h -A2 '"task":' <ref> -- '*extension.py' | grep '"task":'
+```
+
+**Destroys or revokes data. Look at these before the first beat cycle.**
+
+| Task | Schedule | What it does |
+|---|---|---|
+| `marketplace.cleanup_stale_offering_users` | daily | Schedules offering-user *deletion* for every user with no active role on the project. Runs over **every** OfferingUser not already deleting, so the first run after the resync is the big one. |
+| `marketplace.reconcile_robot_account_access` | 02:30 daily | Removes users from robot accounts where no active `UserRole` on the project exists. A backstop for the signal-driven path, so it acts on historical drift the first time it runs. |
+| `marketplace.revoke_outdated_consents` | daily | Revokes `UserOfferingConsent` rows for any active ToS with `requires_reconsent` whose grace period has passed. |
+| `marketplace_openstack.terminate_child_resources_of_terminated_tenants` | daily | Marks Instance/Volume resources TERMINATED under an already-terminated tenant. Mark-only -- no backend call, no quota release, no plugin rows deleted -- and writes a DONE terminate `Order` for the audit trail. |
+| `marketplace.cleanup_usage_poll_records` | daily | Deletes `ComponentUsagePollRecord` older than `USAGE_POLL_RECORD_RETENTION_MONTHS` (default 3). |
+| `policy.cleanup_slurm_evaluation_logs` | daily | Deletes `SlurmPolicyEvaluationLog` past its retention. |
+| `logging.cleanup_orphan_subscription_queues`, `marketplace_site_agent.cleanup_{stale,dangling}_agent_queues` | 6h / 24h / 1h | Delete RabbitMQ queues with no matching database row, or whose owner is inactive. RMQ state, not Waldur data. |
+| `marketplace_script.cleanup_orphaned_k8s_resources` | -- | Deletes Waldur-created Kubernetes Jobs and ConfigMaps older than an hour. |
+
+The two that change *resource lifetimes* rather than clean up after them:
+
+- `marketplace_remote.reconcile_resource_end_dates` (daily) walks every
+  non-terminated remote resource and reconciles its `end_date` against the
+  remote. An end date pulled from a remote feeds straight into project expiry.
+- `terminate_resources_if_project_end_date_has_been_reached` is not new, but
+  its behaviour changed completely -- see the grace period step in §5 of the migrate script. It
+  **deletes** a project outright once its effective end date has passed and no
+  active resources remain.
+
+**Accounting, at the month boundary.** Invoice finalisation is now two-phase:
+
+- `invoices.create_monthly_invoices` still runs at 00:00 on the 1st, but with
+  `INVOICE_FINALIZATION_GRACE_PERIOD_HOURS > 0` it moves invoices to
+  `PENDING_FINALIZATION` instead of `CREATED`.
+- `invoices.finalize_previous_invoices` (new, hourly on the 1st-3rd) does the
+  `CREATED` transition once the grace period has elapsed.
+- The default is **0**, i.e. finalise immediately, which is the old behaviour.
+- `send_monthly_invoicing_reports_about_customers` **no longer has a cron
+  entry**. It is now triggered programmatically at the end of whichever of the
+  two tasks finalises. If reports stop arriving on the 2nd, that is where to
+  look.
+- `set_to_zero_overdue_credits` now takes an `effective_date` and refuses a
+  future one, and records an `EXPIRY` credit transaction against the month the
+  balance was forfeited in.
+
+**New pulls worth knowing about before they surprise you:**
+`marketplace.ServicePropertiesListPullTask` (24h) and
+`ServiceResourcesListPullTask` (hourly, on the hour) both start pulling against
+every provider; `openstack.TenantUsageBillingPoll` and
+`billing.refresh_estimates` are new; `marketplace.sync_component_usage_summaries`
+and `re_evaluate_usage_limit_restrictions` recompute usage state hourly/daily.
+
+**Removed:** `invoices.send_monthly_invoicing_reports_about_customers` (see
+above), `marketplace_remote.pull_invoices`, and four proposal tasks including
+`proposal.delete_stale_proposals` -- so one deletion path goes away.
+
+A conservative first deployment can leave beat down, bring the API up, and
+start beat only after spot-checking what the first cycle of the destructive
+tasks would do.
+
 ## 7. Sequencing
 
 1. Scope the OpenPortal 0.32 → 0.92 library and service upgrade. This can
