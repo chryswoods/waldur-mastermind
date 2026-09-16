@@ -52,14 +52,30 @@ class OpenPortalRunnerTest(TestCase):
         self.assertEqual(str(local), "u6vf.brics")
 
     @mock.patch("waldur_openportal.config.ensure_config_loaded", return_value=True)
-    def test_local_identifier_leaves_a_qualified_name_alone(self, mock_config):
+    def test_local_identifier_leaves_a_qualified_local_name_alone(self, mock_config):
         board = OpenPortalBoard("airr.brics.isambard-ai")
 
-        with mock.patch("openportal.get_portal", return_value="brics") as get_portal:
+        with mock.patch("openportal.get_portal", return_value="brics"):
             local = board._to_local_project_identifier("u6vf.brics")
 
         self.assertEqual(str(local), "u6vf.brics")
-        get_portal.assert_not_called()
+
+    @mock.patch("waldur_openportal.config.ensure_config_loaded", return_value=True)
+    def test_local_identifier_rejects_another_portals_identifier(self, mock_config):
+        """
+        Being handed an already-qualified identifier for a different portal is
+        a caller bug, and a silent one if allowed through: it would be stored
+        as local_identifier and never match anything.
+        """
+        board = OpenPortalBoard("airr.brics.isambard-ai")
+
+        with mock.patch("openportal.get_portal", return_value="brics"):
+            with self.assertRaises(exceptions.OpenPortalError) as cm:
+                board._to_local_project_identifier("u6vf.airr")
+
+        self.assertIn("u6vf.airr", str(cm.exception))
+        self.assertIn("airr", str(cm.exception))
+        self.assertIn("brics", str(cm.exception))
 
     @mock.patch("waldur_openportal.config.ensure_config_loaded", return_value=True)
     def test_remote_identifier_still_uses_the_board_portal(self, mock_config):

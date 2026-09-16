@@ -79,28 +79,30 @@ class OpenPortalBoard:
 
         openportal.get_portal() is the local portal, and is what every other
         caller in this app already uses for this.
+
+        Raises exceptions.OpenPortalError if handed an identifier that is
+        already qualified with some other portal.
         """
+        local_portal = openportal.get_portal()
+
         if not isinstance(project, openportal.ProjectIdentifier):
             try:
                 project = openportal.ProjectIdentifier(project)
             except Exception:
-                project = openportal.ProjectIdentifier(
-                    f"{project}.{openportal.get_portal()}"
-                )
+                return openportal.ProjectIdentifier(f"{project}.{local_portal}")
+
+        # An identifier that arrived already qualified must be qualified with
+        # OUR portal - it is about to be stored or looked up as a local one.
+        # Anything else is a bug in the caller, and a silent one: it would be
+        # written to ManagedProject.local_identifier and simply never match.
+        if str(project.portal) != str(local_portal):
+            raise exceptions.OpenPortalError(
+                f"Project identifier {project} is for portal {project.portal}, "
+                f"not the local portal {local_portal} - refusing to use it as a "
+                "local identifier."
+            )
 
         return project
-
-    def _to_user_identifier(self, user) -> openportal.UserIdentifier:
-        """
-        Convert the passed (any) object into a UserIdentifier
-        """
-        if not isinstance(user, openportal.UserIdentifier):
-            try:
-                user = openportal.UserIdentifier(user)
-            except Exception:
-                user = openportal.UserIdentifier(f"{user}.{self.portal()}")
-
-        return user
 
     def portal(self) -> openportal.PortalIdentifier:
         """
