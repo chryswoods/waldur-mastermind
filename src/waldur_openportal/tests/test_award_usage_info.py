@@ -325,13 +325,39 @@ class SumUsageOverWindowsTest(TestCase):
             0.0,
         )
 
-    def test_missing_identifier_or_resource_returns_zero(self):
+    def test_reports_are_found_without_naming_a_resource(self):
+        """
+        The regression this guards: get_award_usage_info() passed
+        ManagedProject.destination - the remote portal - as the resource, so
+        the filter matched no report and every award showed zero usage while
+        its allocation read correctly.
+        """
+        self._make_cached_report(2026, 5)
+        windows = [(datetime.date(2026, 5, 1), None)]
+
+        with _patch_report(total_hours_per_day=1.0):
+            total = utils._sum_usage_over_windows(windows, self.project_identifier)
+
+        self.assertEqual(total, 31.0)
+
+    def test_missing_identifier_returns_zero(self):
         windows = [(datetime.date(2026, 1, 1), None)]
 
         self.assertEqual(utils._sum_usage_over_windows(windows, "", self.resource), 0.0)
-        self.assertEqual(
-            utils._sum_usage_over_windows(windows, self.project_identifier, ""), 0.0
-        )
+
+    def test_blank_resource_does_not_narrow(self):
+        """
+        An absent resource means "every report for this project", not "no
+        reports". It used to mean the latter, which is the shape of the bug
+        that made every award read zero.
+        """
+        self._make_cached_report(2026, 3)
+        windows = [(datetime.date(2026, 3, 1), datetime.date(2026, 3, 31))]
+
+        with _patch_report(total_hours_per_day=1.0):
+            total = utils._sum_usage_over_windows(windows, self.project_identifier, "")
+
+        self.assertAlmostEqual(total, 31.0)
 
     def test_full_month_window_counts_the_whole_report(self):
         self._make_cached_report(2026, 3)
@@ -460,4 +486,8 @@ class GetAwardUsageInfoTest(TestCase):
         mock_sum.assert_called_once()
         _, kwargs = mock_sum.call_args
         self.assertEqual(kwargs["project_identifier"], managed_project.local_identifier)
-        self.assertEqual(kwargs["resource"], managed_project.destination)
+        # Deliberately NOT managed_project.destination. That is the remote
+        # portal managing the award; the reports' resource is the local
+        # cluster the usage ran on. Keying on it matched nothing, and this
+        # assertion used to pin that mistake in place.
+        self.assertNotIn("resource", kwargs)

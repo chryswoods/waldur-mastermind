@@ -708,15 +708,26 @@ def get_managed_project_attached_date_ranges(
 def _sum_usage_over_windows(
     windows: list[tuple[datetime.date, datetime.date | None]],
     project_identifier: str | None,
-    resource: str | None,
+    resource: str | None = None,
 ) -> float:
     """
     Sum the node-hours from cached usage reports that fall within the passed
     windows. Each cached report covers a calendar month; where a window
     starts or ends partway through a month, the report is filtered down to
     the exact overlapping days before summing.
+
+    project_identifier is the key; resource narrows further and is optional.
+    Every other reader of these reports (board._get_cached_report_for_month,
+    the two reconciliation sweeps below) keys on project_identifier alone,
+    because that already scopes the reports to one project.
+
+    A resource here is the LOCAL destination the usage was recorded against -
+    what backfill writes as str(backend.client.destination()), e.g.
+    "brics.aip2.clusters.shared". It is not interchangeable with
+    ManagedProject.destination, which is the REMOTE portal that manages the
+    award; passing one where the other belongs matches nothing at all.
     """
-    if not windows or not project_identifier or not resource:
+    if not windows or not project_identifier:
         return 0.0
 
     import openportal
@@ -724,8 +735,10 @@ def _sum_usage_over_windows(
     total_hours = 0.0
 
     cached_reports = models.CachedProjectUsageReport.objects.filter(
-        project_identifier=project_identifier, resource=resource
+        project_identifier=project_identifier
     )
+    if resource:
+        cached_reports = cached_reports.filter(resource=resource)
 
     for cached_report in cached_reports:
         month_start = datetime.date(cached_report.year, cached_report.month, 1)
@@ -788,10 +801,16 @@ def get_award_usage_info(project) -> tuple[float | None, float]:
         else:
             allocation_credits = project_template.convert_to_credits(details.allocation)
 
+    # Keyed on local_identifier alone. An earlier version also passed
+    # resource=managed_project.destination, which never matched: the reports'
+    # resource is the local cluster the usage happened on
+    # ("brics.aip2.clusters.shared"), while ManagedProject.destination is the
+    # remote portal that sends instructions about the award
+    # ("airr.brics.isambard-ai"). Both fields are called a destination and
+    # they are different endpoints, so every award reported zero usage.
     usage_credits = _sum_usage_over_windows(
         _get_managed_project_windows(managed_project),
         project_identifier=managed_project.local_identifier,
-        resource=managed_project.destination,
     )
 
     return (allocation_credits, usage_credits)
