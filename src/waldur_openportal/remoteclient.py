@@ -98,41 +98,6 @@ class RemoteOpenPortalClient:
                 f"Failed to get portal name from destination {self._destination}: {e}"
             )
 
-    def add_user(
-        self, shortname: str, project: openportal.ProjectIdentifier
-    ) -> openportal.UserMapping:
-        """
-        Tell OpenPortal to add the specified short (unix) name to the project.
-        The username should be unique on the caller
-        side. OpenPortal will derive its own internal username for this user,
-        based on the passed username and project, which will be returned by
-        this method once the user has been added
-        """
-        project = self._to_project_identifier(project)
-
-        if (not shortname) or (not shortname.strip()):
-            raise exceptions.OpenPortalError(f"Invalid empty username '{shortname}'")
-
-        user = openportal.UserIdentifier(f"{shortname}.{project}")
-
-        mapping = self.run(f"{self.destination()} add_user {user}")
-
-        logger.debug(
-            f"Added OpenPortal user to project {project} with mapping {mapping}"
-        )
-
-        return mapping
-
-    def delete_user(self, user: openportal.UserIdentifier) -> None:
-        """
-        Remove the OpenPortal user with specified UserIdentifier
-        """
-        user = self._to_user_identifier(user)
-
-        self.run(f"{self.destination()} remove_user {user}")
-
-        logger.debug(f"Deleted OpenPortal user '{user}'")
-
     def _get_project_shortname(self, project: structure_models.Project) -> str:
         """
         Return the preferred shortname for the passed project.
