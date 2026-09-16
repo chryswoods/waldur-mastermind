@@ -309,12 +309,28 @@ so it is idempotent and keeps any value set on purpose.
 
 Two traps that shaped it. `migrate app NNNN` migrates *to* that migration, so
 on a database already past it Django starts **unapplying** -- reversing real
-migrations and removing fields. Steps 2 and 3 therefore check
-`showmigrations` first, which also makes the script re-runnable after a
-failure. And both apps are squashed (`structure/0041_squashed_0085`,
-`waldur_openportal/0001_squashed_0039`), so naming `0078` as a target is not
-reliably a node Django will accept; migrating the app forward sidesteps the
-question.
+migrations and removing fields. Steps 2 and 3 therefore check first, which
+also makes the script re-runnable after a failure. And both apps are squashed
+(`structure/0041_squashed_0085`, `waldur_openportal/0001_squashed_0039`), so
+naming `0078` as a target is not reliably a node Django will accept; migrating
+the app forward sidesteps the question.
+
+A third trap, found by running the script twice rather than once. That check
+used to grep `showmigrations`, which lists only the squash once it is applied
+
+```text
+ [X] 0001_squashed_0039 (12 squashed migrations)
+```
+
+and never the individual migrations it replaced -- so on a database the script
+had already migrated, the guard reported `0034` as *not* applied, step 2 ran
+`migrate waldur_openportal 0034`, and the unapply the guard exists to prevent
+happened anyway (`KeyError: 'competence'`). The first run on production is
+unaffected: it has the individual migrations recorded and no squash applied.
+It is the re-run that broke. The guard now asks Django's migration loader,
+which resolves replacements -- a replaced migration reads as applied when its
+squash is -- and the migration name it is given has to be exact, where the
+grep tolerated a prefix.
 
 Why this was not caught earlier: the dev database used for the first
 rehearsals already had `structure` at `0085` and upstream
