@@ -30,6 +30,49 @@ class OpenPortalRunnerTest(TestCase):
         self.assertIsInstance(runner, OpenPortalRunner)
         mock_config.assert_called_once()
 
+    @mock.patch("waldur_openportal.config.ensure_config_loaded", return_value=True)
+    def test_local_identifier_uses_the_local_portal(self, mock_config):
+        """
+        A bare shortname must be qualified with THIS portal, not with the
+        portal at the head of the board's destination.
+
+        An award arriving through the AIRR gateway has the destination
+        "airr.brics.isambard-ai", so board.portal() is "airr" - the remote
+        portal that raised the award. Qualifying a local project with that
+        produced "u6vf.airr" instead of "u6vf.brics", which no lookup of a
+        local identifier can find.
+        """
+        board = OpenPortalBoard("airr.brics.isambard-ai")
+
+        self.assertEqual(str(board.portal()), "airr")
+
+        with mock.patch("openportal.get_portal", return_value="brics"):
+            local = board._to_local_project_identifier("u6vf")
+
+        self.assertEqual(str(local), "u6vf.brics")
+
+    @mock.patch("waldur_openportal.config.ensure_config_loaded", return_value=True)
+    def test_local_identifier_leaves_a_qualified_name_alone(self, mock_config):
+        board = OpenPortalBoard("airr.brics.isambard-ai")
+
+        with mock.patch("openportal.get_portal", return_value="brics") as get_portal:
+            local = board._to_local_project_identifier("u6vf.brics")
+
+        self.assertEqual(str(local), "u6vf.brics")
+        get_portal.assert_not_called()
+
+    @mock.patch("waldur_openportal.config.ensure_config_loaded", return_value=True)
+    def test_remote_identifier_still_uses_the_board_portal(self, mock_config):
+        """
+        _to_project_identifier is unchanged: it names things belonging to the
+        portal this board talks to, which is the point of it.
+        """
+        board = OpenPortalBoard("airr.brics.isambard-ai")
+
+        remote = board._to_project_identifier("someproj")
+
+        self.assertEqual(str(remote), "someproj.airr")
+
     @mock.patch("waldur_openportal.config.is_config_available")
     def test_health_raises_error_when_config_unavailable(self, mock_config_available):
         mock_config_available.return_value = False

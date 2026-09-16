@@ -60,6 +60,36 @@ class OpenPortalBoard:
 
         return project
 
+    def _to_local_project_identifier(self, project) -> openportal.ProjectIdentifier:
+        """
+        Convert the passed (any) object into a ProjectIdentifier belonging to
+        THIS portal.
+
+        Not the same as _to_project_identifier, which qualifies a bare name
+        with self.portal() - the portal at the head of this board's
+        destination, i.e. the REMOTE portal that raised the award. That is
+        right for an identifier that belongs to the remote portal and wrong
+        for one that belongs to us: an award arriving from the AIRR gateway
+        has the destination "airr.brics.isambard-ai", so a local project
+        named through _to_project_identifier came out as "u6vf.airr" rather
+        than "u6vf.brics", and nothing that looks a local identifier up would
+        ever find it (see filters._identifiers_for_project_uuid, which builds
+        the same string from get_portal(), and tasks.refresh_remote_award,
+        which discards identifiers whose portal is not this one).
+
+        openportal.get_portal() is the local portal, and is what every other
+        caller in this app already uses for this.
+        """
+        if not isinstance(project, openportal.ProjectIdentifier):
+            try:
+                project = openportal.ProjectIdentifier(project)
+            except Exception:
+                project = openportal.ProjectIdentifier(
+                    f"{project}.{openportal.get_portal()}"
+                )
+
+        return project
+
     def _to_user_identifier(self, user) -> openportal.UserIdentifier:
         """
         Convert the passed (any) object into a UserIdentifier
@@ -435,7 +465,9 @@ class OpenPortalBoard:
 
             shortname = project_info.generate_shortname(generator)
 
-        managed_project.local_identifier = str(self._to_project_identifier(shortname))
+        managed_project.local_identifier = str(
+            self._to_local_project_identifier(shortname)
+        )
         managed_project.save()
 
     def _link_existing_project(self, managed_project: models.ManagedProject):
