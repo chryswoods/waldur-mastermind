@@ -8,7 +8,9 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from waldur_core.structure.tests import factories as structure_factories
-from waldur_openportal import models, tasks
+from waldur_mastermind.invoices import ledger as invoice_ledger
+from waldur_mastermind.invoices import models as invoice_models
+from waldur_openportal import models, tasks, utils
 
 
 class TaskConfigurationTest(TestCase):
@@ -537,3 +539,52 @@ class RunOnceTaskTest(TestCase):
         self.assertTrue(timeouts, "no takeover_timeout values found")
         for timeout in timeouts:
             self.assertGreater(timeout, settings.CELERY_TASK_TIME_LIMIT)
+
+
+class FixTotalAllocationLedgerTest(TestCase):
+    """fix_total_allocation must declare what its correction IS.
+
+    Every change to ProjectCredit.value is recorded in the credit ledger by a
+    signal handler, and an untyped movement falls back to STAFF_GRANT - so
+    without the ledger.credit_transaction_type block the nightly
+    reconciliation reads as a person handing out credit.
+    """
+
+    def test_correction_is_typed_as_an_adjustment(self):
+        project = structure_factories.ProjectFactory()
+        template = models.ProjectTemplate.objects.create(
+            name="tmpl", portal="test-portal", allocation_units_mapping={"NHR": 1.0}
+        )
+        managed_project = models.ManagedProject.objects.create(
+            destination="test.portal",
+            identifier="proj.test-portal",
+            project=project,
+            project_template=template,
+        )
+
+        details = mock.Mock(allocation=mock.Mock(units="NHR", size=1000.0))
+        with (
+            mock.patch.object(
+                models.ManagedProject, "get_details", return_value=details
+            ),
+            mock.patch.object(
+                models.ManagedProject, "get_project_template", return_value=template
+            ),
+            mock.patch.object(utils, "set_project_credits") as set_credits,
+        ):
+            set_credits.side_effect = lambda *a, **kw: declared.append(
+                invoice_ledger.current_credit_transaction_type()
+            )
+            declared = []
+            utils.fix_total_allocation(project)
+
+        self.assertEqual(len(declared), 1)
+        transaction_type, _reference, comment, billing_period = declared[0]
+        self.assertEqual(
+            transaction_type, invoice_models.CreditTransaction.Types.ADJUSTMENT
+        )
+        self.assertIn("reconciliation", comment)
+        # The correction repairs the start-of-month balance, so it belongs to
+        # the current month rather than to no month at all.
+        self.assertEqual(billing_period, timezone.now().date().replace(day=1))
+        self.assertIsNotNone(managed_project.pk)

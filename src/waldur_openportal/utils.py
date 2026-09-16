@@ -23,6 +23,7 @@ from waldur_core.users import models as user_models
 from waldur_core.users import tasks as user_tasks
 from waldur_core.users.enums import InvitationState
 from waldur_core.users.utils import get_invitation_duplicates
+from waldur_mastermind.invoices import ledger as invoice_ledger
 from waldur_mastermind.invoices import models as invoice_models
 
 from . import exceptions, models, utils
@@ -438,7 +439,28 @@ def fix_total_allocation(project):
 
     allocation = project_template.convert_to_credits(details.allocation)
 
-    set_project_credits(project, allocation, silent=True)
+    # Declare what this movement IS before writing it. Every change to
+    # ProjectCredit.value is recorded in the credit ledger by a signal handler,
+    # and an untyped one is filed as STAFF_GRANT - so without this block a
+    # nightly reconciliation reads, in the ledger, as a person handing out
+    # credit. ADJUSTMENT is the existing type for an automated correction
+    # (invoices/handlers.py uses it the same way); nothing new is added to
+    # CreditTransaction.Types, so no migration in upstream's app.
+    #
+    # billing_period is the current month because that is what this corrects:
+    # set_project_credits derives the START-OF-MONTH balance, from the award
+    # total minus spend excluding the current month. Leaving it open would drop
+    # the correction out of any per-month total.
+    today = timezone.now().date()
+    with invoice_ledger.credit_transaction_type(
+        invoice_models.CreditTransaction.Types.ADJUSTMENT,
+        comment=(
+            "OpenPortal reconciliation: project credit recomputed from the "
+            "award total and lifetime consumption."
+        ),
+        billing_period=today.replace(day=1),
+    ):
+        set_project_credits(project, allocation, silent=True)
 
 
 def infer_allocation_from_accounting(
