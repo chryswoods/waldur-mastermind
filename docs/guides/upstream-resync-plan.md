@@ -515,9 +515,57 @@ and `re_evaluate_usage_limit_restrictions` recompute usage state hourly/daily.
 above), `marketplace_remote.pull_invoices`, and four proposal tasks including
 `proposal.delete_stale_proposals` -- so one deletion path goes away.
 
+### What this deployment is actually exposed to
+
+Checked against the sanitised production copy, with only OpenPortal offerings
+connected. Three of the destructive tasks cannot touch it:
+
+- `terminate_child_resources_of_terminated_tenants` is filtered to OpenStack
+  tenant offerings.
+- `reconcile_resource_end_dates` is filtered to `REMOTE_OFFERING`, which is
+  `"Waldur.RemoteOffering"` -- **not** `Marketplace.OpenPortalRemote`. The
+  names invite the opposite conclusion.
+- `terminate_resources_in_state_erred_without_backend_id_...` is filtered to
+  `"Marketplace.Slurm"`.
+
+Of the three that are not type-filtered:
+
+- `cleanup_stale_offering_users` narrows its deletions to
+  `offering__plugin_options__offering_user_auto_deletion=True`. All six
+  OpenPortal offerings have the key unset, and a missing key is SQL NULL, so
+  nothing is deleted. It still fans out one Celery task per user holding any
+  offering user -- thousands daily, each a no-op.
+- `reconcile_robot_account_access`: no robot accounts have users, so it is a
+  no-op.
+- `revoke_outdated_consents`: **five** active reconsent ToS exist, so this one
+  has live input. `scripts/dryrun_revoke_outdated_consents.py` reports what it
+  would revoke without writing.
+
 A conservative first deployment can leave beat down, bring the API up, and
 start beat only after spot-checking what the first cycle of the destructive
 tasks would do.
+
+### Project deletion is not only a periodic task
+
+Two paths delete projects, both keyed on `Project.is_expired` and therefore
+both fixed by the grace-period backfill -- but only one is in a beat schedule:
+
+1. `terminate_resources_if_project_end_date_has_been_reached`, daily at 01:40.
+2. `delete_expired_project_if_every_resource_has_been_terminated`, a **signal
+   handler** on `Resource` state changes, which fires whenever the last
+   resource of an expired project reaches TERMINATED. Auditing the beat
+   schedule alone will not find it.
+
+The resync changed the second one's guard. It used to test the grace period
+explicitly (`if today <= project.end_date_with_grace: return`); it now relies
+on `is_expired` alone, whose meaning changed to include the grace period.
+Equivalent *provided* `grace_period_days` is set -- which is why zero removed
+the guard from both paths at once.
+
+Both are **soft** deletes: `Project.delete()` sets `is_removed=True`. Hard
+deletion happens only from `Customer.delete()` and the `cleanup_structure`
+management command, both manual. The only other project deletion in any task
+is the throwaway project a marketplace_script dry run creates.
 
 ## 7. Sequencing
 
