@@ -115,7 +115,30 @@ say() {
 # reversing real migrations and removing fields. So every step checks first,
 # which also makes the script safe to re-run after a failure part-way through.
 is_applied() {
-    $MANAGE showmigrations "$1" 2>/dev/null | grep -qE "^ *\[X\] $2"
+    # NOT showmigrations. Once a squashed migration is applied it lists only
+    # the squash - " [X] 0001_squashed_0039 (12 squashed migrations)" - and
+    # never the individual migrations it replaced, so grepping for the name of
+    # a replaced migration finds nothing and the guard reports "not applied"
+    # for something that is. Steps 2 and 3 then run `migrate app NNNN` against
+    # a database already past NNNN, which is a migrate-TO, i.e. an UNAPPLY, and
+    # it dies building the historical state:
+    #
+    #   KeyError: 'competence'
+    #
+    # exactly the failure these guards exist to prevent. Found by running this
+    # script a second time against a database it had already migrated.
+    #
+    # Django's own loader resolves replacements - a replaced migration reads as
+    # applied when its squash is - so ask it rather than parsing output meant
+    # for humans.
+    #
+    # The name must be EXACT, unlike the prefix match the grep allowed.
+    $MANAGE shell -c "
+from django.db import connection
+from django.db.migrations.loader import MigrationLoader
+loader = MigrationLoader(connection)
+print('APPLIED' if ('$1', '$2') in loader.applied_migrations else 'PENDING')
+" 2>/dev/null | grep -q '^APPLIED$'
 }
 
 run() {
@@ -139,7 +162,7 @@ say "1/6  structure forward (brings in openportal 0036's dependency)"
 run migrate structure
 
 say "2/6  openportal 0034 for real (adds can_be_managed)"
-if is_applied waldur_openportal 0034_allocation_can_be_managed; then
+if is_applied waldur_openportal 0034_allocation_can_be_managed_and_more; then
     echo "    already applied, skipping"
 else
     run migrate waldur_openportal 0034
