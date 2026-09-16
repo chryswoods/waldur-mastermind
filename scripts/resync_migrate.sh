@@ -62,7 +62,19 @@
 #                                 records 0035-0039 without running them.
 #   4. migrate                    everything else, including upstream's
 #                                 proposal 0047-0077 against empty tables.
-#   5. makemigrations --check     proves the result matches the models, which
+#   5. grace period backfill      structure/0067 added Customer.grace_period_days
+#                                 and Project.grace_period_days as nullable
+#                                 columns with no default, replacing a property
+#                                 that returned a fixed 30 days. Every existing
+#                                 row is therefore NULL, which means zero, and
+#                                 everything sitting in its grace period expires
+#                                 the moment this deployment lands. Backfilled
+#                                 here rather than in a migration under
+#                                 waldur_core/structure: that directory is
+#                                 upstream's, and a local migration in it is one
+#                                 stray merge request away from being pushed
+#                                 back. scripts/ is unambiguously ours.
+#   6. makemigrations --check     proves the result matches the models, which
 #                                 is what catches a fake whose objects did not
 #                                 actually match.
 set -euo pipefail
@@ -116,7 +128,7 @@ run() {
     return "${PIPESTATUS[0]}"
 }
 
-say "1/5  structure forward (brings in openportal 0036's dependency)"
+say "1/6  structure forward (brings in openportal 0036's dependency)"
 # `migrate structure` with no target, deliberately. Naming 0078 would be
 # precise but breaks two ways: on a database already past it, migrating TO a
 # migration means UNAPPLYING everything after it - Django starts reversing real
@@ -126,24 +138,37 @@ say "1/5  structure forward (brings in openportal 0036's dependency)"
 # idempotent, never unapplies, and needs no knowledge of the squash.
 run migrate structure
 
-say "2/5  openportal 0034 for real (adds can_be_managed)"
+say "2/6  openportal 0034 for real (adds can_be_managed)"
 if is_applied waldur_openportal 0034_allocation_can_be_managed; then
     echo "    already applied, skipping"
 else
     run migrate waldur_openportal 0034
 fi
 
-say "3/5  openportal 0035-0039 faked (their objects already exist)"
+say "3/6  openportal 0035-0039 faked (their objects already exist)"
 if is_applied waldur_openportal 0039_alter_remoteprojectattachment_options; then
     echo "    already recorded, skipping"
 else
     run migrate waldur_openportal 0039 --fake
 fi
 
-say "4/5  everything else"
+say "4/6  everything else"
 run migrate --noinput
 
-say "5/5  does the schema match the models?"
+say "5/6  restore the 30-day grace period"
+# scripts/set_default_grace_period.py reads GRACE_APPLY from the environment,
+# and $MANAGE may well be a `docker compose run` that passes none through, so
+# the variable is set in the payload itself rather than around the command.
+# Only NULL rows are touched, so this is idempotent and safe to re-run.
+GRACE_SCRIPT="$(dirname "$0")/set_default_grace_period.py"
+if [ ! -f "$GRACE_SCRIPT" ]; then
+    echo "ERROR: cannot find $GRACE_SCRIPT" >&2
+    exit 1
+fi
+run shell -c "import os; os.environ['GRACE_APPLY'] = '1'
+$(cat "$GRACE_SCRIPT")"
+
+say "6/6  does the schema match the models?"
 if run makemigrations --check --dry-run; then
     say "Done. No changes detected: the schema matches the models."
 else

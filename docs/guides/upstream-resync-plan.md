@@ -286,7 +286,26 @@ underneath them. The steps are:
 2. `migrate waldur_openportal 0034` -- for real, adding `can_be_managed`.
 3. `migrate waldur_openportal 0039 --fake` -- recording `0035`-`0039`.
 4. `migrate` -- everything else.
-5. `makemigrations --check --dry-run` -- proof the fakes matched reality.
+5. `scripts/set_default_grace_period.py` -- restore the 30-day grace period.
+6. `makemigrations --check --dry-run` -- proof the fakes matched reality.
+
+Step 5 is data, not schema, and it matters as much as the rest. Upstream's
+`structure/0067` replaced `Project.grace_period_days` -- a property returning a
+fixed 30 days -- with nullable columns on `Customer` and `Project` carrying no
+default and no backfill. `get_grace_period_days()` falls through project ->
+customer -> **0**, so on an upgraded database every row means zero: a project's
+effective end date collapses onto its end date, `is_in_grace_period` can never
+be true, and
+`marketplace.terminate_resources_if_project_end_date_has_been_reached`
+terminates its resources the day it ends -- then schedules the project itself
+for deletion once nothing active is left. Deploying past `0067` without this
+silently expires everything sitting in its grace period. Caught in local
+testing against the sanitised copy, where losing a few projects cost nothing.
+
+It is a script rather than a migration deliberately: a local migration under
+`src/waldur_core/structure/migrations/` is upstream's directory, and one stray
+merge request away from being pushed back to them. Only NULL rows are touched,
+so it is idempotent and keeps any value set on purpose.
 
 Two traps that shaped it. `migrate app NNNN` migrates *to* that migration, so
 on a database already past it Django starts **unapplying** -- reversing real
