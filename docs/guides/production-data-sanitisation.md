@@ -216,15 +216,15 @@ docker compose exec waldur-mastermind-api \
 ## What the pseudonyms look like
 
 Every individual becomes `Person NumberN`, addressed as
-`personN@example_orgM.com`, where `N` counts individuals and `M` counts
+`personN@example-orgM.com`, where `N` counts individuals and `M` counts
 distinct email domains -- so two people at the same institution share a
 domain:
 
 | before | after |
 | --- | --- |
-| `Ada Lovelace <ada@some.ac.uk>` | `Person Number1 <person1@example_org1.com>` |
-| `Alan Turing <alan@other.ac.uk>` | `Person Number2 <person2@example_org2.com>` |
-| `Grace Hopper <grace@some.ac.uk>` | `Person Number3 <person3@example_org1.com>` |
+| `Ada Lovelace <ada@some.ac.uk>` | `Person Number1 <person1@example-org1.com>` |
+| `Alan Turing <alan@other.ac.uk>` | `Person Number2 <person2@example-org2.com>` |
+| `Grace Hopper <grace@some.ac.uk>` | `Person Number3 <person3@example-org1.com>` |
 
 `N` follows `core_user.id`, so `Person Number1` is the oldest account and the
 numbering is the same every time you run the script against the same dump.
@@ -364,6 +364,27 @@ schema, and each is worth knowing if you extend the script.
   row was a *terminated* project, so only `?include_terminated=true` reached
   it, and a smoke test using the soft-delete-filtered default manager walks
   straight past exactly the rows most likely to be damaged.
+- **A pseudonym that is not valid input.** The addresses were originally
+  `personN@example_orgM.com`. An underscore is not legal in a DNS label, so
+  those were not valid email addresses at all -- Django's own
+  `validate_email` rejects them. Anything that *validates* rather than merely
+  stores an address then failed, and the failures surfaced nowhere near the
+  cause: `openportal` parsing an `AwardDetails` document containing one raised
+
+  ```text
+  OSError: Parse("Domain label 'example_org27' contains invalid characters
+  (only letters, digits, and hyphens allowed) at line 1 column 2852")
+  ```
+
+  which `/api/openportal-managed-project-accounting-summary/` catches and
+  reports as a null allocation and zero usage -- an accounting bug with no
+  accounting cause, on one project out of hundreds. The hyphen in
+  `example-orgM.com` is therefore load-bearing, not cosmetic. The general
+  lesson: a pseudonym has to be valid in every format the real value was, or
+  it moves the failure from "obviously fake data" to "mysterious bug in the
+  code under test". `scripts/repair_sanitised_email_domain.sql` fixes a copy
+  made before this, rewriting text columns, JSON values, JSON object keys and
+  text arrays.
 - **Columns that mix secrets with configuration.**
   `structure_servicesettings.options` holds credentials *and* the settings a
   backend needs to work -- OpenPortal reads `instance_name`,
@@ -448,7 +469,7 @@ So the script works by shape, in three layers:
    leaf is recognisable. This is the slowest step; on a large installation
    expect it to dominate the run.
 3. **Two independent checks.** `scripts/sanitise_verify.sql` asserts that
-   every remaining address matches `personN@example_orgM.com` and every
+   every remaining address matches `personN@example-orgM.com` and every
    remaining name matches `Person NumberN` -- so a column nobody thought about
    fails rather than passing quietly. Then the driver greps the bytes of the
    finished dump for anything address- or URL-shaped that is not on an

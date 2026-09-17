@@ -648,7 +648,7 @@ esac
 say "Scanning the output for anything that looks like a live address or URL"
 # One definition each, shared by the scan and by the hint printed on failure.
 RE_EMAIL='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
-ALLOW_EMAIL='^person[0-9]+@example_org[0-9]+\.com$|^admin@example\.com$'
+ALLOW_EMAIL='^person[0-9]+@example-org[0-9]+\.com$|^admin@example\.com$'
 RE_URL='https?://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+'
 ALLOW_URL='localhost|127\.0\.0\.1|example\.(com|org|net)|www\.w3\.org|schemas\.|creativecommons\.org|docs\.waldur\.com|waldur\.com|github\.com|opensource\.org|json-schema\.org'
 leak_email=""

@@ -11,13 +11,13 @@
 --   1. Nothing deployment-specific survives: no URLs, no credentials, no
 --      identity-provider configuration, no tokens, no sessions.
 --   2. No personal data survives: every person becomes "Person NumberN" with
---      the address personN@example_orgM.com, where N counts individuals and M
+--      the address personN@example-orgM.com, where N counts individuals and M
 --      counts distinct email domains, both in first-seen order.
 --
 -- Both are done by allowlist wherever a denylist would silently miss a column
 -- added by a later Waldur release: the deployment config is reduced to a named
 -- set of keys, and the verification script asserts on shape (every remaining
--- address matches personN@example_orgM.com) rather than on a list of things to
+-- address matches personN@example-orgM.com) rather than on a list of things to
 -- look for.
 --
 -- REFERENTIAL CONSISTENCY
@@ -83,7 +83,7 @@ CREATE FUNCTION sanitise.is_pseudonym(val text)
 RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
     SELECT val ~ '^Person Number[0-9]+$'
         OR val ~ '^person[0-9]+([._-][A-Za-z0-9._-]*)?$'
-        OR val ~ '^person[0-9]+@example_org[0-9]+\.com$'
+        OR val ~ '^person[0-9]+@example-org[0-9]+\.com$'
         OR val = 'Person'
         OR val ~ '^Number[0-9]+$'
         OR val = '198.51.100.1'
@@ -377,10 +377,26 @@ SET new_name = 'Person Number' || n,
     new_username = 'person' || n;
 
 -- Domains, numbered in first-seen order: the domain of Person Number1 is
--- example_org1, and a domain first seen on Person Number9 gets whatever number
--- is next. This reproduces the requested shape - person1@example_org1.com,
--- person2@example_org2.com, person3@example_org1.com - where the third person
+-- example-org1, and a domain first seen on Person Number9 gets whatever number
+-- is next. This reproduces the requested shape - person1@example-org1.com,
+-- person2@example-org2.com, person3@example-org1.com - where the third person
 -- shares the first person's domain.
+--
+-- THE HYPHEN IS LOAD-BEARING. It was originally example_org1.com, and an
+-- underscore is not legal in a DNS label, so those addresses were not valid
+-- email addresses at all. Anything that VALIDATES rather than merely stores
+-- one then failed on the sanitised copy - Django's own validate_email rejects
+-- example_org1.com - and the failures surfaced far from the cause:
+--
+--   OSError: Parse("Domain label 'example_org27' contains invalid characters
+--   (only letters, digits, and hyphens allowed) at line 1 column 2852")
+--
+-- raised by openportal parsing an AwardDetails document with an address
+-- inside it, which
+-- /api/openportal-managed-project-accounting-summary/ catches and reports as
+-- a null allocation and zero usage - a plausible-looking accounting bug with
+-- no accounting cause. A hyphen parses everywhere and keeps the numbering
+-- scheme exactly.
 CREATE TABLE sanitise.domain (
     orig_domain text PRIMARY KEY,
     m           int NOT NULL
@@ -418,7 +434,7 @@ CREATE TABLE sanitise.email_map (
 INSERT INTO sanitise.email_map (orig_email, new_email)
 SELECT DISTINCT ON (p.orig_email)
        p.orig_email,
-       'person' || p.n || '@example_org' || coalesce(d.m, 0) || '.com'
+       'person' || p.n || '@example-org' || coalesce(d.m, 0) || '.com'
 FROM sanitise.person p
 LEFT JOIN sanitise.domain d
        ON d.orig_domain = split_part(p.orig_email, '@', 2)
@@ -449,7 +465,7 @@ RETURNS text LANGUAGE sql STABLE AS $$
     SELECT coalesce(
         -- Already mapped: return it unchanged, or a second pass would fold it
         -- onto the sink. This is what makes the whole script idempotent.
-        CASE WHEN addr ~ '^person[0-9]+@example_org[0-9]+\.com$'
+        CASE WHEN addr ~ '^person[0-9]+@example-org[0-9]+\.com$'
              THEN addr END,
         (SELECT new_email FROM sanitise.email_map
          WHERE orig_email = lower(btrim(addr))),
@@ -458,7 +474,7 @@ RETURNS text LANGUAGE sql STABLE AS $$
         -- verification shape; the verifier's count of sink addresses says how
         -- often this happened.
         CASE WHEN addr IS NULL OR addr = '' THEN addr
-             ELSE 'person0@example_org0.com' END
+             ELSE 'person0@example-org0.com' END
     )
 $$;
 

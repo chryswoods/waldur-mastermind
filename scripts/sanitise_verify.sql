@@ -5,7 +5,7 @@
 -- refuses to write the output dump if anything FAILs.
 --
 -- The checks assert on SHAPE, not on a list of things to look for: every
--- remaining address must match personN@example_orgM.com and every remaining
+-- remaining address must match personN@example-orgM.com and every remaining
 -- personal name must match "Person NumberN". A column that the sanitiser does
 -- not know about therefore fails these checks rather than passing silently,
 -- which is the property that matters as upstream adds columns.
@@ -52,10 +52,10 @@ SET TRANSACTION READ ONLY;
 
 DO $verify$
 DECLARE
-    -- personN@example_orgM.com, alone or as a comma-separated list.
+    -- personN@example-orgM.com, alone or as a comma-separated list.
     email_shape text :=
-        '^person[0-9]+@example_org[0-9]+\.com'
-        '(, ?person[0-9]+@example_org[0-9]+\.com)*$';
+        '^person[0-9]+@example-org[0-9]+\.com'
+        '(, ?person[0-9]+@example-org[0-9]+\.com)*$';
     -- personN, and the compound account names that keep their project and
     -- system parts: personN.project, personN.project.cluster.
     login_shape text := '^person[0-9]+([._-][A-Za-z0-9][A-Za-z0-9._-]*)?$';
@@ -152,7 +152,7 @@ BEGIN
                 email_shape), 'FAIL'),
         ('no_addresses_in_event_log',       'logging_event', ARRAY['message'],
          $p$message ~ '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
-            AND message !~ 'person[0-9]+@example_org[0-9]+\.com'$p$, 'FAIL'),
+            AND message !~ 'person[0-9]+@example-org[0-9]+\.com'$p$, 'FAIL'),
 
         -- login names, which other tables join on
         ('login_offering_user',      'marketplace_offeringuser',
@@ -290,7 +290,7 @@ BEGIN
         -- the harvest step does not read ends up. Safe, but it collapses
         -- distinct people onto one pseudonym.
         ('unmapped_address_sink', 'core_user', ARRAY['email'],
-         $p$email = 'person0@example_org0.com'$p$, 'WARN')
+         $p$email = 'person0@example-org0.com'$p$, 'WARN')
         ) AS t(name, tbl, cols, pred, severity)
     LOOP
         SELECT to_regclass('public.' || quote_ident(r.tbl)) IS NOT NULL
