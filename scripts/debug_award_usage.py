@@ -25,6 +25,7 @@ import os
 
 from waldur_core.structure.models import Project
 from waldur_openportal import models, utils
+from waldur_openportal.filters import _identifiers_for_project_uuid
 
 SELECTOR = os.environ.get("AWARD_PROJECT", "").strip()
 
@@ -47,19 +48,43 @@ def describe(project):
     print(f"  destination         : {award.destination!r}")
 
     # --- allocation side -------------------------------------------------
+    # get_award_usage_info reads .project_template DIRECTLY rather than calling
+    # get_project_template(), because that method can DELETE the ManagedProject
+    # as a side effect of failing to resolve one. So a null allocation_credits
+    # can mean the FK is null even though a template is resolvable - report
+    # both.
     template = award.project_template
     if template is None:
-        print("  allocation          : no project_template -> None")
+        print("  project_template    : NULL on the row -> allocation_credits is None")
+        print(
+            "                        (get_award_usage_info reads the FK directly"
+            " and does not resolve)"
+        )
     else:
+        print(f"  project_template    : {template.name!r}")
+
+    try:
         details = award.get_details()
-        if details.allocation is None:
-            print("  allocation          : no allocation in details -> None")
-        else:
+    except Exception as e:
+        details = None
+        print(f"  details             : get_details() raised {type(e).__name__}: {e}")
+
+    if details is None:
+        print("  details             : None -> allocation_credits is None")
+    elif details.allocation is None:
+        print("  details.allocation  : None -> allocation_credits is None")
+        print(f"  raw details keys    : {sorted((award.details or {}).keys())}")
+    else:
+        print(
+            f"  details.allocation  : {details.allocation.size}"
+            f" {details.allocation.units}"
+        )
+        if template is not None:
             print(
-                f"  allocation          : {details.allocation.size}"
-                f" {details.allocation.units}"
-                f" -> {template.convert_to_credits(details.allocation)} credits"
+                f"  allocation_credits  : "
+                f"{template.convert_to_credits(details.allocation)}"
             )
+            print(f"  units mapping       : {template.allocation_units_mapping}")
 
     # --- usage side ------------------------------------------------------
     # Counted directly rather than through get_attachments(), which would
@@ -90,11 +115,41 @@ def describe(project):
         print("  -> usage is 0 because there are NO WINDOWS to count over.")
         return
 
-    # The join _sum_usage_over_windows does.
+    # The two endpoints do not use the same key, which is the usual reason one
+    # shows usage and the other does not:
+    #
+    #   /api/openportal-project-usage-reports/?project_uuid=...
+    #       -> filters._identifiers_for_project_uuid(), which is every
+    #          Allocation.backend_id on the project PLUS
+    #          "{ProjectInfo.shortname}.{get_portal()}"
+    #   get_award_usage_info
+    #       -> ManagedProject.local_identifier, and nothing else
+    #
+    # So an award whose local_identifier is blank, or differs from the
+    # identifier the reports were written under, reports zero usage while the
+    # reports endpoint happily returns them.
+    endpoint_ids = _identifiers_for_project_uuid(project.uuid)
+    print(f"  identifiers the reports endpoint uses: {sorted(endpoint_ids)}")
+    if not award.local_identifier:
+        print("  -> local_identifier is EMPTY, so usage can only ever be 0.")
+    elif award.local_identifier not in endpoint_ids:
+        print(
+            f"  -> MISMATCH: local_identifier {award.local_identifier!r} is not"
+            " among them."
+        )
+        for candidate in sorted(endpoint_ids):
+            n = models.CachedProjectUsageReport.objects.filter(
+                project_identifier=candidate
+            ).count()
+            print(f"       {candidate!r}: {n} cached reports")
+    else:
+        print("  -> local_identifier agrees with the reports endpoint.")
+
+    # The lookup _sum_usage_over_windows now does: project_identifier alone.
     exact = models.CachedProjectUsageReport.objects.filter(
-        project_identifier=award.local_identifier, resource=award.destination
+        project_identifier=award.local_identifier
     )
-    print(f"  cached reports (both keys) : {exact.count()}")
+    print(f"  cached reports on local_identifier : {exact.count()}")
 
     if exact.exists():
         print("  -> the join matches; if usage is still 0 the reports are empty")
