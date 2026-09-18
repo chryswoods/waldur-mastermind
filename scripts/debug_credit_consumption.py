@@ -48,12 +48,21 @@ else:
     if pc:
         print(f"minimal_consumption  : {pc.minimal_consumption}")
 
-    # Cost charged to this project, per invoice month.
-    cost = defaultdict(lambda: 0)
+    # Charges and credit applications are BOTH InvoiceItems on the project -
+    # the credit application is one with a negative unit_price - so summing
+    # price over all of them gives the NET, which is zero in exactly the
+    # healthy case where the cost was fully met from credit. Separate them, or
+    # the table reads as "never billed" for the months that worked properly.
+    charged = defaultdict(lambda: 0)
+    credited = defaultdict(lambda: 0)
     for item in invoice_models.InvoiceItem.objects.filter(
         project=project
     ).select_related("invoice"):
-        cost[(item.invoice.year, item.invoice.month)] += item.price
+        key = (item.invoice.year, item.invoice.month)
+        if item.unit_price < 0:
+            credited[key] += item.price
+        else:
+            charged[key] += item.price
 
     # Credit applied, per month. Keyed on the CUSTOMER credit, which is what
     # the graph reads - a compensation item carries the project it was for.
@@ -67,19 +76,26 @@ else:
             if item.project_id == project.id:
                 applied_here[(item.invoice.year, item.invoice.month)] += item.price
 
-    months = sorted(set(cost) | set(applied))
+    months = sorted(set(charged) | set(credited) | set(applied))
     if not months:
         print("\nNo invoice items at all for this project.")
     else:
         print(
-            f"\n{'month':>9} | {'project cost':>13} | {'credit applied':>15}"
-            f" | {'of it, this project':>20}"
+            f"\n{'month':>9} | {'charged':>11} | {'credited':>11}"
+            f" | {'net':>10} | {'customer applied':>17}"
         )
         for year, month in months:
+            key = (year, month)
+            net = charged[key] + credited[key]
+            flag = (
+                "  <- charged, nothing credited"
+                if (charged[key] and not credited[key])
+                else ""
+            )
             print(
-                f"  {year}-{month:02d} | {cost[(year, month)]:13.2f}"
-                f" | {-applied[(year, month)]:15.2f}"
-                f" | {-applied_here[(year, month)]:20.2f}"
+                f"  {year}-{month:02d} | {charged[key]:11.2f}"
+                f" | {-credited[key]:11.2f} | {net:10.2f}"
+                f" | {-applied[key]:17.2f}{flag}"
             )
 
     # The new ledger, for comparison. Empty for months that predate it.
@@ -96,7 +112,16 @@ else:
         print(f"  {name}: {n}")
 
     print(
-        "\nReading this: a month with cost but no credit applied is a month"
-        "\nthe compensation step never ran for. Cost of zero everywhere means"
-        "\nthe offerings are not billed, and an empty graph is then correct."
+        "\nReading this:"
+        "\n  charged ~= credited, net ~0  healthy - usage billed, met from credit"
+        "\n  charged, nothing credited    that invoice was never compensated"
+        "\n                               (the current month is expected)"
+        "\n  nothing charged at all       the offerings are not billed, and an"
+        "\n                               empty consumption graph is correct"
+        "\n"
+        "\nCreditTransaction is the ledger the resync added. It records only"
+        "\nmovements made after it was wired up, so zero rows means no history,"
+        "\nNOT no consumption - the invoice items above are the record."
+        "\n`waldur backfill_credit_ledger --dry-run` reconstructs what is"
+        "\nrecoverable."
     )
