@@ -54,6 +54,10 @@ class CustomerSection(FeatureSection):
         "Allows to show OpenPortal Remote Projects (remotes) in an organization."
     )
 
+    show_openportal_accounting_only = Feature(
+        "Show only OpenPortal award accounting for this organization, hiding the marketplace usage, limit and credit widgets that describe a different accounting model."
+    )
+
 
 class ProjectSection(FeatureSection):
     class Meta:
