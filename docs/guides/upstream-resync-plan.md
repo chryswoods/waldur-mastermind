@@ -602,6 +602,50 @@ is the throwaway project a marketplace_script dry run creates.
    endpoint homeport calls sits inside `src/proposals`, which is replaced
    wholesale, so nothing outside it needs reworking.
 
+## 7.1 On deployment day: the production-data actions
+
+Migrating the schema is not the whole deployment. These act on production's
+own data and are easy to lose track of, because most were found while
+debugging the sanitised copy and fixed there first.
+
+**`scripts/repair_managed_project_local_portal.py` must be run against
+production.** This is the one most easily missed. `OpenPortalBoard` minted
+`ManagedProject.local_identifier` with the portal at the head of the board's
+destination -- the remote portal that raised the award -- so awards arriving
+through the AIRR gateway were stored as `u6dj.airr` where they should be
+`u6dj.brics`. The board no longer does this, but that only fixes awards minted
+from now on. The rows already in production are wrong, and nothing finds them:
+`filters._identifiers_for_project_uuid` builds the identifier from
+`get_portal()`, and `tasks.refresh_remote_award` discards an identifier whose
+portal is not this one. Around 400 rows needed rewriting on the sanitised copy,
+which is the same number production carries. Dry run first; it refuses a
+rewrite that would collide with another `ManagedProject`.
+
+**The migration nobody has timed.**
+`marketplace/0270_scrub_secret_options_from_reversion` walks the version
+history, and the sanitiser empties `reversion_version` -- so every rehearsal
+has run it against an empty table. Production's is full. The 5m58s figure in
+§6.6 therefore excludes it, and the deployment window should not be planned as
+though it were included. Worth measuring `reversion_version` before the window
+(the pre-flight's `largest_table` output sizes it) and, if it is large, timing
+that migration alone against an unsanitised restore.
+
+**The OpenPortal service upgrade.** `pyproject.toml` now pins
+`openportal>=0.93.0`, against `>=0.32.2` before the resync. The deployed
+OpenPortal *service* has to move in step; this is sequencing step 1 and the
+main scheduling risk in the whole resync, not something to discover during the
+window.
+
+**The test suite.** The OpenPortal app is covered -- 268 tests pass against the
+merge, the local-portal fix and the `RemoteOpenPortalClient` removal. The rest
+of the suite has not been run against this branch end to end, and should be
+before the window.
+
+**Not resync-related, but open.** One project shows an invoice month charged
+with no credit compensation recorded (2026-06, mid-life for a Feb-Nov project),
+while every other month nets to zero correctly. `scripts/debug_credit_consumption.py`
+reports this per project. Worth understanding before it becomes a pattern.
+
 ## 8. Testing
 
 Upstream requires Python 3.13 (`requires-python = ">=3.13,<3.14"`, from
