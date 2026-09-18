@@ -52,6 +52,7 @@ from waldur_core.structure.models import CUSTOMER_DETAILS_FIELDS
 from waldur_core.structure.notifications import NOTIFICATIONS
 from waldur_core.structure.registry import get_resource_type, get_service_type
 from waldur_core.structure.utils_data_access import log_user_data_access_sync
+from waldur_core.user_actions import serializers as user_action_serializers
 from waldur_mastermind.marketplace.enums import ResourceStates
 
 logger = logging.getLogger(__name__)
@@ -522,6 +523,7 @@ class ProjectMetadataAnswerSerializer(serializers.Serializer):
             "to their labels."
         ),
     )
+    modified = serializers.DateTimeField(help_text="When this answer was last saved.")
 
 
 def fetch_project_metadata_completions(project_ids):
@@ -553,7 +555,10 @@ class ProjectSerializer(
         help_text="Number of active resources in this project"
     )
     project_metadata = serializers.SerializerMethodField(
-        help_text="Answers to the customer's project-metadata checklist (read-only)."
+        help_text=(
+            "Answers to the customer's project-metadata checklist (read-only): "
+            "the latest answer per question."
+        )
     )
     oecd_fos_2007_label = serializers.CharField(
         read_only=True,
@@ -1114,6 +1119,22 @@ class CustomerListSerializer(serializers.ListSerializer):
         if not customer_ids:
             return super().to_representation(data)
 
+        # Rows reached only through a service provider role are narrowed to
+        # identity fields, so skip the aggregations for them entirely.
+        service_provider_manager_only_ids = (
+            managers.get_service_provider_manager_only_customer_ids(
+                request.user, customer_ids
+            )
+            if request
+            else set()
+        )
+        self.context["service_provider_manager_only_ids"] = (
+            service_provider_manager_only_ids
+        )
+        customer_ids = [
+            cid for cid in customer_ids if cid not in service_provider_manager_only_ids
+        ]
+
         # 2. Build the bulk context dictionary
         bulk_context = {
             "visibility": self._get_visibility_context(request, customer_ids),
@@ -1345,6 +1366,12 @@ class CustomerSerializer(
     users_count = serializers.SerializerMethodField(
         help_text="Number of users with access to this organization"
     )
+    is_service_provider_manager_only = serializers.SerializerMethodField(
+        help_text=(
+            "True when the requesting user's only link to this organization is a "
+            "role on its service provider. Such a row carries only identity fields."
+        )
+    )
     project_metadata_checklist = serializers.SlugRelatedField(
         slug_field="uuid",
         queryset=Checklist.objects.filter(
@@ -1397,6 +1424,7 @@ class CustomerSerializer(
             "user_affiliations",
             "user_identity_sources",
             "default_affiliations",
+            "is_service_provider_manager_only",
         ) + CUSTOMER_DETAILS_FIELDS
         staff_only_fields = (
             "access_subnets",
@@ -1419,6 +1447,55 @@ class CustomerSerializer(
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
         }
+
+    # What a service provider manager without any role on the organization
+    # itself may read: the identity marketplace-service-providers already
+    # publishes, plus the provider link the portal needs to open its workspace.
+    SERVICE_PROVIDER_MANAGER_FIELDS = frozenset(
+        (
+            "url",
+            "uuid",
+            "name",
+            "native_name",
+            "display_name",
+            "abbreviation",
+            "slug",
+            "image",
+            "country",
+            "country_name",
+            "is_service_provider",
+            "service_provider",
+            "service_provider_uuid",
+            "is_service_provider_manager_only",
+        )
+    )
+
+    # Filters and ordering on CustomerViewSet (query over registration code and
+    # agreement number, ordering by contact_details) still act on these rows,
+    # so a manager could infer hidden values of their own provider's
+    # organization by probing. Accepted: it is their own organization, and the
+    # narrowing is about not presenting internal details, not secrecy.
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if instance.id in self._get_service_provider_manager_only_ids(instance):
+            return {
+                key: value
+                for key, value in data.items()
+                if key in self.SERVICE_PROVIDER_MANAGER_FIELDS
+            }
+        return data
+
+    def _get_service_provider_manager_only_ids(self, instance) -> set:
+        # A list computes these once per page in CustomerListSerializer.
+        ids = self.context.get("service_provider_manager_only_ids")
+        if ids is not None:
+            return ids
+        request = self.context.get("request")
+        if not request:
+            return set()
+        return managers.get_service_provider_manager_only_customer_ids(
+            request.user, [instance.id]
+        )
 
     def get_fields(self):
         fields = super().get_fields()
@@ -1540,6 +1617,11 @@ class CustomerSerializer(
 
     def get_display_name(self, customer) -> str:
         return customer.get_display_name()
+
+    def get_is_service_provider_manager_only(self, customer) -> bool:
+        # The portal reads this instead of re-deriving it from user permissions,
+        # which cannot see every rule that makes an organization visible.
+        return customer.id in self._get_service_provider_manager_only_ids(customer)
 
     def get_projects_count(self, customer) -> int:
         # Use annotated value if available (from ViewSet.get_queryset)
@@ -2458,6 +2540,8 @@ class UserSerializer(
             "active_isds",
             "deactivation_reason",
             "is_admin_deactivated",
+            # Raw identity provider claims (staff/support only, see get_fields)
+            "details",
         )
         read_only_fields = (
             "uuid",
@@ -2477,6 +2561,9 @@ class UserSerializer(
             "is_admin_deactivated",
             "uid_number",
             "primary_gid",
+            # Provider-asserted, and now load-bearing for role assignment:
+            # nothing may PATCH a user's claims into existence.
+            "details",
         )
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
@@ -2492,12 +2579,22 @@ class UserSerializer(
         except (KeyError, AttributeError):
             return fields
 
-        if user.is_anonymous:
-            return fields
-
         # Check if this is schema generation context (drf-spectacular)
         # When generating schema, we want to include all fields
         if getattr(self.context.get("view"), "swagger_fake_view", False):
+            return fields
+
+        # Raw identity provider claims. Whatever the provider puts in the claims
+        # listed in IdentityProvider.extra_fields lands here verbatim, and
+        # auto-provisioning rules match on it to grant roles — so this is a
+        # support and debugging surface, not a profile field. Staff and support
+        # only, the user themselves included. Checked before the anonymous
+        # return below so an unauthenticated caller cannot receive it either;
+        # AnonymousUser has no is_support, hence the getattr.
+        if not (user.is_staff or getattr(user, "is_support", False)):
+            fields.pop("details", None)
+
+        if user.is_anonymous:
             return fields
 
         if not user.is_staff:
@@ -3802,7 +3899,8 @@ class ProjectAnswerSerializer(serializers.ModelSerializer):
         """Get count of answers."""
         completion = self._get_completion_data(project)
         if completion:
-            return completion.answers.count()
+            # Answered questions, not per-user answer rows
+            return completion.answers.values("question_id").distinct().count()
         return 0
 
     def get_unanswered_required_count(self, project) -> int:
@@ -3815,9 +3913,12 @@ class ProjectAnswerSerializer(serializers.ModelSerializer):
         total_required = checklist.questions.filter(required=True).count()
 
         if completion:
-            answered_required = completion.answers.filter(
-                question__required=True
-            ).count()
+            answered_required = (
+                completion.answers.filter(question__required=True)
+                .values("question_id")
+                .distinct()
+                .count()
+            )
             return max(0, total_required - answered_required)
         else:
             return total_required
@@ -3831,7 +3932,11 @@ class ProjectAnswerDetailSerializer(serializers.Serializer):
     answer_uuid = serializers.UUIDField(read_only=True, allow_null=True)
     answer_data = serializers.JSONField(read_only=True, allow_null=True)
     answered_by = serializers.CharField(read_only=True, allow_null=True)
-    answered_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    answered_at = serializers.DateTimeField(
+        read_only=True,
+        allow_null=True,
+        help_text="When the shown answer was last saved.",
+    )
     requires_review = serializers.BooleanField(read_only=True)
 
 
@@ -3910,13 +4015,18 @@ class QuestionAnswerSerializer(serializers.ModelSerializer):
         project_ct = ContentType.objects.get_for_model(models.Project)
 
         # Get answers for this question across all projects
-        answers = Answer.objects.filter(
-            question=question,
-            completion__scope_content_type=project_ct,
-            completion__scope_object_id__in=[p.id for p in projects],
-        ).select_related("user", "completion")
+        answers = (
+            Answer.objects.filter(
+                question=question,
+                completion__scope_content_type=project_ct,
+                completion__scope_object_id__in=[p.id for p in projects],
+            )
+            .select_related("user", "completion")
+            .order_by("modified", "id")
+        )
 
-        # Create mapping of project_id -> answer
+        # Create mapping of project_id -> answer. Answers are per-user rows; later
+        # rows overwrite earlier ones, so each project keeps its latest answer.
         answers_by_project = {
             answer.completion.scope_object_id: answer for answer in answers
         }
@@ -3938,6 +4048,7 @@ class QuestionAnswerSerializer(serializers.ModelSerializer):
         data = self._get_projects_and_answers_data(question)
         return data["answered_projects_count"]
 
+    @extend_schema_field(ProjectAnswerDetailSerializer(many=True))
     def get_project_answers(self, question) -> list[dict]:
         """Get all project answers for this question."""
         data = self._get_projects_and_answers_data(question)
@@ -3959,7 +4070,8 @@ class QuestionAnswerSerializer(serializers.ModelSerializer):
                             question, answer.answer_data
                         ),
                         "answered_by": answer.user.full_name if answer.user else None,
-                        "answered_at": answer.created,
+                        # The shown answer's last save, not when its row was created
+                        "answered_at": answer.modified,
                         "requires_review": answer.requires_review,
                     }
                 )
@@ -4124,3 +4236,20 @@ class DashboardPendingActionSerializer(serializers.Serializer):
     # the frontend, so the feed carries identifiers rather than URLs.
     target_uuid = serializers.UUIDField(read_only=True, allow_null=True)
     customer_uuid = serializers.UUIDField(read_only=True, allow_null=True)
+    # Set only for items backed by a UserAction row. It addresses that row on
+    # the existing silence/unsilence/execute_action endpoints, so the feed can
+    # carry the queue's controls without duplicating them here. Computed items
+    # have no row and leave this null.
+    uuid = serializers.UUIDField(read_only=True, allow_null=True)
+    urgency = serializers.CharField(read_only=True, allow_null=True)
+    # UI-Router state and params, carried through from the queue. Computed
+    # items keep routing frontend-side and leave these empty.
+    route_name = serializers.CharField(read_only=True, allow_null=True)
+    route_params = serializers.DictField(read_only=True)
+    can_silence = serializers.BooleanField(read_only=True)
+    # The queue's own serializer, not a copy of it: an earlier copy declared
+    # api_endpoint as a CharField, and "False" is truthy in JS, so every
+    # navigation-only action executed server-side instead of navigating.
+    actions = user_action_serializers.CorrectiveActionSerializer(
+        read_only=True, many=True
+    )

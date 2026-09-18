@@ -18,6 +18,8 @@ include:
   - project: "waldur/waldur-pipelines"
     file: "/templates/stages.yml"
   - project: "waldur/waldur-pipelines"
+    file: "/templates/test/python-linters.yml"
+  - project: "waldur/waldur-pipelines"
     file: "/templates/test/check-merge-compatibility.yml"
   - project: "waldur/waldur-pipelines"
     file: "/templates/release/publish-multiarch.yml"
@@ -110,13 +112,8 @@ before_script:
         - uv.lock
 
 Run linters:
-  image: registry.hpc.ut.ee/mirror/library/python:3.13-bookworm
-  stage: test
-  interruptible: true
+  extends: .Run linters template
   <<: *unit_test_rules
-  script:
-    - pip install prek
-    - prek run --all-files
 
 Scan Python dependencies:
   extends: .Vulnerability scan template
@@ -129,7 +126,7 @@ Check TransactionTestCase usage:
   interruptible: true
   <<: *source_analysis_rules
   script:
-    - python scripts/analyze_transaction_test_cases.py --ci --baseline 80
+    - python scripts/analyze_transaction_test_cases.py --ci --baseline 0
 
 Check Action decorators:
   image: registry.hpc.ut.ee/mirror/library/python:3.13-bookworm
@@ -263,6 +260,31 @@ Check startup memory budget:
       - scripts/memory_profiles/startup_components.csv
     expire_in: 1 week
 
+.migration_test_settings:
+  script:
+    - |
+      echo "[+] Setting up test database configuration..."
+      cat > src/waldur_mastermind/test_settings.py <<-EOF
+      import os
+      from waldur_core.server.test_settings import *
+      from django.db.backends.base.schema import BaseDatabaseSchemaEditor
+
+      # Using UNLOGGED tables in PostgreSQL is a significant performance boost for
+      # tests, as it reduces disk I/O by not writing to the WAL.
+      BaseDatabaseSchemaEditor.sql_create_table = "CREATE UNLOGGED TABLE %(table)s (%(definition)s)"
+
+      DATABASES = {
+          'default': {
+              'ENGINE': 'django.db.backends.postgresql',
+              'NAME': os.environ.get('WALDUR_DB_NAME', 'test_waldur'),
+              'USER': 'runner',
+              'HOST': 'postgres',
+              'PORT': 5432,
+              'PASSWORD': 'waldur',
+          }
+      }
+      EOF
+
 Run migration tests:
   extends: .Unit test runner
   rules:
@@ -293,28 +315,8 @@ Run migration tests:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes: *migration_test_changes
   script:
+    - !reference [.migration_test_settings, script]
     - |
-      echo "[+] Setting up test database configuration..."
-      cat > src/waldur_mastermind/test_settings.py <<-EOF
-      import os
-      from waldur_core.server.test_settings import *
-      from django.db.backends.base.schema import BaseDatabaseSchemaEditor
-
-      # Using UNLOGGED tables in PostgreSQL is a significant performance boost for
-      # tests, as it reduces disk I/O by not writing to the WAL.
-      BaseDatabaseSchemaEditor.sql_create_table = "CREATE UNLOGGED TABLE %(table)s (%(definition)s)"
-
-      DATABASES = {
-          'default': {
-              'ENGINE': 'django.db.backends.postgresql',
-              'NAME': os.environ.get('WALDUR_DB_NAME', 'test_waldur'),
-              'USER': 'runner',
-              'HOST': 'postgres',
-              'PORT': 5432,
-              'PASSWORD': 'waldur',
-          }
-      }
-      EOF
       uv run waldur migrate --noinput
       # Fresh-install path (`migrate_fresh` builds the schema from the models in
       # seconds and fakes the migrations) must produce exactly the schema the full
@@ -326,7 +328,7 @@ Run migration tests:
       time WALDUR_DB_NAME=test_fresh uv run waldur migrate_fresh
       WALDUR_DB_NAME=test_fresh uv run python scripts/squash_migrations.py snapshot-db > schema_fresh.txt
       uv run python scripts/squash_migrations.py compare-schema schema_migrated.txt schema_fresh.txt
-  services:
+  services: &migration_postgres
     - name: "registry.hpc.ut.ee/mirror/library/postgres:15-alpine"
       alias: postgres
       command:
@@ -342,11 +344,62 @@ Run migration tests:
           "-ctemp_buffers=16MB",
           "-cwal_buffers=48MB",
         ]
-  variables:
+  variables: &migration_db_variables
     POSTGRES_DB: test_waldur
     POSTGRES_USER: runner
     POSTGRES_PASSWORD: waldur
     DJANGO_SETTINGS_MODULE: waldur_mastermind.test_settings
+
+Run upgrade migration test:
+  extends: .Unit test runner
+  rules:
+    - if: '$SKIP_TESTS == "true" || $SKIP_TESTS == "yes"'
+      when: never
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes: *migration_test_changes
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *migration_test_changes
+  script:
+    - !reference [.migration_test_settings, script]
+    - |
+      # Every deployment upgrades an existing database, and the job above only
+      # ever starts from an empty one. That let regenerated squashes depend on a
+      # migration newer than the range they replace: Django counts a squash as
+      # applied wherever its originals are, so `migrate` refused every upgraded
+      # database with InconsistentMigrationHistory (#354). Initialise a database
+      # from the newest release tag (other than the one being built) and run this
+      # commit's `migrate` on top. `migrate_fresh` at the baseline takes seconds,
+      # records exactly what `migrate` records, and its from-the-models schema is
+      # what every `initdb` since 2026-08-29 produced.
+      echo "[+] Locating the previous release..."
+      BASELINE=$(git -c versionsort.suffix=-rc ls-remote --tags --refs --sort=-v:refname origin '[0-9]*.[0-9]*.[0-9]*' \
+        | sed 's|.*refs/tags/||' | grep -vx "${CI_COMMIT_TAG:-}" | head -1)
+      test -n "$BASELINE"
+      echo "[+] Baseline: $BASELINE"
+      git fetch --quiet --depth=1 origin "refs/tags/$BASELINE:refs/tags/$BASELINE"
+      # The build directory persists between attempts (GIT_STRATEGY: fetch) but /tmp
+      # does not, so a failed attempt leaves .git/worktrees/baseline registered against
+      # a path that no longer exists and every retry dies on "missing but already
+      # registered worktree". Clear the stale registration first.
+      git worktree prune
+      git worktree add --quiet --detach /tmp/baseline "$BASELINE"
+      cp src/waldur_mastermind/test_settings.py /tmp/baseline/src/waldur_mastermind/
+      uv run python -c "import psycopg; psycopg.connect('host=postgres user=runner password=waldur dbname=postgres', autocommit=True).execute('CREATE DATABASE test_upgrade')"
+      echo "[+] Initialising a database from $BASELINE..."
+      (cd /tmp/baseline && UV_CACHE_DIR=$CI_PROJECT_DIR/.uv-cache uv sync --group dev --quiet && WALDUR_DB_NAME=test_upgrade uv run waldur migrate_fresh)
+      echo "[+] Upgrading it with this commit's migrations..."
+      time WALDUR_DB_NAME=test_upgrade uv run waldur migrate --noinput
+      # The upgraded database must end up with the schema a fresh install of this
+      # commit gets (auto-generated constraint names aside).
+      echo "[+] Comparing the upgraded schema with a fresh one..."
+      uv run python -c "import psycopg; psycopg.connect('host=postgres user=runner password=waldur dbname=postgres', autocommit=True).execute('CREATE DATABASE test_fresh')"
+      WALDUR_DB_NAME=test_fresh uv run waldur migrate_fresh
+      WALDUR_DB_NAME=test_upgrade uv run python scripts/squash_migrations.py snapshot-db > schema_upgraded.txt
+      WALDUR_DB_NAME=test_fresh uv run python scripts/squash_migrations.py snapshot-db > schema_fresh.txt
+      uv run python scripts/squash_migrations.py compare-schema schema_fresh.txt schema_upgraded.txt
+  services: *migration_postgres
+  variables: *migration_db_variables
 
 Run demo presets tests:
   extends: .Unit test runner
@@ -409,6 +462,108 @@ Run demo presets tests:
     POSTGRES_USER: runner
     POSTGRES_PASSWORD: waldur
     DJANGO_SETTINGS_MODULE: waldur_mastermind.test_settings
+
+# The VMware plugin is validated against vcsim, VMware's vCenter simulator
+# (shipped inside govmomi, VMware's official Go SDK). These tests are excluded
+# from the sharded suite by a collection-time skip in
+# src/waldur_vmware/tests/conftest.py — that suite runs with `-m 'not slow'`,
+# which does not opt into the marker — so they need a job of their own.
+#
+# vcsim proves call shapes and payloads, not vCenter behaviour: it is a
+# developer tool, not a complete implementation. Acceptance against a live
+# vCenter is still required before release.
+Run VMware integration tests:
+  extends: .Unit test runner
+  rules:
+    - if: '$SKIP_TESTS == "true" || $SKIP_TESTS == "yes"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - src/waldur_vmware/**/*
+  script:
+    - |
+      echo "[+] Setting up test database configuration..."
+      cat > src/waldur_mastermind/test_settings.py <<-EOF
+      from waldur_core.server.test_settings import *
+      from django.db.backends.base.schema import BaseDatabaseSchemaEditor
+
+      # Using UNLOGGED tables in PostgreSQL is a significant performance boost for
+      # tests, as it reduces disk I/O by not writing to the WAL.
+      BaseDatabaseSchemaEditor.sql_create_table = "CREATE UNLOGGED TABLE %(table)s (%(definition)s)"
+
+      DATABASES = {
+          'default': {
+              'ENGINE': 'django.db.backends.postgresql',
+              'NAME': 'test_waldur',
+              'USER': 'runner',
+              'HOST': 'postgres',
+              'PORT': 5432,
+              'PASSWORD': 'waldur',
+          }
+      }
+      EOF
+    - uv run pytest --no-migrations -m vcsim src/waldur_vmware/ -v
+  services:
+    - name: "registry.hpc.ut.ee/mirror/library/postgres:15-alpine"
+      alias: postgres
+      command:
+        [
+          "postgres",
+          "-cfsync=off",
+          "-cfull_page_writes=off",
+          "-cmax_connections=1000",
+          "-cshared_buffers=1GB",
+          "-ceffective_cache_size=4GB",
+          "-cwork_mem=32MB",
+          "-cmaintenance_work_mem=32MB",
+          "-ctemp_buffers=16MB",
+          "-cwal_buffers=48MB",
+        ]
+    # -api-version: vcsim defaults to 6.5, which is older than anything we
+    # target. The inventory is plural where the code makes a choice, so that the
+    # get_default_* helpers are tested for which object they pick.
+    #
+    # The tag is pinned rather than :latest, so that a govmomi release cannot
+    # redden this job on its own. Keep it in step with docker/vcsim-dev/.
+    - name: "registry.hpc.ut.ee/mirror/vmware/vcsim:v0.56.0"
+      alias: vcsim
+      command:
+        [
+          "-l",
+          "0.0.0.0:8989",
+          "-api-version",
+          "8.0.1.0",
+          "-username",
+          "waldur",
+          "-password",
+          "waldur",
+          "-dc",
+          "1",
+          "-cluster",
+          "1",
+          "-host",
+          "2",
+          "-vm",
+          "2",
+          "-ds",
+          "2",
+          "-pg",
+          "2",
+          "-pool",
+          "1",
+          "-folder",
+          "1",
+        ]
+  variables:
+    POSTGRES_DB: test_waldur
+    POSTGRES_USER: runner
+    POSTGRES_PASSWORD: waldur
+    DJANGO_SETTINGS_MODULE: waldur_mastermind.test_settings
+    VCSIM_URL: "https://vcsim:8989"
+    VCSIM_USERNAME: waldur
+    VCSIM_PASSWORD: waldur
 
 # This is the "preparation" job. It's not parallelized.
 # Its only responsibilities are to check for merge conflicts and generate the dynamic

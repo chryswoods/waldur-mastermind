@@ -288,6 +288,16 @@ class WaldurCore(BaseModel):
         ],
         description="List of IP ranges that are blocked for the SDK client.",
     )
+    WEB_SHELL_ENABLED: bool = Field(
+        False,
+        description="Let staff open `waldur shell` in the browser, served by the "
+        "separate `waldur web_shell` process. Takes effect only when DEBUG is on.",
+    )
+    WEB_SHELL_URL: str = Field(
+        "",
+        description="Public URL of the page served by `waldur web_shell`, "
+        "e.g. http://localhost:18090/webshell/.",
+    )
 
     class Meta:
         public_settings: list[str] = [
@@ -551,7 +561,7 @@ class WaldurAuthSAML2(BaseModel):
     OPTIONAL_ATTRIBUTES: list[str] = Field(
         [], description="SAML attributes that may be useful to have but not required"
     )
-    SAML_ATTRIBUTE_MAPPING: dict[str, str] = Field(
+    SAML_ATTRIBUTE_MAPPING: dict[str, list[str]] = Field(
         {}, description="Mapping between SAML attributes and User fields"
     )
     ORGANIZATION: dict[str, Any] = Field(
@@ -610,14 +620,28 @@ class WaldurOpenstack(BaseModel):
     DEFAULT_SECURITY_GROUPS: tuple[
         dict[str, str | tuple[dict[str, str | int], ...]], ...
     ] = Field(
+        # Every rule has an IPv6 twin so that the groups also work in IPv6-only
+        # and dual-stack tenants. The twins are created only in a tenant with
+        # IPv6 (an IPv6 subnet of its own, or an IPv6 subnet on the external
+        # network it uses), so an IPv4-only cloud does not get IPv6 opened by
+        # default. ICMPv6 is a separate IP protocol (IANA 58), so "icmp" with
+        # an IPv6 ethertype would not match ping over IPv6.
         (
             {
                 "name": "ssh",
                 "description": "Security group for secure shell access",
                 "rules": (
                     {
+                        "ethertype": "IPv4",
                         "protocol": "tcp",
                         "cidr": "0.0.0.0/0",
+                        "from_port": 22,
+                        "to_port": 22,
+                    },
+                    {
+                        "ethertype": "IPv6",
+                        "protocol": "tcp",
+                        "cidr": "::/0",
                         "from_port": 22,
                         "to_port": 22,
                     },
@@ -628,10 +652,18 @@ class WaldurOpenstack(BaseModel):
                 "description": "Security group for ping",
                 "rules": (
                     {
+                        "ethertype": "IPv4",
                         "protocol": "icmp",
                         "cidr": "0.0.0.0/0",
                         "icmp_type": -1,
                         "icmp_code": -1,
+                    },
+                    {
+                        "ethertype": "IPv6",
+                        "protocol": "58",
+                        "cidr": "::/0",
+                        "from_port": -1,
+                        "to_port": -1,
                     },
                 ),
             },
@@ -640,8 +672,16 @@ class WaldurOpenstack(BaseModel):
                 "description": "Security group for remote desktop access",
                 "rules": (
                     {
+                        "ethertype": "IPv4",
                         "protocol": "tcp",
                         "cidr": "0.0.0.0/0",
+                        "from_port": 3389,
+                        "to_port": 3389,
+                    },
+                    {
+                        "ethertype": "IPv6",
+                        "protocol": "tcp",
+                        "cidr": "::/0",
                         "from_port": 3389,
                         "to_port": 3389,
                     },
@@ -652,21 +692,42 @@ class WaldurOpenstack(BaseModel):
                 "description": "Security group for http and https access",
                 "rules": (
                     {
+                        "ethertype": "IPv4",
                         "protocol": "tcp",
                         "cidr": "0.0.0.0/0",
                         "from_port": 80,
                         "to_port": 80,
                     },
                     {
+                        "ethertype": "IPv6",
+                        "protocol": "tcp",
+                        "cidr": "::/0",
+                        "from_port": 80,
+                        "to_port": 80,
+                    },
+                    {
+                        "ethertype": "IPv4",
                         "protocol": "tcp",
                         "cidr": "0.0.0.0/0",
+                        "from_port": 443,
+                        "to_port": 443,
+                    },
+                    {
+                        "ethertype": "IPv6",
+                        "protocol": "tcp",
+                        "cidr": "::/0",
                         "from_port": 443,
                         "to_port": 443,
                     },
                 ),
             },
         ),
-        description="Default security groups and rules created in each of the provisioned OpenStack tenants",
+        description=(
+            "Default security groups and rules created in each of the provisioned "
+            "OpenStack tenants. Rules with the IPv6 ethertype are created only in "
+            "tenants with IPv6: an IPv6 subnet of their own, or an IPv6 subnet on "
+            "the external network they use."
+        ),
     )
 
     SUBNET: dict[str, str] = Field(

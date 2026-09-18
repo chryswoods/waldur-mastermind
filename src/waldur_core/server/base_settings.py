@@ -122,6 +122,12 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_THROTTLE_RATES": {
         "oauth": "10/s",
+        # api-auth/default/init/. The probe runs on every anonymous landing on
+        # the portal root and writes nothing, so it is budgeted for a lecture
+        # hall arriving behind one NAT at once; the navigation is a sign-in
+        # attempt and does write session state. Both are per client address.
+        "oauth_probe": "120/s",
+        "oauth_default": "60/s",
         "token_exchange": "60/min",
         "matrix_credentials": "1000/hour",
         "matrix_webhook": "10000/hour",
@@ -272,16 +278,7 @@ STORAGES = {
     },
 }
 
-# Disable excessive xmlschema logging
-import logging
-
 import structlog
-
-logging.getLogger("xmlschema").propagate = False
-
-# Disable excessive Celery task registration logging
-logging.getLogger("celery.utils.imports").setLevel(logging.WARNING)
-logging.getLogger("celery.app.autodiscover").setLevel(logging.WARNING)
 
 # Processors for stdlib loggers (foreign_pre_chain) - ExtraAdder merges record.extra
 _FOREIGN_PRE_CHAIN = [
@@ -320,6 +317,11 @@ LOGGING = {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "structlog_json" if _USE_JSON_LOGS else "structlog_console",
+            # Log to stdout, not logging's stderr default. Containers are
+            # collected from stdout, and this used to be set only in the
+            # image's logging.conf.py, so a compose stack and a helm pod
+            # disagreed about which stream carried the logs.
+            "stream": "ext://sys.stdout",
         },
         "database": {
             "class": "waldur_core.logging.log.DatabaseLogHandler",
@@ -365,6 +367,24 @@ LOGGING = {
         "neutronclient": {
             "level": "ERROR",
         },
+        # xmlschema logs every parsed element at INFO.
+        "xmlschema": {
+            "propagate": False,
+        },
+        # Celery's import and boot machinery is chatty at INFO. Keep the
+        # task-level loggers at INFO and quiet the layers underneath. These
+        # carry no "handlers"/"propagate" of their own on purpose: they
+        # inherit root's, so adding a root handler later reaches them too.
+        "celery": {"level": "INFO"},
+        "celery.app": {"level": "INFO"},
+        "celery.app.autodiscover": {"level": "WARNING"},
+        "celery.app.base": {"level": "WARNING"},
+        "celery.bootsteps": {"level": "WARNING"},
+        "celery.loaders": {"level": "WARNING"},
+        "celery.utils": {"level": "WARNING"},
+        "celery.utils.functional": {"level": "WARNING"},
+        "celery.utils.imports": {"level": "WARNING"},
+        "celery.worker": {"level": "INFO"},
     },
 }
 

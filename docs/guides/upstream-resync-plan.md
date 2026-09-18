@@ -786,10 +786,39 @@ can be developed against upstream directly.
 
 ## 10. The upstream base is pinned to a release candidate
 
-This branch tracks the tag **`8.1.3-rc.8`** (`f76a0bbce`, 2026-09-01), not
+This branch tracks the tag **`8.1.3-rc.15`** (merged 2026-09-18), not
 `develop`. Merging a moving branch head is not reproducible: the same command a
 day later gives a different base, and the delta measured against it silently
 changes shape. A tag fixes that.
+
+**Moving to a newer tag: the revert trap.** The rewind onto `rc.8` was done by
+reverting the 23 commits past the tag, not by rewriting history, so
+`git merge-base HEAD <tag>` is still `b00cd9b18`. Merging a later tag then
+behaves in two ways, and only one of them is visible:
+
+* where the newer tag CHANGED a file the revert had touched, git conflicts and
+  you see it;
+* where it did NOT, git reads "they did nothing since the base, we removed it"
+  and **silently keeps the removal**.
+
+Merging `rc.15` raised 11 conflicts -- 10 of them files this fork has never
+touched, resolved by taking the tag -- and behind them left **9 files absent
+and 38 more file contents diverged**, with nothing to flag them. Two only
+surfaced by accident: `waldur_vmware/vim_utils.py` as an `ImportError` when
+`waldur` started, and openstack `Instance.metadata` as `makemigrations`
+wanting to remove a field.
+
+`scripts/resync_check_merge_completeness.sh` makes it systematic. Everything
+this fork deliberately changes is the delta between the old tag and the
+pre-merge commit; anything else differing from the new tag is a revert
+leftover. Run it after resolving conflicts, before committing:
+
+```bash
+scripts/resync_check_merge_completeness.sh 8.1.3-rc.8 8.1.3-rc.15 <pre-merge-sha>
+```
+
+Then `makemigrations --check` as well -- a silently dropped model field shows
+up there and not in the file comparison.
 
 Regenerate the audit below against the tag, not the branch:
 

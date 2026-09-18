@@ -1981,6 +1981,7 @@ Following request from {{ order_user }}, resource {{ resource_name }} has been u
 
 {% if resource_old_plan %}
 The plan has been changed from {{ resource_old_plan }} to {{ resource_plan }}.
+{% if billing_consequence %}{{ billing_consequence }}{% endif %}
 {% endif %}
 
 {% if support_email or support_phone %}
@@ -2034,6 +2035,11 @@ Response from {{ order.created_by.get_full_name }} regarding order for {{ order.
 <p>
     The plan has been changed from {{ resource_old_plan }} to {{ resource_plan }}.
 </p>
+{% if billing_consequence %}
+<p>
+    {{ billing_consequence }}
+</p>
+{% endif %}
 {% endif %}
 {% if support_email or support_phone %}
 <p>
@@ -4562,6 +4568,42 @@ This is an automated message from {{ site_name }}. Please do not reply to this e
 
 ```
 
+### notification_issue_created_message.txt (waldur_mastermind.support)
+
+```txt
+
+A new support request has been created.
+
+Request: {{ issue.key }}
+Summary: {{ issue.summary.strip }}
+Type: {{ issue.type }}
+{% if issue.priority %}Priority: {{ issue.priority }}
+{% endif %}Reported by: {{ issue.caller.full_name|default:issue.caller.username|default:"unknown" }}
+{% if issue.customer %}Organization: {{ issue.customer.name }}
+{% endif %}{% if issue.project %}Project: {{ issue.project.name }}
+{% endif %}
+Description:
+{{ issue.description.strip }}
+
+```
+
+### notification_comment_added_staff_message.html (waldur_mastermind.support)
+
+```html
+
+<p>{{ comment.author.name|default:"The requester" }} has commented on a support request.</p>
+<p><strong>Request:</strong> {{ issue.key }}<br>
+<strong>Summary:</strong> {{ issue.summary.strip }}<br>
+<strong>Status:</strong> {{ issue.status }}
+{% if issue.assignee %}<br><strong>Assignee:</strong> {{ issue.assignee.name }}{% endif %}
+{% if issue.customer %}<br><strong>Organization:</strong> {{ issue.customer.name }}{% endif %}
+{% if issue.project %}<br><strong>Project:</strong> {{ issue.project.name }}{% endif %}</p>
+<p><strong>Comment:</strong></p>
+<p>{{ comment.description.strip }}</p>
+<p><a href="{{ issue_url }}">Open the request</a></p>
+
+```
+
 ### notification_issue_updated_message.html (waldur_mastermind.support)
 
 ```html
@@ -4676,6 +4718,22 @@ This is an automated message from {{ site_name }}. Please do not reply to this e
 
 ```
 
+### notification_issue_created_subject.txt (waldur_mastermind.support)
+
+```txt
+
+[{{ issue.key }}] New support request: {{ issue.summary.strip }}
+
+```
+
+### notification_comment_added_staff_subject.txt (waldur_mastermind.support)
+
+```txt
+
+[{{ issue.key }}] New comment from {{ comment.author.name|default:"the requester" }}: {{ issue.summary.strip }}
+
+```
+
 ### provider_sla_warning_message.html (waldur_mastermind.support)
 
 ```html
@@ -4740,6 +4798,23 @@ Comment:
 
 ```
 
+### notification_issue_created_message.html (waldur_mastermind.support)
+
+```html
+
+<p>A new support request has been created.</p>
+<p><strong>Request:</strong> {{ issue.key }}<br>
+<strong>Summary:</strong> {{ issue.summary.strip }}<br>
+<strong>Type:</strong> {{ issue.type }}<br>
+{% if issue.priority %}<strong>Priority:</strong> {{ issue.priority }}<br>{% endif %}
+<strong>Reported by:</strong> {{ issue.caller.full_name|default:issue.caller.username|default:"unknown" }}
+{% if issue.customer %}<br><strong>Organization:</strong> {{ issue.customer.name }}{% endif %}
+{% if issue.project %}<br><strong>Project:</strong> {{ issue.project.name }}{% endif %}</p>
+<p><strong>Description:</strong></p>
+<p>{{ issue.description.strip }}</p>
+
+```
+
 ### provider_ticket_withdrawn_message.html (waldur_mastermind.support)
 
 ```html
@@ -4748,6 +4823,19 @@ Comment:
 <p><strong>Ticket:</strong> {{ issue.key }}<br>
 <strong>Summary:</strong> {{ issue.summary }}</p>
 <p>No further action is required on your side. If you have already opened a corresponding ticket in your system, you may close it.</p>
+
+```
+
+### notification_issue_escalated_message.html (waldur_mastermind.support)
+
+```html
+
+<p>A support request has been escalated.</p>
+<p><strong>Request:</strong> {{ issue.key }}<br>
+<strong>Summary:</strong> {{ issue.summary.strip }}
+{% if issue.customer %}<br><strong>Organization:</strong> {{ issue.customer.name }}{% endif %}</p>
+<p><strong>Reason for escalation:</strong></p>
+<p>{{ reason }}</p>
 
 ```
 
@@ -4776,6 +4864,26 @@ The issue you have created has a new comment. Please go to {{issue_url}} to see 
 ```txt
 
 [{{ issue.key }}] New ticket: {{ issue.summary }}
+
+```
+
+### notification_comment_added_staff_message.txt (waldur_mastermind.support)
+
+```txt
+
+{{ comment.author.name|default:"The requester" }} has commented on a support request.
+
+Request: {{ issue.key }}
+Summary: {{ issue.summary.strip }}
+Status: {{ issue.status }}
+{% if issue.assignee %}Assignee: {{ issue.assignee.name }}
+{% endif %}{% if issue.customer %}Organization: {{ issue.customer.name }}
+{% endif %}{% if issue.project %}Project: {{ issue.project.name }}
+{% endif %}
+Comment:
+{{ comment.description.strip }}
+
+Open the request: {{ issue_url }}
 
 ```
 
@@ -4841,6 +4949,21 @@ No further action is required on your side. If you have already opened a corresp
 ```txt
 
 {% if issue.customer.abbreviation %}{{issue.customer.abbreviation}}: {% endif %}{{issue.summary}}
+
+```
+
+### notification_issue_escalated_message.txt (waldur_mastermind.support)
+
+```txt
+
+A support request has been escalated.
+
+Request: {{ issue.key }}
+Summary: {{ issue.summary.strip }}
+{% if issue.customer %}Organization: {{ issue.customer.name }}
+{% endif %}
+Reason for escalation:
+{{ reason }}
 
 ```
 
@@ -4943,6 +5066,14 @@ Updated issue: {{issue.key}} {{issue.summary}}
 <strong>Priority:</strong> {{ issue.priority }}</p>
 <p><strong>Description:</strong></p>
 <p>{{ issue.description }}</p>
+
+```
+
+### notification_issue_escalated_subject.txt (waldur_mastermind.support)
+
+```txt
+
+[{{ issue.key }}] Escalated: {{ issue.summary.strip }}
 
 ```
 

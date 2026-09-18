@@ -46,7 +46,7 @@ from waldur_core.structure.managers import (
     get_project_users,
 )
 from waldur_mastermind.invoices import models as invoices_models
-from waldur_mastermind.marketplace import plugins
+from waldur_mastermind.marketplace import billing_mode, plugins
 from waldur_mastermind.marketplace.enums import (
     BillingTypes,
     CourseAccountState,
@@ -1700,25 +1700,17 @@ class ResourceFilter(
         if value is None:
             return queryset
         if value:
-            return queryset.filter(
-                offering__components__billing_type=BillingTypes.USAGE
-            ).distinct()
+            return queryset.filter(billing_mode.usage_resource_q()).distinct()
         else:
-            return queryset.exclude(
-                offering__components__billing_type=BillingTypes.USAGE
-            ).distinct()
+            return queryset.exclude(billing_mode.usage_resource_q()).distinct()
 
     def filter_limit_based(self, queryset: ResourceQuerySet, name, value):
         if value is None:
             return queryset
         if value:
-            return queryset.filter(
-                offering__components__billing_type=BillingTypes.LIMIT
-            ).distinct()
+            return queryset.filter(billing_mode.limit_resource_q()).distinct()
         else:
-            return queryset.exclude(
-                offering__components__billing_type=BillingTypes.LIMIT
-            ).distinct()
+            return queryset.exclude(billing_mode.limit_resource_q()).distinct()
 
     def filter_only_limit_based(self, queryset: ResourceQuerySet, name, value):
         if value is None:
@@ -2422,6 +2414,62 @@ class OfferingUserFilter(OfferingFilterMixin, core_filters.CreatedModifiedFilter
             return queryset.exclude(
                 offering__terms_of_service_configs__is_active=True
             ).distinct()
+
+
+class ServiceProviderAccountFilter(core_filters.CreatedModifiedFilter):
+    user_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="user__uuid", label="User UUID"
+    )
+    user_username = django_filters.CharFilter(
+        field_name="user__username", lookup_expr="iexact", label="User username"
+    )
+    provider_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-service-provider-detail",
+        field_name="service_provider__uuid",
+        label="Service provider UUID",
+    )
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="service_provider__customer__uuid",
+        label="Provider organization UUID",
+    )
+    is_restricted = django_filters.BooleanFilter(
+        field_name="is_restricted", label="Is restricted"
+    )
+    state = core_filters.MappedMultipleChoiceFilter(
+        OfferingUserStates.CHOICES, label="Account state"
+    )
+    runtime_state = core_filters.MappedMultipleChoiceFilter(
+        OfferingUserRuntimeStates.CHOICES, label="Account runtime state"
+    )
+
+    o = django_filters.OrderingFilter(
+        fields=(
+            "created",
+            "modified",
+            "username",
+            ("user__first_name", "user_first_name"),
+            ("user__last_name", "user_last_name"),
+        )
+    )
+    query = django_filters.CharFilter(
+        method="filter_query",
+        label="Search by username, user name, UID or primary GID",
+    )
+
+    class Meta:
+        model = models.ServiceProviderAccount
+        fields = []
+
+    def filter_query(self, queryset, name, value):
+        return queryset.filter(
+            Q(username__icontains=value)
+            | Q(user__first_name__icontains=value)
+            | Q(user__last_name__icontains=value)
+            | Q(user__username__icontains=value)
+            | Q(backend_metadata__uidnumber__icontains=value)
+            | Q(backend_metadata__primarygroup__icontains=value)
+        )
 
 
 class OfferingUserChecklistCompletionsFilter(core_filters.CreatedModifiedFilter):

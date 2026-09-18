@@ -1,5 +1,6 @@
 import logging
 from decimal import Decimal
+from functools import partial
 from typing import Any
 
 import httpx
@@ -8,7 +9,7 @@ from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
-from django.db.models import signals
+from django.db.models import F, Q, signals
 from django.template import Context, Template
 from django.utils import timezone
 from django.utils.timezone import now
@@ -37,6 +38,7 @@ from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.billing import MarketplaceBillingService
 from waldur_mastermind.marketplace.enums import (
     BASIC_OFFERING,
+    AccountSettingSources,
     BillingTypes,
     MaintenanceState,
     OfferingStates,
@@ -666,6 +668,13 @@ def switch_resource_plan_period_when_plan_is_updated(
     if instance.plan:
         callbacks.create_resource_plan_period(instance)
 
+    # Hourly usage accumulates "current value × hours since the last poll".
+    # Restart that clock at the switch so the first poll under the new plan
+    # counts only the hours that belong to it.
+    models.ComponentUsagePollRecord.objects.filter(resource=instance).update(
+        last_poll_time=now()
+    )
+
 
 def change_order_state(sender, instance, created=False, **kwargs):
     """Change the state of an order based on resource state changes."""
@@ -793,11 +802,13 @@ def sync_current_usages_from_component_usage(
     resource = instance.resource
     component_type = instance.component.type
 
+    # A month may hold one row per plan period after a plan switch; the
+    # row of the latest period is the current one.
     latest = (
         models.ComponentUsage.objects.filter(
             resource=resource, component=instance.component
         )
-        .order_by("-billing_period")
+        .order_by("-billing_period", F("plan_period__start").desc(nulls_last=True))
         .first()
     )
     if not latest:
@@ -901,7 +912,7 @@ def evaluate_usage_limit_on_resource_limit_change(
 
 
 def update_or_create_quotas(resource: Resource):
-    components_map = resource.offering.get_limit_components()
+    components_map = resource.offering.get_limit_components(resource.plan)
     for key, value in resource.limits.items():
         component = components_map.get(key)
         if component:
@@ -1513,28 +1524,38 @@ def log_offering_user_deleted(sender, instance: OfferingUser, **kwargs):
     )
 
 
-def log_offering_user_username_updated(
+def log_offering_user_fields_updated(
     sender, instance: OfferingUser, created=False, **kwargs
 ):
     if created:
         return
-    if not instance.tracker.has_changed("username"):
+
+    tracked_fields = (
+        "username",
+        "runtime_state",
+        "service_provider_comment",
+        "service_provider_comment_url",
+    )
+    changed_fields = [
+        field for field in tracked_fields if instance.tracker.has_changed(field)
+    ]
+    if not changed_fields:
         return
 
-    old_username = instance.tracker.previous("username")
-    new_username = instance.username
+    event_context = {
+        "offering_user_uuid": instance.uuid.hex,
+        "changed_fields": changed_fields,
+        "offering": instance.offering,
+        "affected_user": instance.user,
+    }
+    for field in changed_fields:
+        event_context[f"old_{field}"] = instance.tracker.previous(field) or ""
+        event_context[f"new_{field}"] = getattr(instance, field) or ""
 
     event_logger.emit(
-        "Offering user username changed for {offering_user_uuid}: '{old_username}' -> '{new_username}'.",
+        "Offering user fields changed for {offering_user_uuid}.",
         event_type=EventType.MARKETPLACE_OFFERING_USER_UPDATED,
-        event_context={
-            "offering_user_uuid": instance.uuid.hex,
-            "old_username": old_username or "",
-            "new_username": new_username or "",
-            "changed_fields": ["username"],
-            "offering": instance.offering,
-            "affected_user": instance.user,
-        },
+        event_context=event_context,
         scopes=[instance.offering, instance.offering.customer],
     )
 
@@ -1867,15 +1888,87 @@ def update_offering_user_username_after_offering_settings_change(
     ):
         return
 
+    # Compared as resolved, so dropping an option the provider already sets to
+    # the same value is not a change, and dropping one it sets differently is.
     old_plugin_options = offering.tracker.previous("plugin_options") or {}
-    new_plugin_options = offering.plugin_options or {}
-    default_policy = utils.UsernameGenerationPolicy.SERVICE_PROVIDER.value
-    old_policy = old_plugin_options.get("username_generation_policy", default_policy)
-    new_policy = new_plugin_options.get("username_generation_policy", default_policy)
-
-    if old_policy == new_policy:
+    old_settings = _username_settings(offering, plugin_options=old_plugin_options)
+    if old_settings == _username_settings(offering):
         return
 
+    _regenerate_offering_usernames(offering, "offering plugin_options change")
+
+
+#: Account settings a generated username depends on.
+USERNAME_ACCOUNT_SETTINGS = ("username_generation_policy", "username_anonymized_prefix")
+
+
+def update_offering_user_username_after_provider_settings_change(
+    sender, instance: models.ServiceProvider, created=False, **kwargs
+):
+    """Regenerate usernames on the provider's offerings that inherit a changed setting.
+
+    An offering that sets the changed setting itself is unaffected by the
+    provider value, so its usernames are left alone.
+    """
+    if created:
+        return
+
+    provider = instance
+    if not provider.tracker.has_changed("account_options"):
+        return
+    previous_options = provider.tracker.previous("account_options") or {}
+    current_options = provider.account_options or {}
+    changed = {
+        name
+        for name in USERNAME_ACCOUNT_SETTINGS
+        if previous_options.get(name) != current_options.get(name)
+    }
+    if not changed:
+        return
+
+    offerings = models.Offering.objects.filter(
+        customer_id=provider.customer_id,
+        type__in=OFFERING_USER_ALLOWED_OFFERING_TYPES,
+    ).select_related("customer__serviceprovider")
+    for offering in offerings:
+        old_values = {}
+        for name in USERNAME_ACCOUNT_SETTINGS:
+            value, source = offering.resolve_account_setting_with_source(name)
+            if name in changed and source != AccountSettingSources.OFFERING:
+                value = (
+                    previous_options.get(name)
+                    or models.Offering.ACCOUNT_SETTING_DEFAULTS[name]
+                )
+            old_values[name] = value
+        if _username_settings_from(old_values) == _username_settings(offering):
+            continue
+        _regenerate_offering_usernames(offering, "service provider settings change")
+
+
+def _username_settings_from(values: dict) -> tuple:
+    """The part of ``values`` that changes a generated username.
+
+    The anonymized prefix counts only under the anonymized policy; under any
+    other policy it is not part of the name.
+    """
+    policy = values["username_generation_policy"]
+    if policy == utils.UsernameGenerationPolicy.ANONYMIZED.value:
+        return policy, values["username_anonymized_prefix"]
+    return policy, None
+
+
+def _username_settings(offering: models.Offering, plugin_options=None) -> tuple:
+    return _username_settings_from(
+        {
+            name: offering.resolve_account_setting_with_source(
+                name, plugin_options=plugin_options
+            )[0]
+            for name in USERNAME_ACCOUNT_SETTINGS
+        }
+    )
+
+
+def _regenerate_offering_usernames(offering: models.Offering, trigger: str):
     offering_users = models.OfferingUser.objects.filter(
         offering=offering,
         state__in=[
@@ -1883,13 +1976,19 @@ def update_offering_user_username_after_offering_settings_change(
             OfferingUserStates.CREATING,
             OfferingUserStates.OK,
         ],
+        # A backed account's username is owned by its provider account and
+        # refreshed by propagation; writing it here is refused.
+        service_provider_account__isnull=True,
     )
 
     for offering_user in offering_users:
-        new_username = utils.generate_username(offering_user.user, offering)
+        new_username = utils.generate_username(
+            offering_user.user, offering, offering_user
+        )
         old_username = offering_user.username
         logger.info(
-            "OfferingUser username refresh after offering plugin_options change: offering_user_uuid=%s offering_uuid=%s old_username=%r new_username=%r affected_user_uuid=%s",
+            "OfferingUser username refresh after %s: offering_user_uuid=%s offering_uuid=%s old_username=%r new_username=%r affected_user_uuid=%s",
+            trigger,
             offering_user.uuid.hex,
             offering.uuid.hex,
             old_username,
@@ -1923,14 +2022,29 @@ def update_offering_user_username_after_user_change(sender, instance: User, **kw
     if not details.get("site_username"):
         return
 
+    # The policy may be set on the offering or defaulted by its provider, and
+    # resolve_account_setting is Python-side, so the filter selects a superset
+    # -- either names it -- and the loop confirms per row. A plain filter on
+    # plugin_options would miss every offering that inherits the policy from
+    # its provider, which is the gap provider account options introduced.
+    policy = utils.UsernameGenerationPolicy.IDENTITY_CLAIM.value
     offering_users = models.OfferingUser.objects.filter(
+        Q(offering__plugin_options__username_generation_policy=policy)
+        | Q(
+            offering__customer__serviceprovider__account_options__username_generation_policy=policy
+        ),
         user=user,
         offering__type__in=OFFERING_USER_ALLOWED_OFFERING_TYPES,
-        offering__plugin_options__username_generation_policy=utils.UsernameGenerationPolicy.IDENTITY_CLAIM.value,
-    )
+        # A backed account's username is owned by its provider account and
+        # refreshed by propagation; writing it here is refused.
+        service_provider_account__isnull=True,
+    ).select_related("offering__customer__serviceprovider")
 
     for offering_user in offering_users:
         offering = offering_user.offering
+        if offering.resolve_account_setting("username_generation_policy") != policy:
+            # The offering overrides its provider with a different policy.
+            continue
         old_username = offering_user.username
         new_username = utils.generate_username(user, offering)
         logger.info(
@@ -1966,13 +2080,30 @@ def update_offering_user_username_after_freeipa_profile_update(
     if not profile.tracker.has_changed("username") or not created:
         return
 
+    # The policy may be set on the offering or defaulted by its provider, and
+    # resolve_account_setting is Python-side, so the filter selects a superset
+    # -- either names it -- and the loop confirms per row. A plain filter on
+    # plugin_options would miss every offering that inherits the policy from
+    # its provider, which is the gap provider account options introduced.
+    policy = utils.UsernameGenerationPolicy.FREEIPA.value
     offering_users = models.OfferingUser.objects.filter(
+        Q(offering__plugin_options__username_generation_policy=policy)
+        | Q(
+            offering__customer__serviceprovider__account_options__username_generation_policy=policy
+        ),
         user=profile.user,
         is_restricted=False,
-        offering__plugin_options__username_generation_policy=utils.UsernameGenerationPolicy.FREEIPA.value,
-    )
+        # A backed account's username is owned by its provider account and
+        # refreshed by propagation; writing it here is refused.
+        service_provider_account__isnull=True,
+    ).select_related("offering__customer__serviceprovider")
 
     for offering_user in offering_users:
+        if (
+            offering_user.offering.resolve_account_setting("username_generation_policy")
+            != policy
+        ):
+            continue
         logger.info(
             "Updating %s username after FreeIPA profile %s change",
             offering_user,
@@ -2627,7 +2758,78 @@ def send_offering_user_created_message(
         ObservableObjectType.OFFERING_USER,
     )
     if messages:
-        logging_tasks.publish_messages.delay(messages)
+        transaction.on_commit(partial(logging_tasks.publish_messages.delay, messages))
+
+
+def _provider_account_payload(account, action: str) -> dict:
+    """The wire payload for one provider-account change."""
+    metadata = account.backend_metadata or {}
+    return {
+        "service_provider_account_uuid": account.uuid.hex,
+        "user_uuid": account.user.uuid.hex,
+        "username": account.username,
+        "state": account.get_state_display(),
+        "runtime_state": account.runtime_state,
+        "action": action,
+        # Unlike the per-offering event, this one carries the POSIX identity:
+        # a directory writer consuming it has no offering to read them back
+        # from, and re-fetching per account is what the agents already avoid.
+        "uidnumber": metadata.get("uidnumber"),
+        "primarygroup": metadata.get("primarygroup"),
+        "login_shell": metadata.get("loginShell"),
+        "home_directory": metadata.get("homeDir"),
+    }
+
+
+def _publish_provider_account(account, action: str) -> None:
+    messages = marketplace_utils.prepare_provider_account_messages(
+        account, _provider_account_payload(account, action)
+    )
+    if messages:
+        transaction.on_commit(partial(logging_tasks.publish_messages.delay, messages))
+
+
+def send_provider_account_created_message(
+    sender, instance: models.ServiceProviderAccount, created=False, **kwargs
+):
+    """Announce a new provider-level account."""
+    if not created or get_skip_side_effects():
+        return
+    _publish_provider_account(instance, "create")
+
+
+def send_provider_account_updated_message(
+    sender, instance: models.ServiceProviderAccount, created=False, **kwargs
+):
+    """Announce a change to a provider-level account.
+
+    Only the fields the tracker watches are worth an event; a save that touches
+    nothing a consumer can observe should not wake every queue.
+    """
+    if created or get_skip_side_effects():
+        return
+    watched = (
+        "username",
+        "state",
+        "runtime_state",
+        "is_restricted",
+        "service_provider_comment",
+        "service_provider_comment_url",
+        # A UID/GID/home change is exactly what a directory writer needs to hear.
+        "backend_metadata",
+    )
+    if not any(instance.tracker.has_changed(field) for field in watched):
+        return
+    _publish_provider_account(instance, "update")
+
+
+def send_provider_account_deleted_message(
+    sender, instance: models.ServiceProviderAccount, **kwargs
+):
+    """Announce a provider-level account going away."""
+    if get_skip_side_effects():
+        return
+    _publish_provider_account(instance, "delete")
 
 
 def send_offering_user_updated_message(
@@ -2664,7 +2866,7 @@ def send_offering_user_updated_message(
         ObservableObjectType.OFFERING_USER,
     )
     if messages:
-        logging_tasks.publish_messages.delay(messages)
+        transaction.on_commit(partial(logging_tasks.publish_messages.delay, messages))
 
 
 def send_offering_user_deleted_message(sender, instance: models.OfferingUser, **kwargs):
@@ -2689,7 +2891,7 @@ def send_offering_user_deleted_message(sender, instance: models.OfferingUser, **
         ObservableObjectType.OFFERING_USER,
     )
     if messages:
-        logging_tasks.publish_messages.delay(messages)
+        transaction.on_commit(partial(logging_tasks.publish_messages.delay, messages))
 
 
 USER_FIELD_TO_ATTRIBUTE = marketplace_utils.USER_FIELD_TO_ATTRIBUTE
@@ -2764,7 +2966,9 @@ def send_user_attribute_update_message(sender, instance, created=False, **kwargs
             offering, payload, ObservableObjectType.OFFERING_USER
         )
         if messages:
-            logging_tasks.publish_messages.delay(messages)
+            transaction.on_commit(
+                partial(logging_tasks.publish_messages.delay, messages)
+            )
 
 
 def notify_users_about_tos_update_signal(sender, instance, created, **kwargs):
@@ -3277,7 +3481,7 @@ def send_order_state_change_to_message_queue(
         order.offering, payload, ObservableObjectType.ORDER
     )
     if messages:
-        logging_tasks.publish_messages.delay(messages)
+        transaction.on_commit(partial(logging_tasks.publish_messages.delay, messages))
 
 
 def send_end_date_change_request_to_message_queue(
@@ -3315,7 +3519,7 @@ def send_end_date_change_request_to_message_queue(
         ObservableObjectType.RESOURCE_END_DATE_CHANGE_REQUEST,
     )
     if messages:
-        logging_tasks.publish_messages.delay(messages)
+        transaction.on_commit(partial(logging_tasks.publish_messages.delay, messages))
 
 
 def send_resource_state_change_to_message_queue(
@@ -3341,4 +3545,4 @@ def send_resource_state_change_to_message_queue(
         resource.offering, payload, ObservableObjectType.RESOURCE
     )
     if messages:
-        logging_tasks.publish_messages.delay(messages)
+        transaction.on_commit(partial(logging_tasks.publish_messages.delay, messages))

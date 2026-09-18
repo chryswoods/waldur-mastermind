@@ -11,6 +11,7 @@ from django.test.utils import CaptureQueriesContext
 from novaclient import exceptions as nova_exceptions
 from rest_framework import status, test
 
+from waldur_core.core import tasks as core_tasks
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.utils import serialize_instance
 from waldur_core.structure.tests import factories as structure_factories
@@ -19,6 +20,7 @@ from waldur_mastermind.marketplace_openstack.utils import (
     delete_instance,
 )
 from waldur_openstack import executors, models, views
+from waldur_openstack import tasks as openstack_tasks
 from waldur_openstack.exceptions import OpenStackBackendError
 from waldur_openstack.models import Port
 from waldur_openstack.tasks import LimitedPerTypeThrottleMixin
@@ -534,6 +536,84 @@ class InstanceCreateTest(test.APITestCase):
         instance = models.Instance.objects.get(uuid=response.data["uuid"])
         self.assertEqual(instance.floating_ips.count(), 1)
 
+    def _import_external_network(self, *ip_versions):
+        network = factories.ExternalNetworkFactory(
+            settings=self.openstack_settings,
+            backend_id=self.openstack_settings.options["external_network_id"],
+        )
+        for ip_version in ip_versions:
+            if ip_version == 6:
+                factories.ExternalSubnetFactory(
+                    network=network,
+                    ip_version=6,
+                    cidr="2001:db8::/64",
+                    gateway_ip="2001:db8::1",
+                )
+            else:
+                factories.ExternalSubnetFactory(network=network, ip_version=4)
+        return network
+
+    def test_floating_ip_allocation_is_refused_when_external_network_has_no_ipv4_subnet(
+        self,
+    ):
+        self._import_external_network(6)
+        subnet_url = factories.SubNetFactory.get_url(self.subnet)
+        data = self.get_valid_data(floating_ips=[{"subnet": subnet_url}])
+
+        response = self.create_instance(data)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("floating_ips", response.data)
+        self.assertIn("IPv6", str(response.data["floating_ips"]))
+        self.assertFalse(models.Instance.objects.filter(name="valid-name").exists())
+
+    @data((4,), (4, 6), ())
+    def test_floating_ip_allocation_is_allowed_unless_external_network_is_ipv6_only(
+        self, ip_versions
+    ):
+        self._import_external_network(*ip_versions)
+        subnet_url = factories.SubNetFactory.get_url(self.subnet)
+        data = self.get_valid_data(floating_ips=[{"subnet": subnet_url}])
+
+        response = self.create_instance(data)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        instance = models.Instance.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(instance.floating_ips.count(), 1)
+
+    def test_floating_ip_allocation_is_allowed_when_external_network_is_not_imported(
+        self,
+    ):
+        subnet_url = factories.SubNetFactory.get_url(self.subnet)
+        data = self.get_valid_data(floating_ips=[{"subnet": subnet_url}])
+
+        response = self.create_instance(data)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_existing_floating_ip_is_accepted_when_external_network_has_no_ipv4_subnet(
+        self,
+    ):
+        # An address that already exists needs no allocation from the IPv6-only
+        # network, so there is nothing for Neutron to refuse.
+        self._import_external_network(6)
+        floating_ip = factories.FloatingIPFactory(
+            tenant=self.tenant, runtime_state="DOWN", state=CoreStates.OK
+        )
+        subnet_url = factories.SubNetFactory.get_url(self.subnet)
+        data = self.get_valid_data(
+            floating_ips=[
+                {
+                    "subnet": subnet_url,
+                    "url": factories.FloatingIPFactory.get_url(floating_ip),
+                }
+            ],
+        )
+
+        response = self.create_instance(data)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
     def test_user_cannot_allocate_floating_ip_if_quota_limit_is_reached(self):
         self.tenant.set_quota_limit(self.tenant.Quotas.floating_ip_count, 0)
         subnet_url = factories.SubNetFactory.get_url(self.subnet)
@@ -898,6 +978,265 @@ class InstanceDeleteTest(test.APITransactionTestCase):
 
         # Assert
         self.assertIsInstance(signature, Signature)
+
+    def _flatten_chain_task_args(self, task):
+        args = list(task.args) if task.args else []
+        if task.kwargs:
+            args.extend(task.kwargs.values())
+        if hasattr(task, "tasks"):
+            for subtask in task.tasks:
+                args.extend(self._flatten_chain_task_args(subtask))
+        return args
+
+    def _get_chain_task_args(self, signature):
+        args = []
+        for task in signature.tasks:
+            args.extend(self._flatten_chain_task_args(task))
+        return args
+
+    def _get_delete_signature_after_pre_apply(self):
+        """Build the delete chain the same way execute() does: pre_apply first."""
+        executors.InstanceDeleteExecutor.pre_apply(self.instance)
+        self.instance.refresh_from_db()
+        return executors.InstanceDeleteExecutor.get_task_signature(
+            self.instance, serialize_instance(self.instance)
+        )
+
+    def test_delete_signature_includes_stop_after_pre_apply(self):
+        self.instance.runtime_state = models.Instance.RuntimeStates.ACTIVE
+        self.instance.save()
+
+        signature = self._get_delete_signature_after_pre_apply()
+
+        self.assertEqual(self.instance.state, CoreStates.DELETION_SCHEDULED)
+        task_args = self._get_chain_task_args(signature)
+        self.assertIn("stop_instance", task_args)
+        # Stop must not use begin_updating (illegal from DELETION_SCHEDULED).
+        self.assertNotIn("begin_updating", task_args)
+
+    def test_delete_signature_skips_stop_for_shutoff_instance(self):
+        self.instance.runtime_state = models.Instance.RuntimeStates.SHUTOFF
+        self.instance.save()
+
+        signature = self._get_delete_signature_after_pre_apply()
+
+        self.assertNotIn("stop_instance", self._get_chain_task_args(signature))
+
+    def test_active_instance_is_stopped_before_delete(self):
+        self.mock_volumes(True)
+        self.instance.runtime_state = models.Instance.RuntimeStates.ACTIVE
+        self.instance.save()
+
+        shutoff_server = mock.Mock(spec=["status"])
+        shutoff_server.status = "SHUTOFF"
+        self.mocked_nova.servers.get.side_effect = [
+            shutoff_server,
+            nova_exceptions.NotFound(code=404),
+        ]
+
+        self.delete_instance()
+
+        self.mocked_nova.servers.stop.assert_called_once_with(self.instance.backend_id)
+        self.mocked_nova.servers.delete.assert_called_once_with(
+            self.instance.backend_id
+        )
+        self.assertFalse(models.Instance.objects.filter(id=self.instance.id).exists())
+
+    def test_delete_signature_includes_backup_deletion(self):
+        factories.BackupFactory(instance=self.instance)
+
+        signature = self._get_delete_signature_after_pre_apply()
+
+        task_args = self._get_chain_task_args(signature)
+        self.assertTrue(any("openstack.backup" in str(arg) for arg in task_args))
+
+    def test_delete_signature_includes_snapshot_deletion(self):
+        volume = self.instance.volumes.first()
+        factories.SnapshotFactory(
+            tenant=self.tenant,
+            project=self.instance.project,
+            source_volume=volume,
+        )
+
+        signature = self._get_delete_signature_after_pre_apply()
+
+        task_args = self._get_chain_task_args(signature)
+        self.assertTrue(any("openstack.snapshot" in str(arg) for arg in task_args))
+
+    def test_delete_signature_skips_snapshot_deletion_for_backup_snapshots(self):
+        volume = self.instance.volumes.first()
+        backup = factories.BackupFactory(instance=self.instance)
+        snapshot = factories.SnapshotFactory(
+            tenant=self.tenant,
+            project=self.instance.project,
+            source_volume=volume,
+        )
+        backup.snapshots.add(snapshot)
+
+        self.assertEqual(
+            executors.InstanceDeleteExecutor.get_delete_snapshots_tasks(self.instance),
+            [],
+        )
+
+    def test_delete_signature_skips_backup_deletion_when_none_exist(self):
+        signature = self._get_delete_signature_after_pre_apply()
+
+        task_args = self._get_chain_task_args(signature)
+        self.assertNotIn(openstack_tasks.TERMINATION_STEP_DELETE_BACKUP, task_args)
+
+    def test_delete_signature_includes_termination_step_markers(self):
+        self.instance.runtime_state = models.Instance.RuntimeStates.ACTIVE
+        self.instance.save()
+        factories.BackupFactory(instance=self.instance)
+        volume = self.instance.volumes.first()
+        factories.SnapshotFactory(
+            tenant=self.tenant,
+            project=self.instance.project,
+            source_volume=volume,
+        )
+
+        signature = self._get_delete_signature_after_pre_apply()
+
+        task_args = self._get_chain_task_args(signature)
+        for step in (
+            openstack_tasks.TERMINATION_STEP_STOP,
+            openstack_tasks.TERMINATION_STEP_DELETE_BACKUP,
+            openstack_tasks.TERMINATION_STEP_DELETE_SNAPSHOT,
+            openstack_tasks.TERMINATION_STEP_DELETE_INSTANCE,
+        ):
+            self.assertIn(step, task_args)
+
+    def test_termination_step_marker_sets_action_details(self):
+        openstack_tasks.InstanceTerminationStepMarkerTask().execute(
+            self.instance, openstack_tasks.TERMINATION_STEP_STOP
+        )
+        self.instance.refresh_from_db()
+        self.assertEqual(
+            self.instance.action_details["termination_step"],
+            openstack_tasks.TERMINATION_STEP_STOP,
+        )
+
+    def test_delete_failure_task_prefixes_error_message(self):
+        task = openstack_tasks.InstanceDeleteFailureTask()
+
+        def set_error(instance):
+            instance.error_message = "Nova API error"
+            instance.error_traceback = "traceback"
+            instance.save(update_fields=["error_message", "error_traceback"])
+
+        self.instance.action_details = {
+            "termination_step": openstack_tasks.TERMINATION_STEP_DELETE_INSTANCE
+        }
+        self.instance.save()
+
+        with mock.patch.object(task, "save_error_message", side_effect=set_error):
+            task.execute(self.instance)
+
+        self.instance.refresh_from_db()
+        self.assertEqual(
+            self.instance.error_message,
+            "Termination failed at step 'delete_instance': Nova API error",
+        )
+        self.assertEqual(self.instance.state, CoreStates.ERRED)
+
+    def test_delete_failure_task_preserves_order_uuid_in_log(self):
+        from waldur_mastermind.marketplace import enums as marketplace_enums
+        from waldur_mastermind.marketplace.tests import (
+            factories as marketplace_factories,
+        )
+
+        resource = marketplace_factories.ResourceFactory(scope=self.instance)
+        order = marketplace_factories.OrderFactory(
+            resource=resource,
+            type=marketplace_enums.OrderTypes.TERMINATE,
+            state=marketplace_enums.OrderStates.EXECUTING,
+        )
+        self.instance.state = CoreStates.DELETION_SCHEDULED
+        self.instance.action_details = {
+            "termination_step": openstack_tasks.TERMINATION_STEP_STOP
+        }
+        self.instance.save()
+
+        task = openstack_tasks.InstanceDeleteFailureTask()
+
+        def set_error(instance):
+            instance.error_message = "backend error"
+            instance.save(update_fields=["error_message"])
+
+        with mock.patch.object(task, "save_error_message", side_effect=set_error):
+            with mock.patch.object(
+                openstack_tasks, "log_instance_termination_event"
+            ) as log_event_mock:
+                task.execute(self.instance)
+
+        order.refresh_from_db()
+        self.assertEqual(order.state, marketplace_enums.OrderStates.ERRED)
+        log_event_mock.assert_called_once()
+        self.assertEqual(
+            log_event_mock.call_args.kwargs["context"]["order_uuid"],
+            order.uuid.hex,
+        )
+
+    def test_failure_signature_uses_deletion_task_when_force(self):
+        serialized = serialize_instance(self.instance)
+        signature = executors.InstanceDeleteExecutor.get_failure_signature(
+            self.instance, serialized, force=True
+        )
+        self.assertEqual(signature.task, core_tasks.DeletionTask().si(serialized).task)
+
+    def test_failure_signature_uses_instance_delete_failure_task_when_not_force(self):
+        serialized = serialize_instance(self.instance)
+        signature = executors.InstanceDeleteExecutor.get_failure_signature(
+            self.instance, serialized, force=False
+        )
+        self.assertEqual(
+            signature.task,
+            openstack_tasks.InstanceDeleteFailureTask().s(serialized).task,
+        )
+
+    def test_force_delete_removes_instance_when_backend_delete_fails(self):
+        self.mock_volumes(True)
+        self.instance.state = CoreStates.ERRED
+        self.instance.save()
+        self.mocked_nova.servers.delete.side_effect = nova_exceptions.ClientException(
+            500
+        )
+
+        delete_instance(self.instance, is_async=False)
+
+        self.assertFalse(models.Instance.objects.filter(id=self.instance.id).exists())
+
+    def test_non_force_failure_signature_marks_instance_erred(self):
+        """Exercise the async link_error path (ErrorStateTransitionTask needs result_id).
+
+        Sync execute()'s exception branch cannot inject result_id, so we invoke the
+        failure signature the same way Celery link_error does in production.
+        """
+        self.instance.state = CoreStates.DELETION_SCHEDULED
+        self.instance.action_details = {
+            "termination_step": openstack_tasks.TERMINATION_STEP_DELETE_INSTANCE
+        }
+        self.instance.save()
+
+        serialized = serialize_instance(self.instance)
+        failure = executors.InstanceDeleteExecutor.get_failure_signature(
+            self.instance, serialized, force=False
+        )
+        fake_result_id = "00000000-0000-0000-0000-000000000001"
+        with mock.patch.object(
+            openstack_tasks.InstanceDeleteFailureTask,
+            "AsyncResult",
+            return_value=mock.Mock(result="Nova API error", traceback="tb"),
+        ):
+            failure.args = (fake_result_id,) + failure.args
+            failure.apply()
+
+        self.instance.refresh_from_db()
+        self.assertEqual(self.instance.state, CoreStates.ERRED)
+        self.assertEqual(
+            self.instance.error_message,
+            "Termination failed at step 'delete_instance': Nova API error",
+        )
 
 
 class InstanceDisabledActionsTest(test.APITestCase):
@@ -1518,6 +1857,28 @@ class InstanceUpdateFloatingIPsTest(test.APITestCase):
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         self.assertIn(self.fixture.floating_ip, self.instance.floating_ips)
 
+    def test_floating_ip_allocation_is_refused_when_external_network_has_no_ipv4_subnet(
+        self,
+    ):
+        settings = self.fixture.tenant.service_settings
+        network = factories.ExternalNetworkFactory(
+            settings=settings,
+            backend_id=settings.options["external_network_id"],
+        )
+        factories.ExternalSubnetFactory(
+            network=network,
+            ip_version=6,
+            cidr="2001:db8::/64",
+            gateway_ip="2001:db8::1",
+        )
+        data = {"floating_ips": [{"subnet": self.subnet_url}]}
+
+        response = self.client.post(self.url, data=data)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("floating_ips", response.data)
+        self.assertEqual(self.instance.floating_ips.count(), 0)
+
     def test_user_cannot_use_same_subnet_twice(self):
         data = {
             "floating_ips": [{"subnet": self.subnet_url}, {"subnet": self.subnet_url}]
@@ -1678,6 +2039,42 @@ class InstanceConsoleLogTest(InstanceActionsTest):
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertTrue("Invalid request." in response.data)
+
+    def test_length_is_read_from_query_string_on_get(self):
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.get(self.url, {"length": 10})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.mock_console.assert_called_once_with(self.instance, 10)
+
+    # The POST form exists for action-oriented clients (the Ansible collection
+    # drives every instance action as a POST). It must behave exactly like GET,
+    # taking `length` from the body instead of the query string.
+    @data("staff", "admin", "manager", "owner")
+    def test_post_is_available_for_the_same_users_as_get(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.post(self.url, {"length": 50})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, self.backend_return_value)
+        self.mock_console.assert_called_once_with(self.instance, 50)
+
+    def test_post_without_length_returns_full_log(self):
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.mock_console.assert_called_once_with(self.instance, None)
+
+    @data("user")
+    def test_post_not_available_for_users_unassociated_with_project(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.post(self.url, {"length": 50})
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.mock_console.assert_not_called()
+
+    def test_post_rejects_invalid_length(self):
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.post(self.url, {"length": "many"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.mock_console.assert_not_called()
 
 
 @ddt
@@ -1902,6 +2299,129 @@ class InstanceRescueActionTest(test.APITestCase):
         response = self.client.post(self.rescue_url, data={})
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
         self.rescue_exec.assert_not_called()
+
+
+class InstanceSetMetadataTest(test.APITestCase):
+    """set_metadata action on InstanceViewSet [#190]."""
+
+    def setUp(self):
+        self.fixture = fixtures.OpenStackFixture()
+        self.instance = self.fixture.instance
+        self.instance.state = CoreStates.OK
+        self.instance.metadata = {"env": "staging", "owner": "team-a"}
+        self.instance.save()
+        self.url = factories.InstanceFactory.get_url(
+            self.instance, action="set_metadata"
+        )
+        self.executor = mock.patch(
+            "waldur_openstack.executors.InstanceUpdateMetadataExecutor.execute"
+        ).start()
+        self.client.force_authenticate(user=self.fixture.admin)
+
+    def tearDown(self):
+        super().tearDown()
+        mock.patch.stopall()
+
+    def test_metadata_is_replaced_wholesale(self):
+        response = self.client.post(self.url, {"metadata": {"env": "prod"}})
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.instance.refresh_from_db()
+        self.assertEqual(self.instance.metadata, {"env": "prod"})
+        self.executor.assert_called_once()
+
+    def test_metadata_can_be_cleared(self):
+        response = self.client.post(self.url, {"metadata": {}}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.instance.refresh_from_db()
+        self.assertEqual(self.instance.metadata, {})
+
+    def test_metadata_is_required(self):
+        response = self.client.post(self.url, {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.executor.assert_not_called()
+
+    def test_too_many_entries_are_rejected(self):
+        metadata = {f"key-{i}": "value" for i in range(129)}
+
+        response = self.client.post(self.url, {"metadata": metadata}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.executor.assert_not_called()
+
+    def test_long_key_is_rejected(self):
+        response = self.client.post(
+            self.url, {"metadata": {"k" * 256: "value"}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_empty_key_is_rejected(self):
+        response = self.client.post(
+            self.url, {"metadata": {"": "value"}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_long_value_is_rejected(self):
+        response = self.client.post(
+            self.url, {"metadata": {"env": "v" * 256}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_whitespace_in_values_is_preserved(self):
+        # Nova stores the value verbatim, so trimming it here would make the
+        # value read back differently from what the client sent.
+        response = self.client.post(
+            self.url, {"metadata": {"note": "  padded  "}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.instance.refresh_from_db()
+        self.assertEqual(self.instance.metadata, {"note": "  padded  "})
+
+    def test_non_string_value_is_rejected(self):
+        # Nova metadata is string-to-string; a number must not be coerced.
+        response = self.client.post(
+            self.url, {"metadata": {"port": 8080}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.instance.refresh_from_db()
+        self.assertEqual(self.instance.metadata, {"env": "staging", "owner": "team-a"})
+
+    def test_action_is_rejected_in_erred_state(self):
+        self.instance.state = CoreStates.ERRED
+        self.instance.save()
+
+        response = self.client.post(
+            self.url, {"metadata": {"env": "prod"}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.executor.assert_not_called()
+
+    def test_unrelated_user_cannot_set_metadata(self):
+        self.client.force_authenticate(user=self.fixture.user)
+
+        response = self.client.post(
+            self.url, {"metadata": {"env": "prod"}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.executor.assert_not_called()
+
+    def test_metadata_is_not_editable_via_patch(self):
+        url = factories.InstanceFactory.get_url(self.instance)
+
+        response = self.client.patch(url, {"metadata": {"env": "prod"}}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.instance.refresh_from_db()
+        self.assertEqual(self.instance.metadata, {"env": "staging", "owner": "team-a"})
 
 
 class ImageRescueFilterTest(test.APITestCase):

@@ -26,6 +26,7 @@ from waldur_auth_social.const import (
 from waldur_auth_social.exceptions import OAuthException
 from waldur_auth_social.models import IdentityProvider
 from waldur_autoprovisioning.models import Rule
+from waldur_core.core import signals as core_signals
 from waldur_core.core.enums import GENDER_CHOICES
 from waldur_core.core.models import SshPublicKey, User
 from waldur_core.core.user_attributes import (
@@ -61,13 +62,13 @@ RULE_MATCH_USER_FIELDS = (
 def has_pending_invitation(email: str) -> bool:
     """Whether the email was invited, either directly or via a group invitation.
 
-    Group invitation patterns are matched with the strict matcher rather than
-    :meth:`UserDetailsMatchMixin._is_pattern_match`. The mixin matches by prefix,
-    which is fine for a convenience filter but not for an authorization decision:
-    an invitation for ``.*@example\\.com`` would otherwise also admit
-    ``attacker@example.com.evil.net`` past the uninvited-user block. This mirrors
-    what :func:`matches_allowed_email_patterns` and
-    :func:`matches_autoprovisioning_rule` already do.
+    Group invitation patterns are matched with
+    :func:`~waldur_core.core.validators.matches_access_email_pattern`, against
+    the whole address and case-insensitively. So an invitation for
+    ``.*@example\\.com`` does not admit ``attacker@example.com.evil.net`` past
+    the uninvited-user block. :func:`matches_allowed_email_patterns`,
+    :func:`matches_autoprovisioning_rule` and
+    :meth:`UserDetailsMatchMixin._is_pattern_match` all use the same matcher.
 
     A direct invitation needs no such care - it is matched by whole address.
     """
@@ -286,6 +287,39 @@ def normalize_mapped_claim_value(user_field: str, value):
     return value
 
 
+def normalize_lookup_claim_value(
+    identity_provider: IdentityProvider, claim: str, value
+) -> str | None:
+    """
+    Reduce a lookup claim to the single string stored in the lookup field.
+
+    IdPs may deliver any claim as a list (MyAccessID sends ``mail`` as one).
+    Passed through as-is, Django stringifies the list on save and on lookup,
+    so the account is keyed on its repr, e.g. ``['user@example.com']``.
+    """
+    if isinstance(value, list | tuple):
+        if not value:
+            return None
+        if len(value) > 1:
+            # Picking one value would make the lookup depend on the order the
+            # IdP happens to return them in.
+            raise OAuthException(
+                identity_provider.provider,
+                f"Unable to match user because identity claim {claim} "
+                "has multiple values.",
+            )
+        value = value[0]
+
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, int | float):
+        return str(value)
+    raise OAuthException(
+        identity_provider.provider,
+        f"Unable to match user because identity claim {claim} is not a scalar value.",
+    )
+
+
 def get_lookup_value(
     identity_provider: IdentityProvider, backend_user: dict[str, str]
 ) -> str | None:
@@ -293,7 +327,9 @@ def get_lookup_value(
     for claim in claims.split():
         claim = claim.strip()
         if claim in backend_user and claim:
-            return backend_user[claim]
+            return normalize_lookup_claim_value(
+                identity_provider, claim, backend_user[claim]
+            )
 
 
 def get_lookup_params(
@@ -375,10 +411,22 @@ def get_user_payload(
             value = backend_user.get(claim)
             if value:
                 extra_fields[claim] = value
-        if extra_fields:
-            payload["details"] = extra_fields
+        # Assigned even when empty. Skipping the assignment left the previous
+        # login's claims in place, so a claim the provider had *stopped*
+        # asserting stayed on the account for ever — invisible while `details`
+        # was only informational, but authorization is now derived from it and
+        # a withdrawn claim has to actually disappear.
+        payload["details"] = extra_fields
 
     return payload
+
+
+def oauth_registration_method(identity_provider: IdentityProvider) -> str:
+    """Map an identity provider to the User.registration_method value."""
+    registration_method = identity_provider.provider
+    if identity_provider.provider == ProviderChoices.REMOTE_EDUTEAMS:
+        registration_method = ProviderChoices.EDUTEAMS
+    return registration_method
 
 
 def create_or_update_oauth_user(
@@ -537,6 +585,11 @@ def create_or_update_oauth_user(
                 user.is_support = should_be_support
                 update_fields.add("is_support")
 
+        registration_method = oauth_registration_method(identity_provider)
+        if user.registration_method != registration_method:
+            user.registration_method = registration_method
+            update_fields.add("registration_method")
+
         if update_fields:
             user.last_sync = timezone.now()
             update_fields.add("last_sync")
@@ -578,13 +631,10 @@ def create_or_update_oauth_user(
             if "support" in roles:
                 merged_dict["is_support"] = True
 
-        registration_method = identity_provider.provider
-        if identity_provider.provider == ProviderChoices.REMOTE_EDUTEAMS:
-            registration_method = ProviderChoices.EDUTEAMS
         user = cast(
             User,
             User.objects.create_user(
-                registration_method=registration_method,
+                registration_method=oauth_registration_method(identity_provider),
                 **merged_dict,
             ),
         )
@@ -600,6 +650,14 @@ def create_or_update_oauth_user(
         user.active_isds = [source]
         user._change_source = source
         user.save()
+
+    # Identity data has landed; anything that derives authorisation from claims
+    # (auto-provisioning role reconciliation) runs off this signal. Sent on both
+    # branches: a claim can be granted or withdrawn on any subsequent login, not
+    # only when the account first appears.
+    core_signals.user_identity_synced.send(
+        sender=User, user=user, source=source, created=created
+    )
 
     return user, created
 

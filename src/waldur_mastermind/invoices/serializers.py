@@ -19,6 +19,7 @@ from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_mastermind.common.mixins import PRICE_DECIMAL_PLACES, PRICE_MAX_DIGITS
 from waldur_mastermind.common.utils import quantize_price
+from waldur_mastermind.marketplace import billing_mode
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.enums import BillingTypes
 
@@ -28,7 +29,9 @@ from . import log, models, utils
 class ResourceLimitPeriod(serializers.Serializer):
     start = serializers.CharField(help_text="Start date of the resource limit period")
     end = serializers.CharField(help_text="End date of the resource limit period")
-    quantity = serializers.IntegerField(
+    # A component may allow fractional limits, and this serializer is what the
+    # generated clients are typed from for details.resource_limit_periods.
+    quantity = serializers.FloatField(
         help_text="Quantity of resources consumed during this period"
     )
     billing_periods = serializers.IntegerField(help_text="Number of billing periods")
@@ -83,8 +86,10 @@ class InvoiceItemSerializer(serializers.HyperlinkedModelSerializer):
 
     def get_billing_type(self, item: models.InvoiceItem) -> str:
         plan_component = item.get_plan_component()
-        if plan_component:
-            return plan_component.component.billing_type
+        if plan_component and plan_component.component:
+            return billing_mode.resolve_component(
+                plan_component.component, plan_component.plan
+            ).billing_type
 
     def get_credit(self, item: models.InvoiceItem) -> bool:
         return item.credit is not None
@@ -229,8 +234,11 @@ class InvoiceItemUpdateSerializer(serializers.HyperlinkedModelSerializer):
 
         if self.instance:
             plan_component = self.instance.get_plan_component()
-            if plan_component:
-                if plan_component.component.billing_type == BillingTypes.FIXED:
+            if plan_component and plan_component.component:
+                effective = billing_mode.resolve_component(
+                    plan_component.component, plan_component.plan
+                )
+                if effective.billing_type == BillingTypes.FIXED:
                     del fields["quantity"]
                 else:
                     del fields["start"]
@@ -243,30 +251,37 @@ class InvoiceItemUpdateSerializer(serializers.HyperlinkedModelSerializer):
         """
         invoice_item = instance
         plan_component = invoice_item.get_plan_component()
-        if plan_component:
+        if plan_component and plan_component.component:
             offering_component = plan_component.component
-            if offering_component.billing_type == BillingTypes.USAGE:
+            effective = billing_mode.resolve_component(
+                offering_component, plan_component.plan
+            )
+            if effective.billing_type == BillingTypes.USAGE:
                 resource = invoice_item.resource
                 if not resource:
                     raise ValidationError(
                         _("Marketplace resource is not defined in invoice item.")
                     )
-                component_usage = (
-                    marketplace_models.ComponentUsage.objects.filter(
-                        resource=resource,
-                        component=offering_component,
-                        billing_period__year=invoice_item.invoice.year,
-                        billing_period__month=invoice_item.invoice.month,
-                    )
-                    .order_by("date")
-                    .last()
+                component_usages = marketplace_models.ComponentUsage.objects.filter(
+                    resource=resource,
+                    component=offering_component,
+                    billing_period__year=invoice_item.invoice.year,
+                    billing_period__month=invoice_item.invoice.month,
                 )
+                # After a plan switch the month holds one usage row per plan
+                # period; edit the row behind this item, not its sibling.
+                plan_period_uuid = (invoice_item.details or {}).get("plan_period_uuid")
+                if plan_period_uuid:
+                    component_usages = component_usages.filter(
+                        plan_period__uuid=plan_period_uuid
+                    )
+                component_usage = component_usages.order_by("date").last()
                 if not component_usage:
                     raise ValidationError(_("Component usage is not found."))
                 quantity = validated_data.get("quantity")
                 component_usage.usage = quantity
                 component_usage.save(update_fields=["usage"])
-            elif offering_component.billing_type == BillingTypes.FIXED:
+            elif effective.billing_type == BillingTypes.FIXED:
                 invoice_item = super().update(invoice_item, validated_data)
                 invoice_item._update_quantity()
                 return invoice_item
@@ -520,6 +535,39 @@ class InvoiceItemReportSerializer(serializers.ModelSerializer):
         return extra_kwargs
 
 
+def has_single_plan(invoice_item) -> bool:
+    return bool(
+        invoice_item.resource and invoice_item.resource.offering.plans.count() == 1
+    )
+
+
+def name_with_plan(invoice_item) -> str:
+    """The item name with the plan appended, unless the name already has it."""
+    plan_name = invoice_item.details.get("plan_name")
+    # Generated item names read "<resource> (<offering> / <plan>)...", see
+    # marketplace.billing_utils.get_invoice_item_name.
+    if not plan_name or f" / {plan_name})" in invoice_item.name:
+        return invoice_item.name
+    return f"{invoice_item.name} / {plan_name}"
+
+
+def single_plan_component_text(invoice_item) -> str:
+    """
+    "<resource> (<offering>) / <component>" for an item of a single-plan
+    offering. Resource and offering names come from the snapshot taken when the
+    item was created, so re-exporting a past month gives the same text after
+    either is renamed; the live names are only used for items without one.
+    """
+    details = invoice_item.details
+    resource = invoice_item.resource
+    resource_name = details.get("resource_name") or resource.name
+    offering_name = details.get("offering_name") or resource.offering.name
+    text = f"{resource_name} ({offering_name}) / {details['offering_component_name']}"
+    if invoice_item.name.endswith(" (Overage)"):
+        text += " (Overage)"
+    return text
+
+
 class SAPReportSerializer(serializers.Serializer):
     registrikood = serializers.ReadOnlyField(
         source="invoice.customer.registration_code"
@@ -664,17 +712,11 @@ class SAPReportSerializer(serializers.Serializer):
 
     def get_tekst_2_field(self, invoice_item):
         # If a single plan for an offering exists, skip it from display
-        if invoice_item.resource and invoice_item.resource.offering.plans.count() == 1:
+        if has_single_plan(invoice_item):
             if "offering_component_name" in invoice_item.details:
-                return (
-                    f"{invoice_item.resource.name} ({invoice_item.resource.offering.name}) / "
-                    f"{invoice_item.details['offering_component_name']}"
-                )
+                return single_plan_component_text(invoice_item)
             return invoice_item.name
-        if "plan_name" in invoice_item.details.keys():
-            return f"{invoice_item.name} / {invoice_item.details['plan_name']}"
-        else:
-            return invoice_item.name
+        return name_with_plan(invoice_item)
 
     def get_vat(self, invoice_item):
         return settings.WALDUR_INVOICES["INVOICE_REPORTING"]["SAP_PARAMS"]["KM_KOOD"]
@@ -802,13 +844,9 @@ class SAFReportSerializer(serializers.Serializer):
         return ""
 
     def get_artnimi_field(self, invoice_item: models.InvoiceItem) -> str:
-        # If a single plan for an offering exists, skip it from display
-        if invoice_item.resource and invoice_item.resource.offering.plans.count() == 1:
+        if has_single_plan(invoice_item):
             return invoice_item.name
-        if "plan_name" in invoice_item.details.keys():
-            return f"{invoice_item.name} / {invoice_item.details['plan_name']}"
-        else:
-            return invoice_item.name
+        return name_with_plan(invoice_item)
 
     def get_covered_period(self, invoice_item: models.InvoiceItem) -> str:
         first_day = self.get_first_day(invoice_item)
@@ -1329,6 +1367,7 @@ class CreateCustomerAffiliateSerializer(CustomerAffiliateSerializer):
         affiliate = self.get_from_attrs_or_instance(attrs, "affiliate")
         start_date = self.get_from_attrs_or_instance(attrs, "start_date")
         end_date = self.get_from_attrs_or_instance(attrs, "end_date")
+        is_active = self.get_from_attrs_or_instance(attrs, "is_active", True)
 
         if customer == affiliate:
             raise exceptions.ValidationError(
@@ -1340,7 +1379,26 @@ class CreateCustomerAffiliateSerializer(CustomerAffiliateSerializer):
                 {"end_date": _("End date must be after the start date.")}
             )
 
+        if is_active:
+            self.validate_single_active_link(customer)
+
         return attrs
+
+    def validate_single_active_link(self, customer):
+        active_links = models.CustomerAffiliate.objects.filter(
+            customer=customer, is_active=True
+        )
+        if self.instance:
+            active_links = active_links.exclude(pk=self.instance.pk)
+        existing = active_links.select_related("affiliate").first()
+        if existing:
+            raise exceptions.ValidationError(
+                _(
+                    "%(customer)s is already referred by %(affiliate)s. "
+                    "Deactivate that link before activating another one."
+                )
+                % {"customer": customer.name, "affiliate": existing.affiliate.name}
+            )
 
 
 class AffiliateFeeAccrualSerializer(serializers.ModelSerializer):

@@ -217,7 +217,7 @@ SAML attributes that are required to identify a user
 
 #### SAML_ATTRIBUTE_MAPPING
 
-**Type:** Mapping[str, str]
+**Type:** Mapping[str, list[str]]
 
 Mapping between SAML attributes and User fields
 
@@ -390,7 +390,9 @@ WALDUR_CORE = {'ATTACHMENT_LINK_MAX_AGE': datetime.timedelta(seconds=3600),
                                      'phone_number',
                                      'organization'],
  'USE_ATOMIC_TRANSACTION': True,
- 'VALIDATE_INVITATION_EMAIL': False}
+ 'VALIDATE_INVITATION_EMAIL': False,
+ 'WEB_SHELL_ENABLED': False,
+ 'WEB_SHELL_URL': ''}
 ```
 
 #### ATTACHMENT_LINK_MAX_AGE
@@ -765,6 +767,18 @@ Wrap action views in atomic transaction.
 
 Ensure that invitation and user emails match.
 
+#### WEB_SHELL_ENABLED
+
+**Type:** bool
+
+Let staff open `waldur shell` in the browser, served by the separate `waldur web_shell` process. Takes effect only when DEBUG is on.
+
+#### WEB_SHELL_URL
+
+**Type:** str
+
+Public URL of the page served by `waldur web_shell`, e.g. http://localhost:18090/webshell/.
+
 ### WALDUR_HPC plugin
 
 Default value:
@@ -881,30 +895,60 @@ WALDUR_OPENSTACK = {'ALLOW_CUSTOMER_USERS_OPENSTACK_CONSOLE_ACCESS': True,
                                              'access',
                               'name': 'ssh',
                               'rules': ({'cidr': '0.0.0.0/0',
+                                         'ethertype': 'IPv4',
                                          'from_port': 22,
                                          'protocol': 'tcp',
-                                         'to_port': 22},)},
+                                         'to_port': 22},
+                                        {'cidr': '::/0',
+                                         'ethertype': 'IPv6',
+                                         'from_port': 22,
+                                         'protocol': 'tcp',
+                                         'to_port': 22})},
                              {'description': 'Security group for ping',
                               'name': 'ping',
                               'rules': ({'cidr': '0.0.0.0/0',
+                                         'ethertype': 'IPv4',
                                          'icmp_code': -1,
                                          'icmp_type': -1,
-                                         'protocol': 'icmp'},)},
+                                         'protocol': 'icmp'},
+                                        {'cidr': '::/0',
+                                         'ethertype': 'IPv6',
+                                         'from_port': -1,
+                                         'protocol': '58',
+                                         'to_port': -1})},
                              {'description': 'Security group for remote '
                                              'desktop access',
                               'name': 'rdp',
                               'rules': ({'cidr': '0.0.0.0/0',
+                                         'ethertype': 'IPv4',
                                          'from_port': 3389,
                                          'protocol': 'tcp',
-                                         'to_port': 3389},)},
+                                         'to_port': 3389},
+                                        {'cidr': '::/0',
+                                         'ethertype': 'IPv6',
+                                         'from_port': 3389,
+                                         'protocol': 'tcp',
+                                         'to_port': 3389})},
                              {'description': 'Security group for http and '
                                              'https access',
                               'name': 'web',
                               'rules': ({'cidr': '0.0.0.0/0',
+                                         'ethertype': 'IPv4',
+                                         'from_port': 80,
+                                         'protocol': 'tcp',
+                                         'to_port': 80},
+                                        {'cidr': '::/0',
+                                         'ethertype': 'IPv6',
                                          'from_port': 80,
                                          'protocol': 'tcp',
                                          'to_port': 80},
                                         {'cidr': '0.0.0.0/0',
+                                         'ethertype': 'IPv4',
+                                         'from_port': 443,
+                                         'protocol': 'tcp',
+                                         'to_port': 443},
+                                        {'cidr': '::/0',
+                                         'ethertype': 'IPv6',
                                          'from_port': 443,
                                          'protocol': 'tcp',
                                          'to_port': 443})}),
@@ -939,7 +983,7 @@ Usernames that cannot be created by Waldur in OpenStack
 
 **Type:** `Tuple[dict[str, str | tuple[dict[str, str | int], ...]], ...]`
 
-Default security groups and rules created in each of the provisioned OpenStack tenants
+Default security groups and rules created in each of the provisioned OpenStack tenants. Rules with the IPv6 ethertype are created only in tenants with IPv6: an IPv6 subnet of their own, or an IPv6 subnet on the external network they use.
 
 #### MAX_CONCURRENT_PROVISION
 
@@ -1770,6 +1814,14 @@ Type of support backend. Possible values: basic, atlassian, zammad, smax.
 
 Toggler for request type displaying
 
+#### WALDUR_SUPPORT_ISSUE_KEY_PREFIX
+
+**Type:** issue_key_prefix_field
+
+**Default value:** WLD
+
+Prefix of ticket keys created by the built-in service desk, e.g. WLD in WLD-A1B2C3D4. Three to five capital latin letters. Keys of existing tickets are not rewritten.
+
 #### WALDUR_SUPPORT_PROVIDER_ROUTING_ENABLED
 
 **Type:** bool
@@ -1862,6 +1914,12 @@ Personal Access Token for user
 
 OAuth 2.0 Client ID
 
+#### ATLASSIAN_OAUTH2_CLIENT_SECRET
+
+**Type:** secret_field
+
+OAuth 2.0 Client Secret. With the client ID set, Waldur obtains and renews access tokens itself (client credentials grant).
+
 #### ATLASSIAN_OAUTH2_ACCESS_TOKEN
 
 **Type:** secret_field
@@ -1894,7 +1952,7 @@ Issue type used for request-based item processing.
 
 **Type:** str
 
-Comma-separated list of file extenstions not allowed for attachment.
+Comma-separated list of file extensions not allowed for attachment.
 
 #### ATLASSIAN_AFFECTED_RESOURCE_FIELD
 
@@ -2422,7 +2480,7 @@ If true, user email in Waldur database and in invitatation must strictly match.
 
 **Type:** bool
 
-Do not allow user to accept multiple roles within the same scope (project or organization) using invitation. When enabled, users can still accept invitations to different scopes but cannot have multiple roles in the same scope.
+Do not allow a user to hold multiple roles within the same scope (project or organization). Applies to invitations, permission requests and direct role assignment. When enabled, users can still get roles in different scopes but cannot have multiple roles in the same scope.
 
 #### ONLY_ONE_PROJECT_MANAGER
 
@@ -2626,6 +2684,34 @@ User attributes settable via inbound SCIM.
 
 Allow inbound SCIM to manage user SSH public keys via the sshPublicKeys attribute of the Waldur User extension. When enabled, SCIM is authoritative: a full-replace (PUT / PATCH replace) that omits a key deletes it, including keys the user added via the UI. Off by default because SSH keys grant access.
 
+#### SCIM_USER_MATCH_WALDUR_ATTRIBUTE
+
+**Type:** choice_field
+
+**Default value:** username
+
+Waldur user attribute that links an inbound SCIM user to an existing account. Must be username or an enabled identifying attribute. With username, new accounts are named after the matched value.
+
+#### SCIM_USER_MATCH_SCIM_ATTRIBUTE
+
+**Type:** str
+
+**Default value:** userName
+
+SCIM attribute holding the value matched against SCIM_USER_MATCH_WALDUR_ATTRIBUTE, e.g. userName, emails, or an extension path such as urn:mace:surf.nl:sram:scim:extension:User.eduPersonUniqueId.
+
+#### SRAM_INTEGRATION_ENABLED
+
+**Type:** bool
+
+Accept SCIM provisioning from SURF Research Access Management (SRAM) at /scim/v2/sram/. Also requires SCIM_INBOUND_ENABLED and a staff service-account token registered as the service's SCIM bearer token in SRAM.
+
+#### SRAM_PLACEHOLDER_ROLE_TEMPLATE
+
+**Type:** str
+
+Name of the organization role whose permissions SRAM placeholder roles copy. Empty gives placeholders no permissions. Placeholders are refreshed on the next push or by 'waldur sram_resync'.
+
 #### SCIM_PULL_API_URL
 
 **Type:** str
@@ -2687,6 +2773,14 @@ Field name from the introspection response JSON used to identify the Waldur user
 **Default value:** 300
 
 Seconds to cache successful token introspection results. Reduces load on the introspection endpoint. Set to 0 to disable caching. Default: 300 (5 minutes).
+
+#### OIDC_REGISTRATION_METHOD
+
+**Type:** str
+
+**Default value:** oidc
+
+Value stored in User.registration_method for accounts created or adopted via Bearer token introspection (OIDCAuthentication). Set to the social IdP provider slug (e.g. 'eduteams') when introspection and OAuth share the same identity provider so IdentityProvider.protected_fields apply.
 
 #### OIDC_DEFAULT_LOGOUT_URL
 
@@ -3354,7 +3448,7 @@ If true, a support ticket is created when a user adds or removes an SSH public k
 
 **Type:** multiple_choice_field
 
-**Default value:** ['resource-usage', 'user-usage', 'quotas', 'usage-monitoring', 'usage-trends', 'organization-summary', 'project-detail', 'resources-geography', 'project-classification', 'usage-by-customer', 'usage-by-org-type', 'usage-by-creator', 'call-performance', 'review-progress', 'resource-demand', 'capacity', 'provider-overview', 'provider-revenue', 'provider-orders', 'provider-resources', 'provider-customers', 'provider-offerings', 'openstack-instances', 'offering-usage', 'user-analytics', 'user-demographics', 'user-organizations', 'user-affiliations', 'user-roles', 'growth', 'revenue', 'pricelist', 'orders', 'offering-costs', 'maintenance-overview', 'provisioning-stats']
+**Default value:** ['resource-usage', 'user-usage', 'quotas', 'usage-monitoring', 'usage-trends', 'organization-summary', 'project-detail', 'resources-geography', 'project-classification', 'usage-by-customer', 'usage-by-org-type', 'usage-by-creator', 'projects-by-affiliated-organization', 'call-performance', 'review-progress', 'resource-demand', 'capacity', 'provider-overview', 'provider-revenue', 'provider-orders', 'provider-resources', 'provider-customers', 'provider-offerings', 'openstack-instances', 'offering-usage', 'user-analytics', 'user-demographics', 'user-organizations', 'user-affiliations', 'user-roles', 'growth', 'revenue', 'pricelist', 'orders', 'offering-costs', 'maintenance-overview', 'provisioning-stats']
 
 Select which reporting screens should be visible to users. Uncheck to disable specific reports.
 
@@ -3466,7 +3560,7 @@ OIDC provider URL for Matrix SSO login.
 
 **Type:** str
 
-LiveKit API key for the Element Call SFU (Calls observability tab).
+LiveKit API key for the call SFU (Calls observability tab).
 
 #### MATRIX_LIVEKIT_SECRET
 

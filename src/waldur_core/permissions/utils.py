@@ -303,7 +303,9 @@ def permission_factory(permission, sources=None):
 def get_users(scope, role_name=None):
     users = models.UserRole.objects.filter(is_active=True, scope=scope)
     if role_name:
-        users = users.filter(role__name=role_name)
+        users = users.filter(
+            Q(role__name=role_name) | Q(role__template__name=role_name)
+        )
     user_ids = users.values_list("user_id", flat=True)
     return User.objects.filter(id__in=user_ids)
 
@@ -337,7 +339,9 @@ def get_scope_ids(user, content_type, role=None, permission=None) -> QuerySet[in
             else:
                 # This is a string (like RoleEnum) - use directly
                 role_names.append(r)
-        qs = qs.filter(role__name__in=role_names)
+        qs = qs.filter(
+            Q(role__name__in=role_names) | Q(role__template__name__in=role_names)
+        )
     if permission:
         qs = qs.filter(role__permissions__permission=permission)
     return qs.order_by().values_list("object_id", flat=True).distinct()
@@ -351,11 +355,11 @@ def get_user_ids(content_type, scope_ids, role=None):
     )
     if role:
         if isinstance(role, models.Role):
-            qs = qs.filter(role=role)
+            qs = qs.filter(Q(role=role) | Q(role__template=role))
         else:
             if not isinstance(role, list | tuple):
                 role = [role]
-            qs = qs.filter(role__name__in=role)
+            qs = qs.filter(Q(role__name__in=role) | Q(role__template__name__in=role))
     return qs.values_list("user_id", flat=True)
 
 
@@ -368,17 +372,24 @@ def count_users(scope):
     )
 
 
-def has_user(scope, user, role=None, expiration_time=False):
+def has_user(scope, user, role=None, expiration_time=False, *, match_clones=True):
     """
     Checks whether user has role in entity.
     `expiration_time` can have the following values:
         - False (default) - check whether user has role in entity regardless of expiration.
         - None - check whether user has permanent role in entity.
         - Datetime object - check whether user will have role in entity at specific timestamp.
+    By default a role cloned from `role` (an organization-scoped clone, linked via
+    `Role.template`) also satisfies the check; the reverse never does. Pass
+    `match_clones=False` where role identity itself is checked, e.g. duplicate-grant
+    guards — otherwise a template holder could never be granted the clone.
     """
     qs = models.UserRole.objects.filter(is_active=True, user=user, scope=scope)
     if role:
-        qs = qs.filter(role=role)
+        if match_clones:
+            qs = qs.filter(Q(role=role) | Q(role__template=role))
+        else:
+            qs = qs.filter(role=role)
     if expiration_time is None:
         qs = qs.filter(expiration_time=None)
     elif expiration_time is not False:
@@ -472,9 +483,12 @@ def count_active_project_managers(project):
     return (
         models.UserRole.objects.filter(
             scope=project,
-            role__name=enums.RoleEnum.PROJECT_MANAGER,
             is_active=True,
             user__is_active=True,
+        )
+        .filter(
+            Q(role__name=enums.RoleEnum.PROJECT_MANAGER)
+            | Q(role__template__name=enums.RoleEnum.PROJECT_MANAGER)
         )
         .filter(Q(expiration_time=None) | Q(expiration_time__gte=now))
         .count()
@@ -488,11 +502,28 @@ def validate_only_one_project_manager(scope, role):
     if scope._meta.model_name != "project":
         return
 
-    if role.name != enums.RoleEnum.PROJECT_MANAGER:
+    is_manager_role = role.name == enums.RoleEnum.PROJECT_MANAGER or (
+        role.template_id is not None
+        and role.template.name == enums.RoleEnum.PROJECT_MANAGER
+    )
+    if not is_manager_role:
         return
 
     if count_active_project_managers(scope) >= 1:
         raise ValidationError("Project already has an active project manager.")
+
+
+def validate_single_role_per_scope(scope, user):
+    """Reject a second role in one scope when INVITATION_DISABLE_MULTIPLE_ROLES is on.
+
+    Unlike the duplicate-grant guard in ``validate_role_grant``, this counts any
+    active role the user holds in ``scope``, not only the one being granted.
+    """
+    if not config.INVITATION_DISABLE_MULTIPLE_ROLES:
+        return
+
+    if has_user(scope, user):
+        raise ValidationError("User already has role within this scope.")
 
 
 def check_grant_policy(scope, role):
@@ -563,7 +594,7 @@ def validate_role_grant(scope, user, role, expiration_time=None):
     same invariants. Permission/auth checks stay with the caller — this helper
     only validates the (scope, user, role) triple.
     """
-    if has_user(scope, user, role, expiration_time=expiration_time):
+    if has_user(scope, user, role, expiration_time=expiration_time, match_clones=False):
         raise ValidationError("User has already the same role in this scope.")
 
     if not isinstance(scope, role.content_type.model_class()):
@@ -576,6 +607,7 @@ def validate_role_grant(scope, user, role, expiration_time=None):
 
     check_grant_policy(scope, role)
 
+    validate_single_role_per_scope(scope, user)
     validate_only_one_project_manager(scope, role)
     validate_user_restrictions(scope, user)
 
@@ -614,13 +646,47 @@ def ensure_unique_role_name(name, exclude_id=None):
     return f"{name}-{index}"
 
 
-def add_user(scope, user, role, created_by=None, expiration_time=None, force=False):
+# Prefixes of ``UserRole.source`` values whose grants and revocations must not
+# email anyone: machine-driven membership syncs that would otherwise notify on
+# every change. The events are still logged. Apps register their prefixes in
+# ``AppConfig.ready``.
+QUIET_GRANT_SOURCE_PREFIXES: set[str] = set()
+
+
+def register_quiet_grant_source(prefix: str) -> None:
+    QUIET_GRANT_SOURCE_PREFIXES.add(prefix)
+
+
+def is_quiet_grant_source(source: str) -> bool:
+    return bool(source) and any(
+        source.startswith(prefix) for prefix in QUIET_GRANT_SOURCE_PREFIXES
+    )
+
+
+def add_user(
+    scope,
+    user,
+    role,
+    created_by=None,
+    expiration_time=None,
+    force=False,
+    source="",
+    reason=None,
+):
     """Grant ``role`` to ``user`` on ``scope`` (low-level write primitive).
 
     Enforces the org-scoping policy (:func:`check_grant_policy`) so direct
     callers that bypass ``validate_role_grant`` still respect availability and
     concealment. Pass ``force=True`` for the few internal grants that must bypass
     the policy (e.g. onboarding's initial owner grant).
+
+    ``source`` records the provenance of a machine-issued grant (e.g.
+    ``rule:<uuid>``) and is what makes automatic revocation safe: reconciliation
+    only ever touches rows it recognises as its own. ``reason`` is carried into
+    the audit event, so an automatic grant can say what caused it instead of the
+    generic "System-initiated role assignment". Both are appended last on
+    purpose — several callers pass ``created_by`` and ``expiration_time``
+    positionally.
     """
     if not force:
         check_grant_policy(scope, role)
@@ -632,16 +698,20 @@ def add_user(scope, user, role, created_by=None, expiration_time=None, force=Fal
         object_id=scope.id,
         expiration_time=expiration_time,
         created_by=created_by,
+        source=source,
     )
     signals.role_granted.send(
         sender=models.UserRole,
         instance=permission,
         current_user=created_by,
+        reason=reason,
     )
     return permission
 
 
-def add_user_or_skip(scope, user, role, created_by=None, expiration_time=None):
+def add_user_or_skip(
+    scope, user, role, created_by=None, expiration_time=None, source="", reason=None
+):
     """Grant ``role`` respecting the org-scoping policy, skipping on rejection.
 
     For non-interactive callers — signal handlers, auto-provisioning, group sync,
@@ -651,7 +721,13 @@ def add_user_or_skip(scope, user, role, created_by=None, expiration_time=None):
     """
     try:
         return add_user(
-            scope, user, role, created_by=created_by, expiration_time=expiration_time
+            scope,
+            user,
+            role,
+            created_by=created_by,
+            expiration_time=expiration_time,
+            source=source,
+            reason=reason,
         )
     except ValidationError as exc:
         logger.warning(

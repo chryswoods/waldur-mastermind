@@ -676,6 +676,11 @@ class WorkflowStepValidationTest(test.APITestCase):
         payload = {"step": "panel_review", "is_enabled": True}
         response = self.client.post(url, payload, format="json")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        # The call manager reads this verbatim, so it must name the step
+        # rather than dump the catalog entry's repr.
+        message = str(response.data)
+        self.assertIn("requires 'Expert review' to be enabled", message)
+        self.assertNotIn("WorkflowStepDefinition", message)
 
     def test_panel_review_allowed_when_expert_review_enabled(self):
         factories.CallWorkflowStepFactory(
@@ -1024,7 +1029,7 @@ class WorkflowStepPanelMemberTest(test.APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
 
-class WorkflowStepActiveUniqueConstraintTest(test.APITransactionTestCase):
+class WorkflowStepActiveUniqueConstraintTest(test.APITestCase):
     """At most one workflow step instance per proposal may be ACTIVE at a time."""
 
     def setUp(self):

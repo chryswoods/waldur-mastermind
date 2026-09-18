@@ -12,11 +12,13 @@ from django.test import override_settings, testcases
 from django.test import utils as django_test
 from django.utils import timezone
 from freezegun import freeze_time
+from waldur_api_client.models.offering_user import OfferingUser
 
 from waldur_auth_social.const import ProviderChoices
 from waldur_core.core import models as core_models
 from waldur_core.core.enums import ReviewStates
 from waldur_core.core.utils import format_text, serialize_instance
+from waldur_core.logging.models import Event
 from waldur_core.permissions.enums import RoleEnum
 from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.structure.tests.factories import (
@@ -30,6 +32,8 @@ from waldur_mastermind.marketplace.enums import (
     REMOTE_OFFERING,
     MissingUsagePolicies,
     OfferingStates,
+    OfferingUserRuntimeStates,
+    OfferingUserStates,
     OrderStates,
     OrderTypes,
     ResourceStates,
@@ -649,6 +653,38 @@ class OfferingUserPullTest(testcases.TransactionTestCase):
             [{"user_username": "alice@myaccessid.org", "username": "alice"}]
         )
         tasks.OfferingUserPullTask().pull(self.offering)
+
+    def test_a_backed_account_is_not_renamed_by_the_remote(self):
+        """Under provider scope the local name comes from the provider account,
+        so it will routinely differ from the remote's. Writing it here raised
+        every hour inside the Celery task once the model started refusing
+        delegated writes.
+        """
+        from waldur_mastermind.marketplace.enums import AccountScopes
+        from waldur_mastermind.marketplace.tests import (
+            factories as marketplace_factories,
+        )
+
+        user = UserFactory(username="alice@myaccessid.org")
+        provider = marketplace_factories.ServiceProviderFactory(
+            customer=self.offering.customer
+        )
+        provider.account_options["account_scope"] = AccountScopes.PROVIDER
+        provider.save()
+        account = models.ServiceProviderAccount.objects.create(
+            service_provider=provider, user=user, username="owned_by_provider"
+        )
+        offering_user = models.OfferingUser.objects.create(
+            offering=self.offering, user=user, service_provider_account=account
+        )
+        self.mock_offering_users(
+            [{"user_username": "alice@myaccessid.org", "username": "alice"}]
+        )
+
+        tasks.OfferingUserPullTask().pull(self.offering)
+
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.username, "owned_by_provider")
 
     def test_missing_offering_user_is_created_if_there_is_user_in_local_db(self):
         user = UserFactory(username="alice@myaccessid.org")
@@ -1413,6 +1449,257 @@ class OfferingUserListPullTaskTest(testcases.TransactionTestCase):
         pulled_objects = list(task.get_pulled_objects())
 
         self.assertNotIn(self.offering_with_option, pulled_objects)
+
+
+class RemoteOfferingUserRuntimeMetadataTest(testcases.SimpleTestCase):
+    def test_extracts_typed_runtime_metadata_fields(self):
+        remote_offering_user = OfferingUser.from_dict(
+            {
+                "user_username": "alice@example.com",
+                "username": "alice",
+                "runtime_state": "Pending account linking",
+                "service_provider_comment": "Please link your account",
+                "service_provider_comment_url": "https://help.example.com/link",
+            }
+        )
+
+        self.assertEqual(
+            utils._remote_offering_user_runtime_metadata(remote_offering_user),
+            {
+                "runtime_state": "Pending account linking",
+                "service_provider_comment": "Please link your account",
+                "service_provider_comment_url": "https://help.example.com/link",
+            },
+        )
+
+    def test_omits_unset_runtime_metadata_fields(self):
+        remote_offering_user = OfferingUser.from_dict(
+            {
+                "user_username": "alice@example.com",
+                "username": "alice",
+            }
+        )
+
+        self.assertEqual(
+            utils._remote_offering_user_runtime_metadata(remote_offering_user), {}
+        )
+
+    def test_includes_empty_comment_fields_when_remote_sets_blank_strings(self):
+        remote_offering_user = OfferingUser.from_dict(
+            {
+                "user_username": "alice@example.com",
+                "username": "alice",
+                "service_provider_comment": "",
+                "service_provider_comment_url": "",
+            }
+        )
+
+        self.assertEqual(
+            utils._remote_offering_user_runtime_metadata(remote_offering_user),
+            {
+                "service_provider_comment": "",
+                "service_provider_comment_url": "",
+            },
+        )
+
+
+class OfferingUserPullTaskRuntimeMetadataTest(testcases.TransactionTestCase):
+    def setUp(self):
+        self.api_url = "https://example.com"
+        self.offering = factories.OfferingFactory(
+            type=REMOTE_OFFERING,
+            secret_options={"api_url": self.api_url, "token": "token"},
+            backend_id=uuid.uuid4().hex,
+        )
+        self.user = UserFactory(username="alice@example.com")
+        self.offering_user = models.OfferingUser.objects.create(
+            user=self.user,
+            offering=self.offering,
+            username="alice",
+        )
+
+    def mock_offering_users(self, users):
+        respx.get(f"{self.api_url}/api/marketplace-offering-users/").respond(
+            200, json=users
+        )
+
+    @respx.mock
+    def test_pull_requests_sparse_offering_user_fieldset(self):
+        route = respx.get(f"{self.api_url}/api/marketplace-offering-users/").respond(
+            200,
+            json=[
+                {
+                    "user_username": "alice@example.com",
+                    "username": "alice",
+                    "runtime_state": OfferingUserRuntimeStates.ACTIVE,
+                }
+            ],
+        )
+
+        tasks.OfferingUserPullTask().pull(self.offering)
+
+        request_url = str(route.calls[0].request.url)
+        self.assertIn("field=user_username", request_url)
+        self.assertIn("field=username", request_url)
+        self.assertIn("field=runtime_state", request_url)
+        self.assertIn("field=service_provider_comment", request_url)
+        self.assertIn("field=service_provider_comment_url", request_url)
+
+    @respx.mock
+    def test_runtime_state_and_comments_are_synced_from_remote(self):
+        self.mock_offering_users(
+            [
+                {
+                    "user_username": "alice@example.com",
+                    "username": "alice",
+                    "runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+                    "service_provider_comment": "Please link your account",
+                    "service_provider_comment_url": "https://help.example.com/link",
+                }
+            ]
+        )
+
+        tasks.OfferingUserPullTask().pull(self.offering)
+        self.offering_user.refresh_from_db()
+
+        self.assertEqual(
+            self.offering_user.runtime_state,
+            OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+        )
+        self.assertEqual(
+            self.offering_user.service_provider_comment, "Please link your account"
+        )
+        self.assertEqual(
+            self.offering_user.service_provider_comment_url,
+            "https://help.example.com/link",
+        )
+
+    @respx.mock
+    def test_pull_emits_single_audit_event_when_runtime_metadata_changes(self):
+        baseline = Event.objects.filter(
+            event_type="marketplace_offering_user_updated"
+        ).count()
+        self.mock_offering_users(
+            [
+                {
+                    "user_username": "alice@example.com",
+                    "username": "alice",
+                    "runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+                    "service_provider_comment": "Please link your account",
+                    "service_provider_comment_url": "https://help.example.com/link",
+                }
+            ]
+        )
+
+        tasks.OfferingUserPullTask().pull(self.offering)
+
+        self.assertEqual(
+            Event.objects.filter(event_type="marketplace_offering_user_updated").count()
+            - baseline,
+            1,
+        )
+        event = (
+            Event.objects.filter(event_type="marketplace_offering_user_updated")
+            .order_by("-created")
+            .first()
+        )
+        self.assertEqual(
+            event.context["changed_fields"],
+            [
+                "runtime_state",
+                "service_provider_comment",
+                "service_provider_comment_url",
+            ],
+        )
+        self.assertEqual(
+            event.context["offering_user_uuid"], self.offering_user.uuid.hex
+        )
+
+    @respx.mock
+    def test_unchanged_runtime_metadata_is_not_saved(self):
+        self.offering_user.runtime_state = (
+            OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING
+        )
+        self.offering_user.service_provider_comment = "Existing comment"
+        self.offering_user.service_provider_comment_url = "https://example.com/existing"
+        self.offering_user.save(
+            update_fields=[
+                "runtime_state",
+                "service_provider_comment",
+                "service_provider_comment_url",
+            ]
+        )
+        self.mock_offering_users(
+            [
+                {
+                    "user_username": "alice@example.com",
+                    "username": "alice",
+                    "runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+                    "service_provider_comment": "Existing comment",
+                    "service_provider_comment_url": "https://example.com/existing",
+                }
+            ]
+        )
+
+        with mock.patch.object(models.OfferingUser, "save", autospec=True) as save_mock:
+            tasks.OfferingUserPullTask().pull(self.offering)
+
+        save_mock.assert_not_called()
+
+    @respx.mock
+    def test_deleted_local_offering_user_is_not_updated(self):
+        self.offering_user.state = OfferingUserStates.DELETED
+        self.offering_user.save(update_fields=["state"])
+        self.mock_offering_users(
+            [
+                {
+                    "user_username": "alice@example.com",
+                    "username": "alice",
+                    "runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+                    "service_provider_comment": "Please link your account",
+                    "service_provider_comment_url": "https://help.example.com/link",
+                }
+            ]
+        )
+
+        tasks.OfferingUserPullTask().pull(self.offering)
+        self.offering_user.refresh_from_db()
+
+        self.assertEqual(
+            self.offering_user.runtime_state, OfferingUserRuntimeStates.ACTIVE
+        )
+        self.assertEqual(self.offering_user.service_provider_comment, "")
+
+    @respx.mock
+    def test_new_remote_user_gets_runtime_metadata_on_create(self):
+        remote_user = UserFactory(username="bob@example.com")
+        self.mock_offering_users(
+            [
+                {
+                    "user_username": "alice@example.com",
+                    "username": "alice",
+                    "runtime_state": OfferingUserRuntimeStates.ACTIVE,
+                },
+                {
+                    "user_username": remote_user.username,
+                    "username": "bob",
+                    "runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+                    "service_provider_comment": "Link account",
+                    "service_provider_comment_url": "https://help.example.com",
+                },
+            ]
+        )
+
+        tasks.OfferingUserPullTask().pull(self.offering)
+
+        offering_user = models.OfferingUser.objects.get(
+            user=remote_user, offering=self.offering
+        )
+        self.assertEqual(
+            offering_user.runtime_state,
+            OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+        )
+        self.assertEqual(offering_user.service_provider_comment, "Link account")
 
 
 @override_settings(

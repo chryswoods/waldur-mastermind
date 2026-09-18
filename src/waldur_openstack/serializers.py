@@ -5,6 +5,7 @@ import re
 from ipaddress import (
     AddressValueError,
     IPv4Network,
+    IPv6Network,
     NetmaskValueError,
     ip_address,
     ip_network,
@@ -43,7 +44,9 @@ from waldur_core.quotas.models import SharedQuotaMixin
 from waldur_core.quotas.serializers import QuotaSerializer
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import serializers as structure_serializers
+from waldur_openstack.enums import VALID_ROUTER_INTERFACE_OWNERS
 from waldur_openstack.utils import (
+    get_no_ipv4_external_network_message,
     get_tenant_external_networks,
     get_valid_availability_zones,
     is_flavor_valid_for_tenant,
@@ -51,6 +54,7 @@ from waldur_openstack.utils import (
     is_openstack_service_provider,
     is_valid_volume_type_name,
     is_volume_type_valid_for_tenant,
+    tenant_has_ipv6,
     volume_type_name_to_quota_name,
 )
 
@@ -208,7 +212,9 @@ class OpenStackServiceSerializer(structure_serializers.ServiceOptionsSerializer)
         source="options.console_domain_override",
         label=_("Console domain override"),
         help_text=_(
-            "Override of the console URL domain. Supports hostname (e.g. lb.example.com) or hostname:port (e.g. lb.example.com:443)."
+            "Override of the console URL domain. Supports hostname (e.g. lb.example.com), hostname:port (e.g. lb.example.com:443), "
+            "an IPv6 address (e.g. 2001:db8::20 or [2001:db8::20]) or a bracketed IPv6 address with port (e.g. [2001:db8::20]:443). "
+            "Without a port, the console's own port is kept."
         ),
         required=False,
     )
@@ -713,6 +719,8 @@ class OpenStackFloatingIPSerializer(structure_serializers.BaseResourceActionSeri
                             )
                         }
                     )
+
+        _validate_floating_ip_can_be_allocated(tenant)
 
         return super().validate(attrs)
 
@@ -1311,6 +1319,43 @@ def validate_private_subnet_cidr(value):
     return validate_private_cidr(value, 24)
 
 
+def parse_subnet_cidr(value):
+    """The network a subnet CIDR names, in either family.
+
+    Neutron requires the prefix length to be written out, so an address without
+    one -- which ``ip_network`` would read as a /32 or /128 -- is refused here
+    instead of by Neutron after the subnet was already created. Host bits are
+    tolerated, as Neutron tolerates them.
+    """
+    message = _(
+        "Enter a network address in CIDR format with a prefix length, "
+        "e.g. 192.168.42.0/24 or 2001:db8::/64."
+    )
+    if not isinstance(value, str) or "/" not in value:
+        raise serializers.ValidationError(message)
+    try:
+        return ip_network(value, strict=False)
+    except ValueError:
+        raise serializers.ValidationError(message)
+
+
+def validate_default_subnet_cidr(value):
+    """The CIDR of the subnet a new tenant gets by default.
+
+    An order cannot carry IPv6 address modes, so an IPv6 default subnet uses
+    SLAAC, which Neutron only allows on a /64.
+    """
+    network = parse_subnet_cidr(value)
+    if network.version == 6 and network.prefixlen != 64:
+        raise serializers.ValidationError(
+            _(
+                "An IPv6 default subnet uses SLAAC, which needs a /64 prefix, "
+                "because instances build their address from it."
+            )
+        )
+    return value
+
+
 class OpenStackTenantSecurityGroupSerializer(serializers.Serializer):
     name = serializers.CharField()
     description = serializers.CharField(required=False, allow_blank=True)
@@ -1406,6 +1451,12 @@ class OpenStackTenantSerializer(structure_serializers.BaseResourceSerializer):
                     del fields[field]
 
         return fields
+
+    def validate_subnet_cidr(self, value):
+        # A marketplace order is validated by this serializer too, so a CIDR
+        # Neutron would refuse is rejected when the order is placed instead
+        # of leaving an ERRED order and a half-created tenant behind.
+        return validate_default_subnet_cidr(value)
 
     def validate_security_groups_configuration(self, attrs):
         security_groups = attrs.get("security_groups")
@@ -1564,6 +1615,8 @@ class OpenStackTenantSerializer(structure_serializers.BaseResourceSerializer):
                     project=tenant.project,
                     mtu=mtu,
                 )
+                ip_version = ip_network(subnet_cidr, strict=False).version
+                ipv6_mode = models.SubNet.Ipv6Modes.SLAAC if ip_version == 6 else None
                 models.SubNet.objects.create(
                     name=slugified_name + "-sub-net",
                     description=_("SubNet for tenant %s internal network")
@@ -1573,7 +1626,18 @@ class OpenStackTenantSerializer(structure_serializers.BaseResourceSerializer):
                     service_settings=tenant.service_settings,
                     project=tenant.project,
                     cidr=subnet_cidr,
-                    dns_nameservers=service_settings.options.get("dns_nameservers", []),
+                    ip_version=ip_version,
+                    ipv6_ra_mode=ipv6_mode,
+                    ipv6_address_mode=ipv6_mode,
+                    # Neutron rejects a nameserver of the other family, and the
+                    # defaults are usually IPv4 resolvers.
+                    dns_nameservers=[
+                        nameserver
+                        for nameserver in service_settings.options.get(
+                            "dns_nameservers", []
+                        )
+                        if _ip_version_of(nameserver) == ip_version
+                    ],
                 )
             self.create_default_security_groups(tenant, security_groups_data)
 
@@ -1600,6 +1664,9 @@ class OpenStackTenantSerializer(structure_serializers.BaseResourceSerializer):
         config_groups = copy.deepcopy(
             plugin_settings.get("DEFAULT_SECURITY_GROUPS", [])
         )
+        # IPv6 is not opened by default in a tenant that has no IPv6 network.
+        # Groups sent in the request are created as given, above.
+        has_ipv6 = tenant_has_ipv6(tenant)
 
         for group in config_groups:
             sg_name = group.get("name")
@@ -1613,6 +1680,11 @@ class OpenStackTenantSerializer(structure_serializers.BaseResourceSerializer):
             )[0]
 
             for rule in group.get("rules"):
+                if (
+                    rule.get("ethertype") == models.SecurityGroupRule.IPv6
+                    and not has_ipv6
+                ):
+                    continue
                 if "icmp_type" in rule:
                     rule["from_port"] = rule.pop("icmp_type")
                 if "icmp_code" in rule:
@@ -1641,6 +1713,12 @@ class OpenStackSubNetAllocationPoolField(serializers.JSONField):
 
 class OpenStackNestedSubNetSerializer(serializers.ModelSerializer):
     allocation_pools = OpenStackSubNetAllocationPoolField(read_only=True)
+    ipv6_ra_mode = serializers.ChoiceField(
+        choices=models.SubNet.Ipv6Modes.CHOICES, read_only=True, allow_null=True
+    )
+    ipv6_address_mode = serializers.ChoiceField(
+        choices=models.SubNet.Ipv6Modes.CHOICES, read_only=True, allow_null=True
+    )
     # Projected from the parent Network; Neutron owns this flag at the network level.
     port_security_enabled = serializers.BooleanField(
         source="network.port_security_enabled", read_only=True
@@ -1656,6 +1734,8 @@ class OpenStackNestedSubNetSerializer(serializers.ModelSerializer):
             "gateway_ip",
             "allocation_pools",
             "ip_version",
+            "ipv6_ra_mode",
+            "ipv6_address_mode",
             "enable_dhcp",
             "port_security_enabled",
         )
@@ -1989,22 +2069,70 @@ _MAC_ADDRESS_RE = re.compile(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
 _AAP_MAX_ENTRIES = 64
 
 
-class AllowedAddressPairEntrySerializer(serializers.Serializer):
-    """One {ip_address, mac_address?} entry. Used by the set action.
+# Unique local addresses, the IPv6 counterpart of the RFC 1918 ranges.
+_IPV6_UNIQUE_LOCAL = IPv6Network("fc00::/7")
+# Ranges no IPv6 pair may overlap, whatever the port's subnets are. A broad
+# prefix such as ::/0 or 8000::/1 overlaps at least one of them.
+_IPV6_PAIR_FORBIDDEN = (
+    (IPv6Network("::/128"), _("the unspecified address")),
+    (IPv6Network("::1/128"), _("the loopback address")),
+    (IPv6Network("::ffff:0:0/96"), _("IPv4-mapped addresses")),
+    (IPv6Network("fe80::/10"), _("link-local addresses")),
+    (IPv6Network("ff00::/8"), _("multicast addresses")),
+)
 
-    Reuses ``validate_private_cidr`` to enforce that the spoofable range
-    is bounded to RFC1918 — accepting ``0.0.0.0/0``, the port's subnet
-    gateway, link-local, multicast, or public IPs would let a port
-    impersonate the upstream router, metadata service, or other
-    tenants' fixed IPs (the textbook AAP-escalation attack the
-    instance-level path explicitly guards against).
+
+def validate_address_pair_ip(value):
+    """The ``ip_address`` of one allowed address pair, as a normalised CIDR.
+
+    IPv4 is bounded to RFC 1918 by ``validate_private_cidr``. IPv6 has no
+    private range that every cloud uses, so here it only has to stay clear of
+    the special-purpose ranges; whether it is a unique local address or lies in
+    one of the port's own subnets needs the port, and is checked by
+    ``validate_pairs_for_port``.
+    """
+    try:
+        network = ip_network(value, strict=True)
+    except (TypeError, ValueError):
+        raise serializers.ValidationError(
+            _("Enter a valid IPv4 or IPv6 address or network in CIDR format.")
+        )
+    if network.version == 4:
+        return validate_private_cidr(value)
+    for forbidden, description in _IPV6_PAIR_FORBIDDEN:
+        if network.overlaps(forbidden):
+            raise serializers.ValidationError(
+                _("%(pair)s overlaps %(range)s, %(description)s.")
+                % {
+                    "pair": network.with_prefixlen,
+                    "range": forbidden.with_prefixlen,
+                    "description": description,
+                }
+            )
+    return network.with_prefixlen
+
+
+class AllowedAddressPairEntrySerializer(serializers.Serializer):
+    """One {ip_address, mac_address?} entry, for both the port action and the
+    instance action.
+
+    The spoofable range is bounded -- to RFC 1918 for IPv4, to unique local
+    addresses or the tenant's own subnets for IPv6 -- because accepting
+    ``0.0.0.0/0``, ``::/0``, link-local, multicast, or public addresses would
+    let a port impersonate the upstream router, the metadata service, or other
+    tenants' fixed IPs, the textbook allowed-address-pairs escalation. Neutron
+    leaves this to the caller: its default policy lets any member who owns the
+    network set any range, and it only documents that ``0.0.0.0/0`` bypasses
+    source-restricted security group rules for every port sharing the group
+    (Neutron bug 1793029). What needs the port -- the IPv6 scope and the
+    router addresses on its subnets -- is checked by ``validate_pairs_for_port``.
     """
 
     ip_address = serializers.CharField()
     mac_address = serializers.CharField(required=False, allow_blank=True)
 
     def validate_ip_address(self, value):
-        return validate_private_cidr(value)
+        return validate_address_pair_ip(value)
 
     def validate_mac_address(self, value):
         if not value:
@@ -2016,29 +2144,185 @@ class AllowedAddressPairEntrySerializer(serializers.Serializer):
         return value.lower()
 
 
+def validate_address_pair_list(pairs):
+    """List-level rules for validated entries, shared by the port action and
+    the instance action. Returns plain dicts without a blank MAC, which Neutron
+    would reject; an omitted MAC means the port's own."""
+    if len(pairs) > _AAP_MAX_ENTRIES:
+        raise serializers.ValidationError(
+            _("At most {limit} address pairs are supported per port.").format(
+                limit=_AAP_MAX_ENTRIES
+            )
+        )
+    cleaned = []
+    seen = set()
+    for entry in pairs:
+        entry = {key: value for key, value in dict(entry).items() if value != ""}
+        key = (entry.get("ip_address"), entry.get("mac_address") or "")
+        if key in seen:
+            raise serializers.ValidationError(
+                _("Duplicate address pair entries are not allowed.")
+            )
+        seen.add(key)
+        cleaned.append(entry)
+    return cleaned
+
+
+def _port_subnets(port: models.Port):
+    """Every subnet the port has an address on."""
+    subnet_ids = {
+        fixed_ip.get("subnet_id")
+        for fixed_ip in port.fixed_ips or []
+        if isinstance(fixed_ip, dict) and fixed_ip.get("subnet_id")
+    }
+    subnets = list(
+        models.SubNet.objects.filter(
+            network_id=port.network_id, backend_id__in=subnet_ids
+        )
+    )
+    if port.subnet_id and all(subnet.pk != port.subnet_id for subnet in subnets):
+        subnets.append(port.subnet)
+    return subnets
+
+
+def _router_addresses(port: models.Port, subnets):
+    """Addresses a router answers on next to the port, each with what it is.
+
+    The gateway is only the first router: another one attached with
+    add_router_interface sits on some other address of the subnet, and a host
+    route points instances at its next hop.
+    """
+    addresses = []
+
+    def add(value, description):
+        try:
+            addresses.append((ip_address(value), description))
+        except ValueError:
+            pass
+
+    for subnet in subnets:
+        if subnet.gateway_ip:
+            add(subnet.gateway_ip, _("the subnet gateway"))
+        for route in subnet.host_routes or []:
+            if isinstance(route, dict) and route.get("nexthop"):
+                add(route["nexthop"], _("the next hop of a host route"))
+    network_ids = {subnet.network_id for subnet in subnets} | {port.network_id}
+    router_ports = models.Port.objects.filter(
+        network_id__in=network_ids - {None},
+        device_owner__in=VALID_ROUTER_INTERFACE_OWNERS,
+    ).exclude(pk=port.pk)
+    for router_port in router_ports:
+        for fixed_ip in router_port.fixed_ips or []:
+            if isinstance(fixed_ip, dict) and fixed_ip.get("ip_address"):
+                add(fixed_ip["ip_address"], _("a router interface"))
+    return addresses
+
+
+def _tenant_networks(port: models.Port):
+    """Every subnet of the port's tenant, as networks.
+
+    A pair is measured against all of them rather than only the port's own: an
+    address in a neighbouring subnet is what a failover address (keepalived,
+    VRRP) looks like, and Neutron allows it.
+    """
+    networks = []
+    for cidr in models.SubNet.objects.filter(tenant_id=port.tenant_id).values_list(
+        "cidr", flat=True
+    ):
+        try:
+            networks.append(ip_network(cidr, strict=False))
+        except ValueError:
+            continue
+    return networks
+
+
+def validate_pairs_for_port(pairs, port: models.Port | None):
+    """The rules that need the port, shared by the port action and the
+    instance action.
+
+    An IPv6 pair must be a unique local address or lie within one of the
+    tenant's own IPv6 subnets: those are the addresses the tenant already
+    controls. No pair may cover one of the tenant's subnets, which would let
+    the port answer for every instance in it, nor an address a router answers
+    on, which would intercept the traffic routed through it. A wide range that
+    does not overlap those stays allowed: a container network routed through
+    an instance (Magnum sets the whole pod CIDR as a pair) is exactly that.
+    Without a port only unique local addresses can be vouched for.
+    """
+    subnets = _port_subnets(port) if port is not None else []
+    tenant_networks = _tenant_networks(port) if port is not None else []
+    for pair in pairs:
+        network = ip_network(pair["ip_address"], strict=False)
+        if network.version == 6 and not (
+            network.subnet_of(_IPV6_UNIQUE_LOCAL)
+            or any(
+                own.version == 6 and network.subnet_of(own) for own in tenant_networks
+            )
+        ):
+            raise serializers.ValidationError(
+                {
+                    "allowed_address_pairs": _(
+                        "%(pair)s is neither a unique local address (fc00::/7) "
+                        "nor within an IPv6 subnet of the tenant."
+                    )
+                    % {"pair": pair["ip_address"]}
+                }
+            )
+    if port is None:
+        return
+    for pair in pairs:
+        network = ip_network(pair["ip_address"], strict=False)
+        for own in tenant_networks:
+            if own.version == network.version and own.subnet_of(network):
+                raise serializers.ValidationError(
+                    {
+                        "allowed_address_pairs": _(
+                            "%(pair)s covers the subnet %(subnet)s of this "
+                            "tenant, so the port could answer for every "
+                            "address in it."
+                        )
+                        % {
+                            "pair": pair["ip_address"],
+                            "subnet": own.with_prefixlen,
+                        }
+                    }
+                )
+    addresses = _router_addresses(port, subnets)
+    for pair in pairs:
+        network = ip_network(pair["ip_address"], strict=False)
+        for address, description in addresses:
+            if address.version == network.version and address in network:
+                raise serializers.ValidationError(
+                    {
+                        "allowed_address_pairs": _(
+                            "%(pair)s contains %(address)s, %(description)s."
+                        )
+                        % {
+                            "pair": pair["ip_address"],
+                            "address": address,
+                            "description": description,
+                        }
+                    }
+                )
+
+
 class SetAllowedAddressPairsSerializer(serializers.Serializer):
-    """Body shape for ``POST .../ports/{uuid}/set_allowed_address_pairs/``."""
+    """Body shape for ``POST .../ports/{uuid}/set_allowed_address_pairs/``.
+
+    Expects the port in the serializer context, for the rules that need it."""
 
     allowed_address_pairs = AllowedAddressPairEntrySerializer(
         many=True, allow_empty=True
     )
 
     def validate_allowed_address_pairs(self, value):
-        if len(value) > _AAP_MAX_ENTRIES:
-            raise serializers.ValidationError(
-                _("At most {limit} address pairs are supported per port.").format(
-                    limit=_AAP_MAX_ENTRIES
-                )
-            )
-        seen = set()
-        for entry in value:
-            key = (entry.get("ip_address"), entry.get("mac_address") or "")
-            if key in seen:
-                raise serializers.ValidationError(
-                    _("Duplicate address pair entries are not allowed.")
-                )
-            seen.add(key)
-        return value
+        return validate_address_pair_list(value)
+
+    def validate(self, attrs):
+        validate_pairs_for_port(
+            attrs["allowed_address_pairs"], self.context.get("port")
+        )
+        return attrs
 
 
 @extend_schema_field(OpenStackAllowedAddressPairSerializer(many=True))
@@ -2432,6 +2716,14 @@ class DnsNameserversField(serializers.JSONField):
     pass
 
 
+def _ip_version_of(value):
+    """4 or 6 for an IP address, None for anything that is not one."""
+    try:
+        return ip_address(value).version
+    except ValueError:
+        return None
+
+
 class OpenStackSubNetSerializer(structure_serializers.BaseResourceActionSerializer):
     cidr = serializers.CharField(
         required=False,
@@ -2439,6 +2731,35 @@ class OpenStackSubNetSerializer(structure_serializers.BaseResourceActionSerializ
         label="CIDR",
     )
     allocation_pools = OpenStackSubNetAllocationPoolField(required=False)
+    # Declared rather than derived, so a bad address gets one message rather
+    # than one from the field and another from the model's validator. Either
+    # family is accepted here; whether it matches the subnet's is checked
+    # against the CIDR in _validate_address_family.
+    gateway_ip = serializers.IPAddressField(
+        required=False,
+        allow_null=True,
+        help_text=_("IP address of the gateway for this subnet"),
+    )
+    # Declared so that "unset" has one spelling, null, rather than also the
+    # empty string the model's blank=True would let through.
+    ipv6_ra_mode = serializers.ChoiceField(
+        choices=models.SubNet.Ipv6Modes.CHOICES,
+        required=False,
+        allow_null=True,
+        help_text=_(
+            "How the router advertises an IPv6 subnet. Set at creation only; "
+            "null for an IPv4 subnet."
+        ),
+    )
+    ipv6_address_mode = serializers.ChoiceField(
+        choices=models.SubNet.Ipv6Modes.CHOICES,
+        required=False,
+        allow_null=True,
+        help_text=_(
+            "How instances on an IPv6 subnet get their address. Set at creation "
+            "only; null for an IPv4 subnet."
+        ),
+    )
     network_name = serializers.CharField(source="network.name", read_only=True)
     tenant = serializers.HyperlinkedRelatedField(
         source="network.tenant",
@@ -2453,6 +2774,35 @@ class OpenStackSubNetSerializer(structure_serializers.BaseResourceActionSerializ
     port_security_enabled = serializers.BooleanField(
         source="network.port_security_enabled", read_only=True
     )
+    router = serializers.HyperlinkedRelatedField(
+        view_name="openstack-router-detail",
+        lookup_field="uuid",
+        queryset=models.Router.objects.all(),
+        required=False,
+        allow_null=True,
+        help_text=_(
+            "Router to attach the subnet to. Optional: when omitted Waldur picks "
+            "a router of the tenant itself. Cannot be changed here afterwards -- "
+            "use the router's add/remove interface actions."
+        ),
+    )
+    # allow_null keeps the keys present (and nullable in the OpenAPI schema) for a
+    # subnet with no router; without it DRF raises SkipField and drops them.
+    skip_router_connection = serializers.BooleanField(
+        default=False,
+        write_only=True,
+        help_text=_(
+            "Create the subnet without attaching it to a router. Off by default, "
+            "so an omitted field behaves exactly as before: Waldur attaches the "
+            "subnet to a router of the tenant."
+        ),
+    )
+    router_name = serializers.CharField(
+        source="router.name", read_only=True, allow_null=True
+    )
+    router_uuid = serializers.UUIDField(
+        source="router.uuid", read_only=True, allow_null=True
+    )
 
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
         model = models.SubNet
@@ -2466,11 +2816,17 @@ class OpenStackSubNetSerializer(structure_serializers.BaseResourceActionSerializ
             "disable_gateway",
             "allocation_pools",
             "ip_version",
+            "ipv6_ra_mode",
+            "ipv6_address_mode",
             "enable_dhcp",
             "dns_nameservers",
             "host_routes",
             "is_connected",
             "port_security_enabled",
+            "router",
+            "router_name",
+            "router_uuid",
+            "skip_router_connection",
         )
         read_only_fields = (
             structure_serializers.BaseResourceSerializer.Meta.read_only_fields
@@ -2492,9 +2848,18 @@ class OpenStackSubNetSerializer(structure_serializers.BaseResourceActionSerializ
     def get_fields(self):
         fields = super().get_fields()
 
-        # Make cidr read-only on update
-        if self.instance and "cidr" in fields:
-            fields["cidr"].read_only = True
+        # The CIDR, and with it the address family, is fixed at creation, and
+        # Neutron does not allow changing the IPv6 modes afterwards either.
+        if self.instance:
+            for name in ("cidr", "ipv6_ra_mode", "ipv6_address_mode"):
+                if name in fields:
+                    fields[name].read_only = True
+
+        # Re-targeting an existing subnet is a router-interface operation, not a
+        # subnet update: writing the field here would change what the API reports
+        # without moving the interface in Neutron.
+        if self.instance and "router" in fields:
+            fields["router"].read_only = True
 
         return fields
 
@@ -2511,13 +2876,34 @@ class OpenStackSubNetSerializer(structure_serializers.BaseResourceActionSerializ
             attrs["gateway_ip"] = None
 
         if "cidr" not in attrs:
-            attrs["cidr"] = (
-                "192.168.42.0/24"
-                if not self.instance or not self.instance.cidr
-                else self.instance.cidr
-            )
+            if self.instance and self.instance.cidr:
+                attrs["cidr"] = self.instance.cidr
+            elif attrs.get("ipv6_ra_mode") or attrs.get("ipv6_address_mode"):
+                raise serializers.ValidationError(
+                    {
+                        "cidr": _(
+                            "An IPv6 subnet needs a CIDR: the default is IPv4 "
+                            "(192.168.42.0/24)."
+                        )
+                    }
+                )
+            else:
+                attrs["cidr"] = "192.168.42.0/24"
 
         cidr = attrs["cidr"]
+        try:
+            subnet_network = parse_subnet_cidr(cidr)
+        except serializers.ValidationError as error:
+            if self.instance is None:
+                raise serializers.ValidationError({"cidr": error.detail})
+            # A stored CIDR Waldur cannot parse came from the backend; do not
+            # make every later rename of that subnet fail on it.
+            subnet_network = None
+        if subnet_network is not None:
+            self._validate_address_family(attrs, subnet_network.version)
+            if self.instance is None:
+                attrs["ip_version"] = subnet_network.version
+                self._validate_ipv6_modes(attrs, subnet_network)
         allocation_pools = attrs.get("allocation_pools")
 
         if allocation_pools:
@@ -2564,8 +2950,152 @@ class OpenStackSubNetSerializer(structure_serializers.BaseResourceActionSerializ
             attrs["service_settings"] = network.service_settings
             attrs["project"] = network.project
             options = network.service_settings.options
-            attrs.setdefault("dns_nameservers", options.get("dns_nameservers", []))
+            # The defaults are usually IPv4 resolvers. Neutron rejects a
+            # nameserver of the other family, so an IPv6 subnet created with
+            # them would end up ERRED instead of simply having none.
+            attrs.setdefault(
+                "dns_nameservers",
+                [
+                    nameserver
+                    for nameserver in options.get("dns_nameservers", [])
+                    if _ip_version_of(nameserver) == attrs.get("ip_version", 4)
+                ],
+            )
+            if attrs.get("skip_router_connection") and attrs.get("router"):
+                raise serializers.ValidationError(
+                    {
+                        "router": _(
+                            "A router cannot be chosen for a subnet that is "
+                            "created without a router connection."
+                        )
+                    }
+                )
+            self.validate_router_choice(
+                network.tenant, attrs.get("router"), attrs.get("disable_gateway")
+            )
         return attrs
+
+    def _validate_address_family(self, attrs, version):
+        """Neutron rejects a gateway or nameserver of the other family; say so
+        here with a 400 rather than leave an ERRED subnet behind."""
+        gateway_ip = attrs.get("gateway_ip")
+        if gateway_ip and _ip_version_of(gateway_ip) != version:
+            raise serializers.ValidationError(
+                {
+                    "gateway_ip": _(
+                        "The gateway must be an IPv%(version)s address, like the "
+                        "subnet's CIDR."
+                    )
+                    % {"version": version}
+                }
+            )
+        nameservers = attrs.get("dns_nameservers")
+        if isinstance(nameservers, list):
+            for nameserver in nameservers:
+                if _ip_version_of(nameserver) != version:
+                    raise serializers.ValidationError(
+                        {
+                            "dns_nameservers": _(
+                                "%(nameserver)s is not an IPv%(version)s address, "
+                                "like the subnet's CIDR."
+                            )
+                            % {"nameserver": nameserver, "version": version}
+                        }
+                    )
+
+    def _validate_ipv6_modes(self, attrs, subnet_network):
+        ra_mode = attrs.get("ipv6_ra_mode")
+        address_mode = attrs.get("ipv6_address_mode")
+        if subnet_network.version == 4:
+            for name, value in (
+                ("ipv6_ra_mode", ra_mode),
+                ("ipv6_address_mode", address_mode),
+            ):
+                if value:
+                    raise serializers.ValidationError(
+                        {name: _("Only an IPv6 subnet has an address mode.")}
+                    )
+            return
+        if ra_mode and address_mode and ra_mode != address_mode:
+            raise serializers.ValidationError(
+                {
+                    "ipv6_address_mode": _(
+                        "When both modes are set, ipv6_ra_mode and "
+                        "ipv6_address_mode must be the same."
+                    )
+                }
+            )
+        from_prefix = models.SubNet.Ipv6Modes.FROM_PREFIX
+        if (
+            ra_mode in from_prefix or address_mode in from_prefix
+        ) and subnet_network.prefixlen != 64:
+            raise serializers.ValidationError(
+                {
+                    "cidr": _(
+                        "SLAAC and stateless DHCPv6 need a /64 prefix, because "
+                        "instances build their address from it."
+                    )
+                }
+            )
+
+    def create(self, validated_data):
+        # Not a model field: it tells the executor what to do, and the view
+        # reads it off validated_data before this pops it.
+        validated_data.pop("skip_router_connection", None)
+        return super().create(validated_data)
+
+    def validate_router_choice(self, tenant, router, disable_gateway=False):
+        """A named router must be one this subnet can actually be attached to.
+
+        The field is a plain hyperlink, so the caller can name any router they
+        can resolve; without this check a router of another tenant would reach
+        the backend and Neutron would refuse the attachment there, turning a
+        400 into an ERRED subnet.
+        """
+        if router is None:
+            return
+        if tenant.skip_creation_of_default_router:
+            # The two settings contradict each other: the tenant has opted out
+            # of Waldur attaching subnets to routers at all, so naming one here
+            # would be silently ignored by connect_subnet. Say so instead.
+            raise serializers.ValidationError(
+                {
+                    "router": _(
+                        "Tenant is configured to skip connecting subnets to a router, "
+                        "so a router cannot be chosen for its subnets."
+                    )
+                }
+            )
+        if router.tenant_id != tenant.id:
+            raise serializers.ValidationError(
+                {
+                    "router": _(
+                        "Router does not belong to the same tenant as the subnet."
+                    )
+                }
+            )
+        if router.state != CoreStates.OK:
+            raise serializers.ValidationError(
+                {"router": _("Router is not in a valid state for connecting a subnet.")}
+            )
+        if not router.backend_id:
+            # connect_subnet reads backend_id to address the router; an empty one
+            # is falsy, so the implicit resolution would quietly attach the
+            # subnet elsewhere while the API kept reporting this choice.
+            raise serializers.ValidationError(
+                {"router": _("Router does not exist in the backend yet.")}
+            )
+        if disable_gateway:
+            # Neutron refuses a router interface on a subnet with no gateway IP,
+            # and _connect_network_to_router returns early for exactly that, so
+            # the subnet would report a router it was never attached to.
+            raise serializers.ValidationError(
+                {
+                    "router": _(
+                        "A subnet without a gateway IP cannot be attached to a router."
+                    )
+                }
+            )
 
     # Keep the previously defined methods below
     def check_cidr_overlap(self, tenant, new_cidr):
@@ -3003,11 +3533,21 @@ class CreateLoadBalancerSerializer(LoadBalancerWritableSerializer):
         queryset=models.SubNet.objects.all(),
         required=True,
     )
+    vip_address = serializers.IPAddressField(
+        required=False,
+        allow_null=True,
+        help_text=_(
+            "Virtual IP address to request, IPv4 or IPv6. It must be of the same "
+            "family as vip_subnet and lie inside it. Octavia allocates one "
+            "from vip_subnet when omitted."
+        ),
+    )
 
     class Meta(LoadBalancerWritableSerializer.Meta):
         fields = LoadBalancerWritableSerializer.Meta.fields + (
             "tenant",
             "vip_subnet",
+            "vip_address",
         )
         extra_kwargs = dict(
             tenant={"lookup_field": "uuid", "view_name": "openstack-tenant-detail"},
@@ -3048,9 +3588,48 @@ class CreateLoadBalancerSerializer(LoadBalancerWritableSerializer):
                     )
                 }
             )
+        if attrs.get("vip_address"):
+            validate_address_in_subnet(attrs["vip_address"], subnet, "vip_address")
         attrs["project"] = tenant.project
         attrs["service_settings"] = tenant.service_settings
         return attrs
+
+
+def validate_address_in_subnet(address_text, subnet, field_name):
+    """Refuse an address that cannot live on the subnet.
+
+    Octavia accepts such an address and only fails asynchronously, leaving an
+    erred load balancer or member behind, so it is refused up front.
+    """
+    try:
+        subnet_network = ip_network(subnet.cidr, strict=False)
+    except ValueError:
+        raise serializers.ValidationError(
+            {
+                field_name: _(
+                    "The address cannot be checked because the CIDR of the "
+                    "subnet is unknown."
+                )
+            }
+        )
+    address = ip_address(address_text)
+    if address.version != subnet_network.version:
+        raise serializers.ValidationError(
+            {
+                field_name: _(
+                    "An IPv%(address)s address cannot be placed on an "
+                    "IPv%(subnet)s subnet."
+                )
+                % {"address": address.version, "subnet": subnet_network.version}
+            }
+        )
+    if address not in subnet_network:
+        raise serializers.ValidationError(
+            {
+                field_name: _("Address %(ip)s is not inside subnet %(cidr)s.")
+                % {"ip": address_text, "cidr": subnet.cidr}
+            }
+        )
 
 
 class OpenStackPoolSerializer(structure_serializers.BaseResourceSerializer):
@@ -3445,6 +4024,28 @@ class CreatePoolMemberSerializer(PoolMemberWritingSerializer):
                     )
                 }
             )
+        # Only checked when the CIDR is known, so that a member can still be
+        # added on a subnet whose CIDR was never recorded.
+        if subnet.cidr:
+            validate_address_in_subnet(attrs["address"], subnet, "address")
+        load_balancer = pool.load_balancer
+        # The OVN provider does not support mixing IPv4 and IPv6 between a load
+        # balancer and its members; Octavia accepts such a member and the
+        # provider fails it afterwards.
+        if (load_balancer.provider or "ovn") == "ovn" and load_balancer.vip_address:
+            vip_version = ip_address(load_balancer.vip_address).version
+            member_version = ip_address(attrs["address"]).version
+            if vip_version != member_version:
+                raise serializers.ValidationError(
+                    {
+                        "address": _(
+                            "The OVN load balancer provider does not support "
+                            "mixing IP versions: the VIP of this load balancer "
+                            "is IPv%(vip)s, the member address is IPv%(member)s."
+                        )
+                        % {"vip": vip_version, "member": member_version}
+                    }
+                )
         attrs["project"] = pool.project
         attrs["service_settings"] = pool.service_settings
         return attrs
@@ -4434,6 +5035,17 @@ def _validate_instance_server_group(server_group, tenant):
         raise serializers.ValidationError({"server_group": error % server_group.name})
 
 
+def _validate_floating_ip_can_be_allocated(tenant: models.Tenant, field=None):
+    """Refuse up front an allocation that Neutron is known to reject later.
+
+    Without this, the request is accepted and the floating IP ends up ERRED.
+    """
+    message = get_no_ipv4_external_network_message(tenant)
+    if message is None:
+        return
+    raise serializers.ValidationError({field: message} if field else message)
+
+
 def _validate_instance_floating_ips(
     floating_ips_with_subnets: FloatingIPSpec, tenant: models.Tenant, instance_subnets
 ):
@@ -4446,6 +5058,11 @@ def _validate_instance_floating_ips(
                 "Please specify tenant external network to perform floating IP operations."
             )
         )
+
+    # Only a new allocation touches the external network; an existing floating
+    # IP chosen by URL or address is already allocated.
+    if any(floating_ip is None for floating_ip, _subnet in floating_ips_with_subnets):
+        _validate_floating_ip_can_be_allocated(tenant, field="floating_ips")
 
     for floating_ip, subnet in floating_ips_with_subnets:
         if not subnet.is_connected:
@@ -4579,6 +5196,70 @@ class OpenStackDataVolumeSerializer(serializers.Serializer):
     )
 
 
+# Nova rejects metadata beyond these limits with a 400 of its own; validate
+# upfront so the order fails fast with a field-level message instead of erring
+# in the middle of provisioning.
+NOVA_METADATA_MAX_ENTRIES = 128
+NOVA_METADATA_MAX_LENGTH = 255
+
+
+class NovaMetadataValueField(serializers.CharField):
+    """CharField that refuses non-string values and preserves them verbatim.
+
+    DRF's CharField happily coerces numbers and would turn ``{"port": 8080}``
+    into ``{"port": "8080"}``. Nova metadata is string-to-string, so reject the
+    input instead of silently changing its type. Whitespace trimming is off for
+    the same reason: Nova stores the value as given, so a trimmed value would
+    read back differently from what the client sent.
+    """
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("trim_whitespace", False)
+        super().__init__(**kwargs)
+
+    def to_internal_value(self, data):
+        if not isinstance(data, str):
+            self.fail("invalid")
+        return super().to_internal_value(data)
+
+
+def validate_nova_metadata(value):
+    if len(value) > NOVA_METADATA_MAX_ENTRIES:
+        raise serializers.ValidationError(
+            _("At most %(limit)s metadata entries are allowed, got %(count)s.")
+            % {"limit": NOVA_METADATA_MAX_ENTRIES, "count": len(value)}
+        )
+    for key in value:
+        if not key:
+            raise serializers.ValidationError(_("Metadata key must not be empty."))
+        if len(key) > NOVA_METADATA_MAX_LENGTH:
+            raise serializers.ValidationError(
+                _("Metadata key %(key)s exceeds %(limit)s characters.")
+                % {"key": key[:50] + "...", "limit": NOVA_METADATA_MAX_LENGTH}
+            )
+
+
+def build_nova_metadata_field(**kwargs):
+    kwargs.setdefault(
+        "help_text",
+        _(
+            "Nova instance metadata as string-to-string pairs. "
+            "At most %(entries)s entries; keys and values up to %(length)s characters."
+        )
+        % {
+            "entries": NOVA_METADATA_MAX_ENTRIES,
+            "length": NOVA_METADATA_MAX_LENGTH,
+        },
+    )
+    return serializers.DictField(
+        child=NovaMetadataValueField(
+            max_length=NOVA_METADATA_MAX_LENGTH, allow_blank=True
+        ),
+        validators=[validate_nova_metadata],
+        **kwargs,
+    )
+
+
 class OpenStackInstanceSerializer(structure_serializers.VirtualMachineSerializer):
     service_settings = serializers.HyperlinkedRelatedField(
         read_only=True,
@@ -4636,6 +5317,8 @@ class OpenStackInstanceSerializer(structure_serializers.VirtualMachineSerializer
         help_text=_("UUID of the OpenStack tenant"),
     )
 
+    metadata = build_nova_metadata_field(required=False)
+
     class Meta(structure_serializers.VirtualMachineSerializer.Meta):
         model = models.Instance
         fields = structure_serializers.VirtualMachineSerializer.Meta.fields + (
@@ -4657,6 +5340,7 @@ class OpenStackInstanceSerializer(structure_serializers.VirtualMachineSerializer
             "hypervisor_hostname",
             "tenant",
             "external_address",
+            "metadata",
         )
         protected_fields = (
             structure_serializers.VirtualMachineSerializer.Meta.protected_fields
@@ -4669,6 +5353,7 @@ class OpenStackInstanceSerializer(structure_serializers.VirtualMachineSerializer
                 "connect_directly_to_external_network",
                 "config_drive",
                 "tenant",
+                "metadata",
             )
         )
         read_only_fields = (
@@ -5103,6 +5788,16 @@ class OpenStackInstanceCreateSerializer(OpenStackInstanceSerializer):
         return instance
 
 
+class InstanceSetMetadataSerializer(serializers.Serializer):
+    """Input serializer for the set_metadata action.
+
+    The payload replaces the instance metadata wholesale: keys missing from it
+    are removed from Nova as well.
+    """
+
+    metadata = build_nova_metadata_field()
+
+
 class InstanceRescueSerializer(serializers.Serializer):
     """Input serializer for the rescue action.
 
@@ -5261,6 +5956,23 @@ class OpenStackInstanceAllowedAddressPairsUpdateSerializer(serializers.Serialize
             "List of allowed address pairs to set on the port. Each pair should contain 'ip_address' and optional 'mac_address'."
         )
     )
+
+    def validate_allowed_address_pairs(self, value):
+        # The same per-entry and list rules as the port action; the field stays
+        # a JSON field so the schema, and every generated client, is unchanged.
+        entries = AllowedAddressPairEntrySerializer(
+            data=value, many=True, allow_empty=True
+        )
+        if not entries.is_valid():
+            raise serializers.ValidationError(entries.errors)
+        return validate_address_pair_list(entries.validated_data)
+
+    def validate(self, attrs):
+        port = models.Port.objects.filter(
+            instance=self.instance, subnet=attrs["subnet"]
+        ).first()
+        validate_pairs_for_port(attrs["allowed_address_pairs"], port)
+        return attrs
 
     @transaction.atomic
     def update(self, instance, validated_data):
@@ -5537,6 +6249,11 @@ class OpenStackBackupRestorationCreateSerializer(OpenStackBackupRestorationSeria
         backup_restoration = super().create(validated_data)
         # restoration for each instance volume from snapshot.
         for snapshot in backup.snapshots.all():
+            # The restored volume inherits the bootable flag of the volume the
+            # snapshot was taken from, the same way Cinder does it. Without it
+            # the restored instance has no system volume and create_instance
+            # fails its `volumes.get(bootable=True)` guard.
+            bootable = bool(snapshot.source_volume and snapshot.source_volume.bootable)
             volume = models.Volume(
                 source_snapshot=snapshot,
                 service_settings=snapshot.service_settings,
@@ -5545,6 +6262,7 @@ class OpenStackBackupRestorationCreateSerializer(OpenStackBackupRestorationSeria
                 name=f"{instance.name[:143]}-volume",
                 description="Restored from backup %s" % backup.uuid.hex,
                 size=snapshot.size,
+                bootable=bootable,
             )
             volume.save()
             volume.increase_backend_quotas_usage(validate=True)
@@ -5784,8 +6502,48 @@ class OpenStackPortIPUpdateSerializer(serializers.Serializer):
                 {"subnet": "Subnet does not belong to the same network as the port."}
             )
 
+        # Neutron refuses a fixed address on such a subnet, so this would only
+        # come back from the backend as an error.
+        from_prefix = models.SubNet.Ipv6Modes.FROM_PREFIX
+        if (
+            subnet.ipv6_ra_mode in from_prefix
+            or subnet.ipv6_address_mode in from_prefix
+        ):
+            raise serializers.ValidationError(
+                {
+                    "subnet": _(
+                        "Addresses on a SLAAC or stateless DHCPv6 subnet are "
+                        "derived from the prefix, so a fixed address cannot be "
+                        "assigned there."
+                    )
+                }
+            )
+
+        ip_addr = ip_address(ip)
+        try:
+            subnet_network = ip_network(subnet.cidr, strict=False)
+        except ValueError:
+            subnet_network = None
+        version = subnet_network.version if subnet_network else subnet.ip_version
+        if ip_addr.version != version:
+            raise serializers.ValidationError(
+                {
+                    "ip_address": _(
+                        "The address must be an IPv%(version)s address, like the "
+                        "subnet."
+                    )
+                    % {"version": version}
+                }
+            )
+        if subnet_network and ip_addr not in subnet_network:
+            raise serializers.ValidationError(
+                {
+                    "ip_address": _("The address is outside of the subnet %(cidr)s.")
+                    % {"cidr": subnet.cidr}
+                }
+            )
+
         if subnet.allocation_pools:
-            ip_addr = ip_address(ip)
             in_pool = False
             for pool in subnet.allocation_pools:
                 start_ip = ip_address(pool["start"])
@@ -5833,9 +6591,17 @@ class OpenStackRouterInterfaceSerializer(serializers.Serializer):
             tenant = router.tenant
             if attrs.get("subnet"):
                 subnet: models.SubNet = attrs["subnet"]
-                if subnet.tenant != tenant:
+                # Visibility, not ownership (#394). A network shared over RBAC is
+                # routed by the tenant that consumes it: Neutron accepts the
+                # attachment and puts the interface port in the *router's*
+                # project, which is exactly how a shared network is handed over.
+                # `available_subnets` is the tenant's own subnets plus the ones
+                # reaching it through a NetworkRBACPolicy, so a tenant with no
+                # policy is still refused.
+                if not tenant.available_subnets.filter(pk=subnet.pk).exists():
                     raise serializers.ValidationError(
-                        "Subnet must belong to the same tenant as the router."
+                        "Subnet must belong to the router's tenant, or be shared "
+                        "with it."
                     )
             if attrs.get("port"):
                 port: models.Port = attrs["port"]

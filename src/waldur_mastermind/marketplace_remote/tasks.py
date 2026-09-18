@@ -38,12 +38,14 @@ from waldur_core.structure import models as structure_models
 from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_core.structure.tasks import BackgroundListPullTask, BackgroundPullTask
 from waldur_mastermind.marketplace import models
+from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.callbacks import sync_order_state
 from waldur_mastermind.marketplace.enums import (
     REMOTE_OFFERING,
     MaintenanceState,
     MissingUsagePolicies,
     OfferingStates,
+    OfferingUserStates,
     OrderStates,
     OrderTypes,
     ResourceStates,
@@ -64,7 +66,9 @@ from waldur_mastermind.marketplace_remote.constants import (
 from waldur_mastermind.marketplace_remote.exceptions import RemoteWaldurError
 from waldur_mastermind.marketplace_remote.utils import (
     get_client_for_offering,
+    keep_local_plugin_options,
     pull_fields,
+    pull_offering_user_runtime_state_fields,
     sync_project_permission,
 )
 
@@ -113,7 +117,11 @@ class OfferingPullTask(BackgroundPullTask):
             remote_offering = marketplace_public_offerings_retrieve.sync(
                 client=client, uuid=local_offering.backend_id
             )
-            pull_fields(OFFERING_FIELDS, local_offering, remote_offering.to_dict())
+            pull_fields(
+                OFFERING_FIELDS,
+                local_offering,
+                keep_local_plugin_options(local_offering, remote_offering.to_dict()),
+            )
             utils.import_offering_thumbnail(local_offering, remote_offering.thumbnail)
             self.sync_offering_components(local_offering, remote_offering.components)
             self.sync_plans(local_offering, remote_offering.plans)
@@ -442,12 +450,23 @@ class OfferingUserPullTask(BackgroundPullTask):
         from waldur_api_client.api.marketplace_offering_users import (
             marketplace_offering_users_list,
         )
+        from waldur_api_client.models.offering_user_field_enum import (
+            OfferingUserFieldEnum,
+        )
 
         client = get_client_for_offering(local_offering)
         remote_offering_users = {
-            remote_offering_user.user_username: remote_offering_user.username
+            remote_offering_user.user_username: remote_offering_user
             for remote_offering_user in marketplace_offering_users_list.sync_all(
-                client=client, offering_uuid=[UUID(local_offering.backend_id)]
+                client=client,
+                offering_uuid=[UUID(local_offering.backend_id)],
+                field=[
+                    OfferingUserFieldEnum.USER_USERNAME,
+                    OfferingUserFieldEnum.USERNAME,
+                    OfferingUserFieldEnum.RUNTIME_STATE,
+                    OfferingUserFieldEnum.SERVICE_PROVIDER_COMMENT,
+                    OfferingUserFieldEnum.SERVICE_PROVIDER_COMMENT_URL,
+                ],
             )
         }
         # Build lookup dicts upfront to avoid N+1 queries
@@ -455,7 +474,7 @@ class OfferingUserPullTask(BackgroundPullTask):
             offering_user.user.username: offering_user
             for offering_user in models.OfferingUser.objects.filter(
                 offering=local_offering
-            ).select_related("user")
+            ).select_related("user", "offering__customer")
         }
         local_offering_users = {
             username: offering_user.username
@@ -477,11 +496,23 @@ class OfferingUserPullTask(BackgroundPullTask):
                 )
                 continue
             user = user_map[local_username]
-            models.OfferingUser.objects.create(
-                user=user,
-                offering=local_offering,
-                username=remote_offering_users[local_username],
+            remote_offering_user = remote_offering_users[local_username]
+            remote_username = remote_offering_user.username
+            # Through the shared creator so a provider-scoped offering gets a
+            # backed account; the remote's username only applies outside it.
+            # state is passed rather than left to the creator's own rule, which
+            # would open an account with a username as OK -- that is a change to
+            # what this sync means and does not belong in this branch.
+            offering_user, _ = marketplace_utils.create_offering_user(
+                user,
+                local_offering,
+                username=remote_username if isinstance(remote_username, str) else "",
+                state=OfferingUserStates.CREATION_REQUESTED,
             )
+            if offering_user.state != OfferingUserStates.DELETED:
+                pull_offering_user_runtime_state_fields(
+                    offering_user, remote_offering_user
+                )
 
         stale = set(local_offering_users.keys()) - set(remote_offering_users.keys())
         for local_username in stale:
@@ -507,20 +538,31 @@ class OfferingUserPullTask(BackgroundPullTask):
 
         common = set(local_offering_users.keys()) & set(remote_offering_users.keys())
         for local_username in common:
-            remote_username = remote_offering_users[local_username]
-            if local_offering_users[local_username] == remote_username:
-                continue
-            # O(1) lookup instead of database query
+            remote_offering_user = remote_offering_users[local_username]
+            remote_username = remote_offering_user.username
             offering_user = local_offering_user_objects[local_username]
-            offering_user.username = remote_username
-            offering_user.save(update_fields=["username"])
+            # A backed account's username is owned by its provider account, so
+            # the remote's name does not apply: under provider scope the two
+            # routinely differ, and writing here would raise every hour.
+            if (
+                isinstance(remote_username, str)
+                and not offering_user.is_provider_backed
+                and offering_user.username != remote_username
+            ):
+                offering_user.username = remote_username
+                offering_user.save(update_fields=["username"])
+            if offering_user.state != OfferingUserStates.DELETED:
+                pull_offering_user_runtime_state_fields(
+                    offering_user, remote_offering_user
+                )
 
 
 class OfferingUserListPullTask(BackgroundListPullTask):
     """Pull and synchronize remote marketplace offering users.
 
     This task synchronizes user associations with marketplace offerings from
-    remote Waldur instances, ensuring local user mappings are up to date.
+    remote Waldur instances, including usernames and runtime metadata
+    (runtime_state, service provider comments).
     Runs every 60 minutes via celery beat.
     """
 

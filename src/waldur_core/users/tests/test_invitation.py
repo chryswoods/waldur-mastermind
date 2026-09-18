@@ -29,6 +29,7 @@ from waldur_core.permissions.models import (
     Role,
     RoleAvailability,
 )
+from waldur_core.permissions.serializers import clone_role_for_customer
 from waldur_core.permissions.utils import get_permissions
 from waldur_core.structure.models import Customer, Project
 from waldur_core.structure.tests import factories as structure_factories
@@ -128,7 +129,7 @@ class InvitationFieldValidationTest(test.APITestCase):
         self.assertEqual(invitation.extra_invitation_text, "")
 
 
-class BaseInvitationTest(test.APITransactionTestCase):
+class BaseInvitationTest(test.APITestCase):
     def setUp(self):
         CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_PROJECT_PERMISSION)
         CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_CUSTOMER_PERMISSION)
@@ -204,7 +205,8 @@ class InvitationDuplicateCheckTest(BaseInvitationTest):
                         "role": CustomerRole.OWNER.uuid.hex,
                         "existing_invitation_uuid": str(invitation.uuid),
                     }
-                ]
+                ],
+                "existing_roles": [],
             },
         )
 
@@ -232,7 +234,7 @@ class InvitationDuplicateCheckTest(BaseInvitationTest):
         response = self.client.post(self.check_duplicates_url, data=payload)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data, {"duplicates": []})
+        self.assertEqual(response.data, {"duplicates": [], "existing_roles": []})
 
     def test_returns_duplicates_within_request(self):
         payload = {
@@ -255,9 +257,151 @@ class InvitationDuplicateCheckTest(BaseInvitationTest):
                         "role": CustomerRole.OWNER.uuid.hex,
                         "existing_invitation_uuid": None,
                     }
-                ]
+                ],
+                "existing_roles": [],
             },
         )
+
+    def check_project_duplicates(self, email, role):
+        payload = {
+            "scope": structure_factories.ProjectFactory.get_url(self.project),
+            "invitations": [{"email": email, "role": role.uuid.hex}],
+        }
+        response = self.client.post(self.check_duplicates_url, data=payload)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.data["existing_roles"]
+
+    def test_returns_existing_role_when_user_has_same_role_in_scope(self):
+        existing_roles = self.check_project_duplicates(
+            self.project_admin.email, ProjectRole.ADMIN
+        )
+
+        self.assertEqual(
+            existing_roles,
+            [
+                {
+                    "email": self.project_admin.email,
+                    "role": ProjectRole.ADMIN.uuid.hex,
+                    "existing_role": ProjectRole.ADMIN.uuid.hex,
+                    "existing_role_name": ProjectRole.ADMIN.name,
+                    "existing_role_description": ProjectRole.ADMIN.description,
+                    "is_same_role": True,
+                }
+            ],
+        )
+
+    def test_returns_existing_role_when_user_has_different_role_in_scope(self):
+        existing_roles = self.check_project_duplicates(
+            self.project_admin.email, ProjectRole.MANAGER
+        )
+
+        self.assertEqual(
+            existing_roles,
+            [
+                {
+                    "email": self.project_admin.email,
+                    "role": ProjectRole.MANAGER.uuid.hex,
+                    "existing_role": ProjectRole.ADMIN.uuid.hex,
+                    "existing_role_name": ProjectRole.ADMIN.name,
+                    "existing_role_description": ProjectRole.ADMIN.description,
+                    "is_same_role": False,
+                }
+            ],
+        )
+
+    def test_does_not_return_existing_roles_for_user_without_role_in_scope(self):
+        self.assertEqual(
+            self.check_project_duplicates(self.user.email, ProjectRole.ADMIN), []
+        )
+
+    def test_matches_existing_roles_by_email_case_insensitively(self):
+        existing_roles = self.check_project_duplicates(
+            self.project_admin.email.upper(), ProjectRole.ADMIN
+        )
+
+        self.assertEqual(len(existing_roles), 1)
+        self.assertEqual(existing_roles[0]["email"], self.project_admin.email.upper())
+        self.assertTrue(existing_roles[0]["is_same_role"])
+
+    def test_ignores_revoked_roles(self):
+        self.project.add_user(self.user, ProjectRole.MANAGER)
+        get_permissions(self.project, self.user).update(is_active=False)
+
+        self.assertEqual(
+            self.check_project_duplicates(self.user.email, ProjectRole.ADMIN), []
+        )
+
+    def test_reports_every_user_sharing_the_same_email(self):
+        # User.email carries no unique constraint, so an email may resolve to
+        # several accounts, each with its own role in the scope.
+        namesake = structure_factories.UserFactory(email=self.project_admin.email)
+        self.project.add_user(namesake, ProjectRole.MANAGER)
+
+        existing_roles = self.check_project_duplicates(
+            self.project_admin.email, ProjectRole.ADMIN
+        )
+
+        # Ordered by role name across both accounts, not by whatever order the
+        # database returned the users in.
+        self.assertEqual(
+            [item["existing_role_name"] for item in existing_roles],
+            [ProjectRole.ADMIN.name, ProjectRole.MANAGER.name],
+        )
+
+    def test_reports_each_case_variant_of_the_same_email(self):
+        payload = {
+            "scope": structure_factories.ProjectFactory.get_url(self.project),
+            "invitations": [
+                {
+                    "email": self.project_admin.email.upper(),
+                    "role": ProjectRole.ADMIN.uuid.hex,
+                },
+                {
+                    "email": self.project_admin.email,
+                    "role": ProjectRole.ADMIN.uuid.hex,
+                },
+            ],
+        }
+
+        response = self.client.post(self.check_duplicates_url, data=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Both rows are reported with their own spelling, so a caller matching
+        # entries back to rows by email flags both of them.
+        self.assertEqual(
+            [item["email"] for item in response.data["existing_roles"]],
+            [self.project_admin.email.upper(), self.project_admin.email],
+        )
+
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=True)
+    def test_reports_existing_roles_when_multiple_roles_are_disabled(self):
+        self.assertEqual(
+            self.check_project_duplicates(
+                self.project_admin.email, ProjectRole.MANAGER
+            ),
+            self.expected_different_role_entry(),
+        )
+
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=False)
+    def test_reports_existing_roles_when_multiple_roles_are_allowed(self):
+        self.assertEqual(
+            self.check_project_duplicates(
+                self.project_admin.email, ProjectRole.MANAGER
+            ),
+            self.expected_different_role_entry(),
+        )
+
+    def expected_different_role_entry(self):
+        return [
+            {
+                "email": self.project_admin.email,
+                "role": ProjectRole.MANAGER.uuid.hex,
+                "existing_role": ProjectRole.ADMIN.uuid.hex,
+                "existing_role_name": ProjectRole.ADMIN.name,
+                "existing_role_description": ProjectRole.ADMIN.description,
+                "is_same_role": False,
+            }
+        ]
 
 
 @ddt
@@ -1113,6 +1257,23 @@ class InvitationEmailRestrictionTest(test.APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
+    def test_invitation_blocked_for_lookalike_domain(self):
+        # Deliberately without "$": the pattern must still cover the whole address.
+        self.customer.user_email_patterns = [r".*@example\.com"]
+        self.customer.save()
+
+        self.client.force_authenticate(user=self.staff)
+        payload = {
+            "email": "user@example.com.attacker.net",
+            "scope": structure_factories.CustomerFactory.get_url(self.customer),
+            "role": CustomerRole.OWNER.uuid.hex,
+        }
+        response = self.client.post(
+            factories.InvitationBaseFactory.get_list_url(), data=payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("email", response.data)
+
     def test_invitation_blocked_by_parent_customer_pattern_for_project_scope(self):
         self.customer.user_email_patterns = [r".*@example\.com$"]
         self.customer.save()
@@ -1594,6 +1755,28 @@ class InvitationAcceptTest(BaseInvitationTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(
             response.data, ["User has already the same role in this scope."]
+        )
+
+    def test_template_holder_can_accept_invitation_to_org_scoped_clone(self):
+        # The duplicate-role guard is identity-strict: holding the system role
+        # must not block accepting an invitation to its organization clone.
+        clone = clone_role_for_customer(
+            ProjectRole.ADMIN, self.customer, conceal_template=False
+        )
+        project_invitation = factories.ProjectInvitationFactory(
+            scope=self.project, role=clone
+        )
+        self.project.add_user(self.user, ProjectRole.ADMIN)
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post(
+            factories.ProjectInvitationFactory.get_url(
+                project_invitation, action="accept"
+            )
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(
+            get_permissions(self.project, self.user).filter(role=clone).exists()
         )
 
     @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=True)

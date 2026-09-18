@@ -3,6 +3,7 @@ import logging
 from datetime import date, datetime
 
 from constance import config
+from django.conf import settings as django_settings
 from django.core.cache import cache
 from django.db import transaction
 from django.db.models import Avg, Count, Prefetch, Q
@@ -11,7 +12,8 @@ from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import (
     decorators,
     generics,
@@ -209,8 +211,14 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         if user.is_staff or user.is_support or not obj:
             return
         issue = obj
-        # if it's a personal issue
-        if not issue.customer and not issue.project and issue.caller == user:
+        # The caller may reply on their own ticket. Scope is already settled by
+        # the time this runs: reaching here means the issue survived
+        # `IssueCallerOrRoleFilterBackend`, which on a ticket raised against a
+        # project or an organization admits only the roles held there. So this
+        # covers the caller who still has access but holds none of the roles
+        # below -- a plain project member on their own thread, refused with a
+        # 403 while the UI went on offering them the button.
+        if issue.caller == user:
             return
         if issue.customer and issue.customer.has_user(user, CustomerRole.OWNER):
             return
@@ -893,13 +901,22 @@ class ProviderTicketViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 
     @extend_schema(
         summary="Get statistics for provider tickets",
+        parameters=[
+            OpenApiParameter(
+                name="provider_helpdesk_uuid",
+                type=OpenApiTypes.UUID,
+                required=False,
+                location=OpenApiParameter.QUERY,
+                description="Count only the tickets routed to this helpdesk.",
+            ),
+        ],
         responses={200: serializers.ProviderStatsSerializer},
     )
     @decorators.action(detail=False, methods=["get"])
     def stats(self, request):
         from django.db.models import Avg, ExpressionWrapper, F, fields
 
-        qs = self.get_queryset()
+        qs = self.filter_queryset(self.get_queryset())
         # Same open/closed definition as the support statistics and the is_open
         # filter. resolved_qs below still keys off resolution_date, because it
         # needs the timestamp to measure a duration.
@@ -913,8 +930,11 @@ class ProviderTicketViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         )
         avg_resolve = resolved_qs.aggregate(avg=Avg("resolve_time"))["avg"]
 
+        # order_by() drops any ?o= ordering, which would otherwise join the
+        # GROUP BY and split one status across several rows.
         by_status = dict(
-            open_qs.values_list("status")
+            open_qs.order_by()
+            .values_list("status")
             .annotate(count=Count("id"))
             .values_list("status", "count")
         )
@@ -1808,6 +1828,36 @@ class IssueStatusViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
     destroy_permissions = [core_permissions.IsStaff]
 
 
+# Constance settings holding each auth method's credentials, mapped to the
+# credentials serializer field that supplies them.
+ATLASSIAN_CREDENTIAL_SETTINGS = {
+    "api_token": {"ATLASSIAN_EMAIL": "email", "ATLASSIAN_TOKEN": "token"},
+    "personal_access_token": {
+        "ATLASSIAN_PERSONAL_ACCESS_TOKEN": "personal_access_token"
+    },
+    "basic": {"ATLASSIAN_USERNAME": "username", "ATLASSIAN_PASSWORD": "password"},
+    "oauth2_client_credentials": {
+        "ATLASSIAN_OAUTH2_CLIENT_ID": "client_id",
+        "ATLASSIAN_OAUTH2_CLIENT_SECRET": "client_secret",
+    },
+}
+ATLASSIAN_CREDENTIAL_KEYS = [
+    setting
+    for settings in ATLASSIAN_CREDENTIAL_SETTINGS.values()
+    for setting in settings
+] + ["ATLASSIAN_OAUTH2_ACCESS_TOKEN"]
+
+
+def _configured_setting(key):
+    """A setting's value, or an empty string while it holds its placeholder default.
+
+    Some Atlassian settings default to placeholders (https://example.com/,
+    USERNAME, PASSWORD) that must not be mistaken for configuration.
+    """
+    value = getattr(config, key)
+    return "" if value == django_settings.CONSTANCE_CONFIG[key][0] else value
+
+
 class AtlassianSettingsDiscoveryViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
     """
     ViewSet for Atlassian settings discovery and configuration.
@@ -1840,6 +1890,8 @@ class AtlassianSettingsDiscoveryViewSet(CheckExtensionMixin, core_views.ActionsV
             personal_access_token=credentials_data.get("personal_access_token"),
             username=credentials_data.get("username"),
             password=credentials_data.get("password"),
+            client_id=credentials_data.get("client_id"),
+            client_secret=credentials_data.get("client_secret"),
             verify_ssl=credentials_data.get("verify_ssl", True),
         )
         return AtlassianDiscoveryService(creds)
@@ -2029,7 +2081,7 @@ class AtlassianSettingsDiscoveryViewSet(CheckExtensionMixin, core_views.ActionsV
         # Build preview of settings
         data = serializer.validated_data
         preview = {
-            "ATLASSIAN_API_URL": data["api_url"],
+            "ATLASSIAN_API_URL": service.api_url,
             "ATLASSIAN_PROJECT_ID": data["project_id"],
             "ATLASSIAN_VERIFY_SSL": data.get("verify_ssl", True),
             "ATLASSIAN_USE_OLD_API": data.get("use_old_api", False),
@@ -2044,6 +2096,9 @@ class AtlassianSettingsDiscoveryViewSet(CheckExtensionMixin, core_views.ActionsV
             preview["ATLASSIAN_TOKEN"] = "***HIDDEN***"
         elif data["auth_method"] == "personal_access_token":
             preview["ATLASSIAN_PERSONAL_ACCESS_TOKEN"] = "***HIDDEN***"
+        elif data["auth_method"] == "oauth2_client_credentials":
+            preview["ATLASSIAN_OAUTH2_CLIENT_ID"] = data["client_id"]
+            preview["ATLASSIAN_OAUTH2_CLIENT_SECRET"] = "***HIDDEN***"
         else:
             preview["ATLASSIAN_USERNAME"] = data["username"]
             preview["ATLASSIAN_PASSWORD"] = "***HIDDEN***"
@@ -2122,36 +2177,18 @@ class AtlassianSettingsDiscoveryViewSet(CheckExtensionMixin, core_views.ActionsV
 
         # Save settings to constance
         try:
-            # URL and options
-            setattr(config, "ATLASSIAN_API_URL", data["api_url"])
+            # URL and options; a Cloud site URL is stored as its API gateway URL
+            # when the credentials need it.
+            setattr(config, "ATLASSIAN_API_URL", service.api_url)
             setattr(config, "ATLASSIAN_VERIFY_SSL", data.get("verify_ssl", True))
 
-            # Auth credentials based on method
-            if data["auth_method"] == "api_token":
-                setattr(config, "ATLASSIAN_EMAIL", data["email"])
-                setattr(config, "ATLASSIAN_TOKEN", data["token"])
-                # Clear other auth methods
-                setattr(config, "ATLASSIAN_PERSONAL_ACCESS_TOKEN", "")
-                setattr(config, "ATLASSIAN_USERNAME", "")
-                setattr(config, "ATLASSIAN_PASSWORD", "")
-            elif data["auth_method"] == "personal_access_token":
-                setattr(
-                    config,
-                    "ATLASSIAN_PERSONAL_ACCESS_TOKEN",
-                    data["personal_access_token"],
-                )
-                # Clear other auth methods
-                setattr(config, "ATLASSIAN_EMAIL", "")
-                setattr(config, "ATLASSIAN_TOKEN", "")
-                setattr(config, "ATLASSIAN_USERNAME", "")
-                setattr(config, "ATLASSIAN_PASSWORD", "")
-            else:
-                setattr(config, "ATLASSIAN_USERNAME", data["username"])
-                setattr(config, "ATLASSIAN_PASSWORD", data["password"])
-                # Clear other auth methods
-                setattr(config, "ATLASSIAN_EMAIL", "")
-                setattr(config, "ATLASSIAN_TOKEN", "")
-                setattr(config, "ATLASSIAN_PERSONAL_ACCESS_TOKEN", "")
+            # Store the chosen method's credentials and clear every other one.
+            # The backend picks the first method it finds configured (OAuth 2.0
+            # first), so a leftover credential would override the new one.
+            chosen = ATLASSIAN_CREDENTIAL_SETTINGS[data["auth_method"]]
+            for setting in ATLASSIAN_CREDENTIAL_KEYS:
+                field = chosen.get(setting)
+                setattr(config, setting, data[field] if field else "")
 
             # Project settings
             setattr(config, "ATLASSIAN_PROJECT_ID", data["project_id"])
@@ -2263,7 +2300,7 @@ class AtlassianSettingsDiscoveryViewSet(CheckExtensionMixin, core_views.ActionsV
         )
 
         settings_data = {
-            "ATLASSIAN_API_URL": config.ATLASSIAN_API_URL,
+            "ATLASSIAN_API_URL": _configured_setting("ATLASSIAN_API_URL"),
             "ATLASSIAN_PROJECT_ID": config.ATLASSIAN_PROJECT_ID,
             "ATLASSIAN_VERIFY_SSL": config.ATLASSIAN_VERIFY_SSL,
             "ATLASSIAN_USE_OLD_API": config.ATLASSIAN_USE_OLD_API,
@@ -2285,23 +2322,31 @@ class AtlassianSettingsDiscoveryViewSet(CheckExtensionMixin, core_views.ActionsV
             "ATLASSIAN_DEFAULT_OFFERING_ISSUE_TYPE": config.ATLASSIAN_DEFAULT_OFFERING_ISSUE_TYPE,
             # Credentials info for pre-filling (secrets are not returned)
             "ATLASSIAN_EMAIL": config.ATLASSIAN_EMAIL,
-            "ATLASSIAN_USERNAME": config.ATLASSIAN_USERNAME,
-            # Determine which auth method is configured
-            "auth_method": (
-                "api_token"
-                if config.ATLASSIAN_TOKEN
-                else (
-                    "personal_access_token"
-                    if config.ATLASSIAN_PERSONAL_ACCESS_TOKEN
-                    else ("basic" if config.ATLASSIAN_PASSWORD else None)
-                )
-            ),
-            "auth_configured": bool(
-                config.ATLASSIAN_TOKEN
-                or config.ATLASSIAN_PERSONAL_ACCESS_TOKEN
-                or config.ATLASSIAN_PASSWORD
-            ),
+            "ATLASSIAN_USERNAME": _configured_setting("ATLASSIAN_USERNAME"),
+            "ATLASSIAN_OAUTH2_CLIENT_ID": config.ATLASSIAN_OAUTH2_CLIENT_ID,
         }
+        # The configured auth method, in the backend's order of preference
+        settings_data["auth_method"] = next(
+            (
+                method
+                for method, configured in (
+                    (
+                        "oauth2_client_credentials",
+                        config.ATLASSIAN_OAUTH2_CLIENT_ID
+                        and config.ATLASSIAN_OAUTH2_CLIENT_SECRET,
+                    ),
+                    (
+                        "personal_access_token",
+                        config.ATLASSIAN_PERSONAL_ACCESS_TOKEN,
+                    ),
+                    ("api_token", config.ATLASSIAN_TOKEN),
+                    ("basic", _configured_setting("ATLASSIAN_PASSWORD")),
+                )
+                if configured
+            ),
+            None,
+        )
+        settings_data["auth_configured"] = settings_data["auth_method"] is not None
 
         return response.Response(settings_data, status=status.HTTP_200_OK)
 

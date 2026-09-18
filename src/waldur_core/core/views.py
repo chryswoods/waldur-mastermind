@@ -107,6 +107,7 @@ from waldur_core.permissions.enums import (
 from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import check_pat_support_scope
 from waldur_core.structure.permissions import IsStaffOrSupportUser
+from waldur_core.web_shell import tickets as web_shell_tickets
 
 logger = logging.getLogger(__name__)
 
@@ -690,6 +691,12 @@ def get_public_settings(request=None):
                     "client_id": provider.client_id,
                     "auth_url": provider.auth_url,
                 }
+    if "WALDUR_CORE" in public_settings:
+        # The effective state, not the raw setting: the web shell also needs
+        # DEBUG, and its URL is handed out to staff only, by the ticket endpoint.
+        public_settings["WALDUR_CORE"]["WEB_SHELL_ENABLED"] = (
+            web_shell_tickets.is_enabled()
+        )
     public_settings["WALDUR_SUPPORT"] = get_constance_plugin_settings(
         all_constance_values,
         "WALDUR_SUPPORT",
@@ -2117,7 +2124,13 @@ class PermissionMetadataView(APIView):
 
 
 class EventMetadataView(APIView):
-    """Provides event metadata grouped by event categories."""
+    """Provides event metadata grouped by event categories.
+
+    Deliberately NOT narrowed by waldur_core.logging.availability, unlike
+    /api/events/event_groups/. This endpoint is the static enum export, and it
+    is unauthenticated: narrowing it would publish which plugins a deployment
+    runs to anonymous callers. Discovery UIs should read the events endpoint.
+    """
 
     permission_classes = []
     authentication_classes = []

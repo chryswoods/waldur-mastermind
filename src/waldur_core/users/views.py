@@ -35,6 +35,7 @@ from waldur_core.users.utils import (
     can_manage_invitation_with,
     can_manage_permission_request,
     get_invitation_duplicates,
+    get_invitation_existing_roles,
     parse_invitation_token,
 )
 
@@ -197,7 +198,8 @@ class InvitationViewSet(viewsets.ModelViewSet):
         summary="Check for duplicate invitations",
         description=(
             "Returns pending invitations that already exist for the same email and role "
-            "within the given scope."
+            "within the given scope, along with the active roles those emails already "
+            "hold in it."
         ),
         request=serializers.InvitationDuplicateCheckSerializer,
         responses=serializers.InvitationDuplicateCheckResponseSerializer,
@@ -216,12 +218,13 @@ class InvitationViewSet(viewsets.ModelViewSet):
 
         invitations = serializer.validated_data["invitations"]
         if not invitations:
-            return Response({"duplicates": []})
+            return Response({"duplicates": [], "existing_roles": []})
 
         duplicates = get_invitation_duplicates(scope, invitations)
+        existing_roles = get_invitation_existing_roles(scope, invitations)
 
         response_serializer = serializers.InvitationDuplicateCheckResponseSerializer(
-            {"duplicates": duplicates}
+            {"duplicates": duplicates, "existing_roles": existing_roles}
         )
         return Response(response_serializer.data)
 
@@ -396,7 +399,9 @@ class InvitationViewSet(viewsets.ModelViewSet):
     def accept(self, request, uuid=None):
         invitation: models.Invitation = self.get_object()
 
-        if has_user(invitation.scope, request.user, invitation.role):
+        if has_user(
+            invitation.scope, request.user, invitation.role, match_clones=False
+        ):
             raise ValidationError(_("User has already the same role in this scope."))
 
         if invitation.email.casefold() != request.user.email.casefold():
@@ -618,7 +623,7 @@ class GroupInvitationViewSet(ActionsViewSet):
             raise ValidationError(_("Only pending invitation can be requested."))
 
         # Check if user already has the requested role in the scope
-        if has_user(invitation.scope, user, invitation.role):
+        if has_user(invitation.scope, user, invitation.role, match_clones=False):
             raise ValidationError(_("User already has this role in the scope."))
 
         # Check if multiple roles are disabled for this scope

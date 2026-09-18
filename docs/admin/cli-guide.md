@@ -2,24 +2,19 @@
 
 ## ai_assistant
 
-AI Assistant management commands.
+Check the AI Assistant's configuration and score it against the
+validation scenario packs. The subcommands are listed below; each
+takes --help of its own.
 
-  Available subcommands:
-
-```yaml
-health       - Check AI Assistant infrastructure health
-validate_scenarios - Validate scenario YAML files
-test_evaluation   - Test evaluation with real AI Assistant responses
-run_all       - Run all checks (health, validate, test)
-```
-
-  Examples:
+Examples:
 
 ```yaml
 waldur ai_assistant health
 waldur ai_assistant validate_scenarios
 waldur ai_assistant test_evaluation
 waldur ai_assistant test_evaluation --scenario greeting_no_tool
+waldur ai_assistant test_evaluation --user support --preload-tools
+waldur ai_assistant test_evaluation --preset credit_realistic
 waldur ai_assistant run_all
 ```
 
@@ -31,10 +26,12 @@ usage: waldur ai_assistant
 positional arguments:
   {health,validate_scenarios,test_evaluation,run_all}
                         Available subcommands
-    health              Check AI Assistant infrastructure health
-    validate_scenarios  Validate scenario YAML files
-    test_evaluation     Test evaluation with real AI Assistant responses
-    run_all             Run all checks (health, validate, test)
+    health              Check the LLM configuration, endpoint and a live
+                        request
+    validate_scenarios  Parse the scenario packs and report what they cover
+    test_evaluation     Put the scenario packs to the live LLM and score the
+                        answers
+    run_all             health, then validate_scenarios, then test_evaluation
 
 ```
 
@@ -208,6 +205,42 @@ options:
 ## check_provider_helpdesks
 
 Check connectivity of all active provider helpdesks.
+
+## check_role_names
+
+Report malformed, mis-scoped and silently global roles.
+
+  Read-only: nothing is created, changed or deleted. Exits with status 1 when
+  an error-severity finding is reported, so it can run as an ops check. The
+  status follows what the filters actually report.
+
+  Usage:
+
+```yaml
+waldur check_role_names
+waldur check_role_names --severity warning
+waldur check_role_names --format json
+waldur check_role_names --check global-custom-role --check org-role-unmanaged
+```
+
+```bash
+
+usage: waldur check_role_names [--format {text,json}]
+                               [--severity {error,warning,info}]
+                               [--check {clone-name-drift,cross-scope-permission,global-custom-role,label-equals-name,label-missing,multi-org-binding,name-not-a-code,org-role-unmanaged,scope-prefix-mismatch,system-name-unknown,system-scope-mismatch,template-without-scope}]
+                               [--exit-zero]
+
+options:
+  --format {text,json}  Output format (default: text)
+  --severity {error,warning,info}
+                        Lowest severity to report (default: info, i.e.
+                        everything)
+  --check {clone-name-drift,cross-scope-permission,global-custom-role,label-equals-name,label-missing,multi-org-binding,name-not-a-code,org-role-unmanaged,scope-prefix-mismatch,system-name-unknown,system-scope-mismatch,template-without-scope}
+                        Report only this check; repeat for several
+  --exit-zero           Always exit with status 0, even when errors are
+                        reported
+
+```
 
 ## clean_celery_results
 
@@ -713,22 +746,6 @@ positional arguments:
 
 ```
 
-## import_azure_image
-
-Import Azure image
-
-```bash
-
-usage: waldur import_azure_image [--sku SKU] [--publisher PUBLISHER]
-                                 [--offer OFFER]
-
-options:
-  --sku SKU
-  --publisher PUBLISHER
-  --offer OFFER
-
-```
-
 ## import_marketplace_orders
 
 Create marketplace order for each resource if it does not yet exist.
@@ -864,6 +881,10 @@ options:
 
 ```
 
+## init_service_desk_defaults
+
+Seed the terminal issue statuses, and the default request type used by the built-in service desk. Existing rows are left untouched, so the command is safe to re-run. Request types are seeded only when the active backend is one Waldur owns; a deployment backed by a remote service desk gets its types from there.
+
 ## list_missing_resources
 
 List OpenStack resources which are marked as missing at the backend. Deletion is left to the operator: each resource is linked to a marketplace resource, invoice items and order history.
@@ -943,11 +964,20 @@ Sync notifications and their templates from a JSON/YAML config file to the DB.
 
 ```bash
 
-usage: waldur load_notifications notifications_file
+usage: waldur load_notifications [--prune] notifications_file
 
 positional arguments:
   notifications_file  Path to a JSON or YAML file mapping notification keys to
                       their enabled status (bool).
+
+options:
+  --prune             Delete Notification rows whose key is no longer in the
+                      NOTIFICATIONS registry, along with any of their
+                      templates that are not shared with a registered
+                      notification and have no operator-customised content.
+                      Without this flag, orphaned rows are only reported.
+                      Never enabled by default (e.g. by initdb) — an
+                      unattended boot should not delete data.
 
 ```
 
@@ -1354,6 +1384,25 @@ options:
 
 Create or update price estimates based on invoices.
 
+## reconcile_autoprovisioned_roles
+
+Re-apply auto-provisioning rules, granting and revoking roles.
+
+```bash
+
+usage: waldur reconcile_autoprovisioned_roles (--username USERNAME | --all)
+                                              [--dry-run] [--rate RATE]
+
+options:
+  --username USERNAME  Reconcile a single user identified by their Waldur
+                       username.
+  --all                Reconcile every active user.
+  --dry-run            Report what would change without writing anything.
+  --rate RATE          Users per second when using --all. 0 (default) means no
+                       limit.
+
+```
+
 ## reencrypt_fields
 
 Re-encrypt stored secrets under the current FIELD_ENCRYPTION_KEY. Run this after promoting a new key (with the previous one in FIELD_ENCRYPTION_KEY_FALLBACKS) so the old key can then be retired; rows are otherwise only re-encrypted when they happen to be rewritten. Use --dry-run to audit which rows the configured keys can still decrypt.
@@ -1370,6 +1419,20 @@ options:
 ## removestalect
 
 Remove Django event log records with stale content types.
+
+## reprovision_matrix_rooms
+
+Reset every active Matrix room and provisioned user profile so the homeserver rebuilds them. Use after moving to a new homeserver, whose room ids and user tokens are different from the old one's. Do not run it against the homeserver the rooms already live on: old rooms are not deleted, so each one keeps its history while Waldur replaces it with an empty room. Equivalent to POST /api/admin/matrix/reprovision/, for deployments where reaching the API as staff is harder than reaching a shell.
+
+```bash
+
+usage: waldur reprovision_matrix_rooms [--dry-run] [-y]
+
+options:
+  --dry-run  Report what would be reset without writing anything
+  -y, --yes  Do not prompt for confirmation
+
+```
 
 ## resource_access_subnets
 
@@ -1502,6 +1565,10 @@ options:
 
 ```
 
+## sram_resync
+
+Re-apply the last SCIM payload SRAM pushed for every group, e.g. after upgrading or changing SRAM settings. SRAM itself only re-sends changed groups.
+
 ## status
 
 Check status of Waldur MasterMind configured services
@@ -1598,5 +1665,22 @@ options:
                         UUID of OpenStack offering to test against (creates
                         temporary tenant)
   --quiet               Suppress SSL warnings and other verbose output
+
+```
+
+## web_shell
+
+Serve `waldur shell` to staff in the browser. Development only: needs DEBUG, WALDUR_CORE['WEB_SHELL_ENABLED'] and WALDUR_CORE['WEB_SHELL_URL'].
+
+```bash
+
+usage: waldur web_shell [--host HOST] [--port PORT] [--fetch-assets]
+                        [--mint USERNAME]
+
+options:
+  --host HOST
+  --port PORT      Port to listen on. Defaults to the port of WEB_SHELL_URL.
+  --fetch-assets   Download ghostty-web 0.4.0-waldur.2 and exit.
+  --mint USERNAME  Print a single-use link for a staff user and exit.
 
 ```

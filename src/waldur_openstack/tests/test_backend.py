@@ -12,6 +12,7 @@ from novaclient import exceptions as nova_exceptions
 from novaclient.v2.flavors import Flavor
 from novaclient.v2.servers import Server
 
+from waldur_core.core import utils as core_utils
 from waldur_core.core.models import CoreStates
 from waldur_openstack import models
 from waldur_openstack.backend import OpenStackBackend
@@ -425,6 +426,100 @@ class PullVolumeTest(BaseBackendTest):
         volume.refresh_from_db()
 
         self.assertEqual(volume.image, None)
+
+    def test_volume_of_provisioning_instance_keeps_its_attachment_fields(self):
+        # Cinder reports no attachment and bootable="false" until the Nova
+        # server exists. Reconciling that would unlink the volume from the
+        # instance being created and make create_instance fail its
+        # `volumes.get(bootable=True)` guard.
+        vm = factories.InstanceFactory(
+            backend_id="",
+            state=CoreStates.CREATING,
+            tenant=self.fixture.tenant,
+            project=self.fixture.project,
+        )
+        volume = factories.VolumeFactory(
+            backend_id=self.backend_volume_id,
+            instance=vm,
+            bootable=True,
+            tenant=self.fixture.tenant,
+            project=self.fixture.project,
+        )
+        self.backend_volume.attachments = []
+        self.backend_volume.bootable = "false"
+
+        self.backend.pull_volume(volume)
+        volume.refresh_from_db()
+
+        self.assertEqual(volume.instance, vm)
+        self.assertTrue(volume.bootable)
+
+    def test_volume_of_provisioned_instance_is_reconciled(self):
+        vm = factories.InstanceFactory(
+            backend_id="instance_backend_id",
+            state=CoreStates.OK,
+            tenant=self.fixture.tenant,
+            project=self.fixture.project,
+        )
+        volume = factories.VolumeFactory(
+            backend_id=self.backend_volume_id,
+            instance=vm,
+            bootable=True,
+            tenant=self.fixture.tenant,
+            project=self.fixture.project,
+        )
+        self.backend_volume.attachments = []
+        self.backend_volume.bootable = "false"
+
+        self.backend.pull_volume(volume)
+        volume.refresh_from_db()
+
+        self.assertIsNone(volume.instance)
+        self.assertFalse(volume.bootable)
+
+
+class PullTenantVolumesTest(BaseBackendTest):
+    def _pull(self, volume, **backend_volume_fields):
+        backend_volume = self._get_valid_volume(volume.backend_id)
+        for name, value in backend_volume_fields.items():
+            setattr(backend_volume, name, value)
+        self.mocked_cinder.volumes.list.return_value = [backend_volume]
+        self.backend.pull_tenant_volumes(self.tenant)
+        volume.refresh_from_db()
+
+    def _create_volume(self, instance_state):
+        vm = factories.InstanceFactory(
+            backend_id="" if instance_state != CoreStates.OK else "instance_backend_id",
+            state=instance_state,
+            tenant=self.fixture.tenant,
+            project=self.fixture.project,
+        )
+        volume = factories.VolumeFactory(
+            instance=vm,
+            bootable=True,
+            state=CoreStates.OK,
+            tenant=self.fixture.tenant,
+            project=self.fixture.project,
+        )
+        return vm, volume
+
+    def test_volume_of_provisioning_instance_keeps_its_attachment_fields(self):
+        # The periodic tenant pull runs while an instance is still being
+        # created: it must not detach the volumes of that instance.
+        vm, volume = self._create_volume(CoreStates.CREATING)
+
+        self._pull(volume, attachments=[], bootable="false")
+
+        self.assertEqual(volume.instance, vm)
+        self.assertTrue(volume.bootable)
+
+    def test_volume_of_provisioned_instance_is_reconciled(self):
+        _, volume = self._create_volume(CoreStates.OK)
+
+        self._pull(volume, attachments=[], bootable="false")
+
+        self.assertIsNone(volume.instance)
+        self.assertFalse(volume.bootable)
 
 
 class PullInstanceAvailabilityZonesTest(BaseBackendTest):
@@ -1243,6 +1338,96 @@ class PullInstanceFloatingIpsTest(BaseBackendTest):
         self.assertEqual(ip2, fip.port)
 
 
+class AttachFloatingIpToPortTest(BaseBackendTest):
+    """Neutron answers an association with both sides of the mapping:
+    `floating_ip_address` is the floating IP's own, public address and
+    `fixed_ip_address` the port's internal one. `FloatingIP.address` is the
+    former; the latter lives on the port the floating IP now points at, which
+    is also all a pull records."""
+
+    FLOATING_ADDRESS = "203.0.113.10"
+
+    def setUp(self):
+        super().setUp()
+        self.floating_ip = FloatingIPFactory(
+            tenant=self.tenant,
+            service_settings=self.openstack_settings,
+            project=self.tenant.project,
+            address=self.FLOATING_ADDRESS,
+            backend_network_id="external-network-id",
+            runtime_state="DOWN",
+            port=None,
+        )
+
+    def _attach(self, fixed_ip_address):
+        port = PortFactory(
+            tenant=self.tenant,
+            network=self.fixture.network,
+            subnet=self.fixture.subnet,
+            backend_id="attached-port-backend-id",
+            fixed_ips=[
+                {
+                    "ip_address": fixed_ip_address,
+                    "subnet_id": self.fixture.subnet.backend_id,
+                }
+            ],
+        )
+        backend_floating_ip = {
+            "id": self.floating_ip.backend_id,
+            "description": "",
+            "floating_ip_address": self.FLOATING_ADDRESS,
+            "floating_network_id": "external-network-id",
+            "fixed_ip_address": fixed_ip_address,
+            "port_id": port.backend_id,
+            "status": "ACTIVE",
+        }
+        self.mocked_neutron.update_floatingip.return_value = {
+            "floatingip": backend_floating_ip
+        }
+
+        self.backend.attach_floating_ip_to_port(
+            self.floating_ip, core_utils.serialize_instance(port)
+        )
+
+        self.floating_ip.refresh_from_db()
+        return port, backend_floating_ip
+
+    def test_address_stays_the_floating_address(self):
+        port, _ = self._attach("192.168.42.5")
+
+        self.assertEqual(self.floating_ip.address, self.FLOATING_ADDRESS)
+        self.assertEqual(self.floating_ip.port, port)
+        self.assertEqual(self.floating_ip.runtime_state, "ACTIVE")
+
+    def test_attach_records_what_a_pull_of_the_same_floating_ip_would(self):
+        _, backend_floating_ip = self._attach("192.168.42.5")
+
+        pulled = self.backend._backend_floating_ip_to_floating_ip(
+            backend_floating_ip, self.tenant
+        )
+        for field in ("address", "port", "runtime_state", "backend_network_id"):
+            self.assertEqual(
+                getattr(self.floating_ip, field), getattr(pulled, field), field
+            )
+        self.assertIn(
+            "192.168.42.5",
+            [fixed_ip["ip_address"] for fixed_ip in self.floating_ip.port.fixed_ips],
+        )
+
+    def test_a_port_with_an_ipv6_fixed_address_can_be_attached(self):
+        """FloatingIP.address is an IPv4 field; the port's IPv6 address has
+        no business in it."""
+        port, _ = self._attach("2001:db8:42::5")
+
+        self.assertEqual(self.floating_ip.address, self.FLOATING_ADDRESS)
+        self.assertEqual(self.floating_ip.port, port)
+        # Postgres' inet column takes either family, so only the field's own
+        # validation says whether the stored value belongs there.
+        models.FloatingIP._meta.get_field("address").clean(
+            self.floating_ip.address, self.floating_ip
+        )
+
+
 class PushInstanceFloatingIpsTest(BaseBackendTest):
     # Regression: push_instance_floating_ips calls
     # update_floatingip(port_id=floating_ip.port.backend_id). If the port row
@@ -1426,6 +1611,22 @@ class CreateInstanceTest(VolumesBaseTest):
         self.assertIn("port creation likely failed earlier", str(ctx.exception))
         self.mocked_nova.servers.create.assert_not_called()
 
+    def test_metadata_is_passed_to_nova_client(self):
+        instance = self.fixture.instance
+        instance.metadata = {"env": "prod", "role": "db"}
+        instance.save()
+
+        self.backend.create_instance(instance, self.flavor_id)
+
+        kwargs = self.mocked_nova.servers.create.mock_calls[0][2]
+        self.assertEqual(kwargs["meta"], {"env": "prod", "role": "db"})
+
+    def test_metadata_is_omitted_when_empty(self):
+        self.backend.create_instance(self.fixture.instance, self.flavor_id)
+
+        kwargs = self.mocked_nova.servers.create.mock_calls[0][2]
+        self.assertNotIn("meta", kwargs)
+
     def test_config_drive_per_instance_true_overrides_tenant_false(self):
         # Per-instance True must win over tenant-wide False.
         self.openstack_settings.options["config_drive"] = False
@@ -1463,6 +1664,91 @@ class CreateInstanceTest(VolumesBaseTest):
 
         kwargs = self.mocked_nova.servers.create.mock_calls[0][2]
         self.assertIs(kwargs["config_drive"], True)
+
+
+class InstanceMetadataTest(BaseBackendTest):
+    """Nova instance metadata plumbing [#190]."""
+
+    def setUp(self):
+        super().setUp()
+        self.instance = self.fixture.instance
+
+    def test_metadata_is_pushed_and_stale_keys_are_deleted(self):
+        # Nova's set_meta merges, so keys dropped from the field have to be
+        # deleted explicitly for the push to be a replace.
+        self.mocked_nova.servers.get.return_value.metadata = {
+            "env": "staging",
+            "owner": "team-a",
+        }
+        self.instance.metadata = {"env": "prod"}
+        self.instance.save()
+
+        self.backend.push_instance_metadata(self.instance)
+
+        self.mocked_nova.servers.set_meta.assert_called_once_with(
+            self.instance.backend_id, {"env": "prod"}
+        )
+        self.mocked_nova.servers.delete_meta.assert_called_once_with(
+            self.instance.backend_id, ["owner"]
+        )
+
+    def test_stale_keys_are_deleted_before_the_new_ones_are_pushed(self):
+        # Nova checks metadata_items quota against the merged result of the
+        # POST, so a push that precedes the prune can trip the quota even when
+        # the requested end state fits within it.
+        self.mocked_nova.servers.get.return_value.metadata = {"owner": "team-a"}
+        self.instance.metadata = {"env": "prod"}
+        self.instance.save()
+
+        self.backend.push_instance_metadata(self.instance)
+
+        called = [
+            call[0]
+            for call in self.mocked_nova.servers.mock_calls
+            if call[0] in ("delete_meta", "set_meta")
+        ]
+        self.assertEqual(called, ["delete_meta", "set_meta"])
+
+    def test_server_without_metadata_attribute_is_tolerated(self):
+        # A partial (down-cell) server response may not carry metadata at all;
+        # that must not escape as an AttributeError.
+        del self.mocked_nova.servers.get.return_value.metadata
+        self.instance.metadata = {"env": "prod"}
+        self.instance.save()
+
+        self.backend.push_instance_metadata(self.instance)
+
+        self.mocked_nova.servers.set_meta.assert_called_once_with(
+            self.instance.backend_id, {"env": "prod"}
+        )
+        self.mocked_nova.servers.delete_meta.assert_not_called()
+
+    def test_push_of_empty_metadata_only_deletes(self):
+        self.mocked_nova.servers.get.return_value.metadata = {"env": "staging"}
+        self.instance.metadata = {}
+        self.instance.save()
+
+        self.backend.push_instance_metadata(self.instance)
+
+        self.mocked_nova.servers.set_meta.assert_not_called()
+        self.mocked_nova.servers.delete_meta.assert_called_once_with(
+            self.instance.backend_id, ["env"]
+        )
+
+    def test_push_skips_delete_when_nothing_became_stale(self):
+        self.mocked_nova.servers.get.return_value.metadata = {"env": "staging"}
+        self.instance.metadata = {"env": "prod", "role": "db"}
+        self.instance.save()
+
+        self.backend.push_instance_metadata(self.instance)
+
+        self.mocked_nova.servers.delete_meta.assert_not_called()
+
+    def test_client_error_is_wrapped(self):
+        self.mocked_nova.servers.get.side_effect = nova_exceptions.ClientException(500)
+
+        with self.assertRaises(OpenStackBackendError):
+            self.backend.push_instance_metadata(self.instance)
 
 
 class CreateServerGroupTest(BaseBackendTest):
@@ -1946,6 +2232,18 @@ class GetConsoleUrlDomainOverrideTest(BaseBackendTest):
         self.original_url = "http://nova-console.internal/vnc_auto.html?token=abc123"
         url = self._get_console_url("lb.example.com:443")
         self.assertEqual(url, "http://lb.example.com:443/vnc_auto.html?token=abc123")
+
+    def test_bare_ipv6_override_is_bracketed_and_keeps_original_port(self):
+        url = self._get_console_url("2001:db8::20")
+        self.assertEqual(url, "http://[2001:db8::20]:13080/vnc_auto.html?token=abc123")
+
+    def test_bracketed_ipv6_override_keeps_original_port(self):
+        url = self._get_console_url("[2001:db8::20]")
+        self.assertEqual(url, "http://[2001:db8::20]:13080/vnc_auto.html?token=abc123")
+
+    def test_bracketed_ipv6_and_port_override_replaces_both(self):
+        url = self._get_console_url("[2001:db8::20]:443")
+        self.assertEqual(url, "http://[2001:db8::20]:443/vnc_auto.html?token=abc123")
 
     def test_no_override_returns_original_url(self):
         self.mocked_nova.servers.get_console_url.return_value = {
@@ -2464,3 +2762,73 @@ class PushInstancePortsTest(BaseBackendTest):
         diagnosis = "\n".join(logs.output)
         self.assertIn("Could not reclaim", diagnosis)
         self.assertIn("compute:nova", diagnosis)
+
+
+class DetachFloatingIpFromPortTest(BaseBackendTest):
+    """Detaching only clears the floating IP's port: Neutron keeps it allocated
+    to the tenant with its address, and answers the update with that address."""
+
+    FLOATING_ADDRESS = "203.0.113.10"
+
+    def setUp(self):
+        super().setUp()
+        self.port = PortFactory(
+            tenant=self.tenant,
+            network=self.fixture.network,
+            subnet=self.fixture.subnet,
+            backend_id="attached-port-backend-id",
+        )
+        self.floating_ip = FloatingIPFactory(
+            tenant=self.tenant,
+            service_settings=self.openstack_settings,
+            project=self.tenant.project,
+            address=self.FLOATING_ADDRESS,
+            backend_network_id="external-network-id",
+            runtime_state="ACTIVE",
+            port=self.port,
+        )
+        self.backend_floating_ip = {
+            "id": self.floating_ip.backend_id,
+            "description": "",
+            "floating_ip_address": self.FLOATING_ADDRESS,
+            "floating_network_id": "external-network-id",
+            "fixed_ip_address": None,
+            "port_id": None,
+            "status": "DOWN",
+        }
+        self.mocked_neutron.update_floatingip.return_value = {
+            "floatingip": self.backend_floating_ip
+        }
+
+    def _detach(self):
+        self.backend.detach_floating_ip_from_port(self.floating_ip)
+        self.floating_ip.refresh_from_db()
+
+    def test_address_is_kept(self):
+        self._detach()
+
+        self.assertEqual(self.floating_ip.address, self.FLOATING_ADDRESS)
+        self.assertIsNone(self.floating_ip.port)
+        self.assertEqual(self.floating_ip.runtime_state, "DOWN")
+        self.mocked_neutron.update_floatingip.assert_called_once_with(
+            self.floating_ip.backend_id, {"floatingip": {"port_id": None}}
+        )
+
+    def test_detach_records_what_a_pull_of_the_same_floating_ip_would(self):
+        self._detach()
+
+        pulled = self.backend._backend_floating_ip_to_floating_ip(
+            self.backend_floating_ip, self.tenant
+        )
+        for field in ("address", "port", "runtime_state"):
+            self.assertEqual(
+                getattr(self.floating_ip, field), getattr(pulled, field), field
+            )
+
+    def test_a_blank_address_is_restored_from_neutron(self):
+        models.FloatingIP.objects.filter(pk=self.floating_ip.pk).update(address=None)
+        self.floating_ip.refresh_from_db()
+
+        self._detach()
+
+        self.assertEqual(self.floating_ip.address, self.FLOATING_ADDRESS)

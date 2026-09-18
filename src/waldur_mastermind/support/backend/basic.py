@@ -8,7 +8,7 @@ from django.utils import timezone
 
 from waldur_mastermind.support import models
 
-from . import SupportBackend, SupportBackendError
+from . import SupportBackend, SupportBackendError, build_backend_id
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ class BasicBackend(SupportBackend):
         return cls()
 
     def create_issue(self, issue):
-        issue.backend_id = f"WLD-{issue.uuid.hex[:8].upper()}"
+        issue.backend_id = build_backend_id(issue.uuid)
         issue.key = issue.backend_id
 
         if not issue.status:
@@ -65,7 +65,7 @@ class BasicBackend(SupportBackend):
         return
 
     def create_comment(self, comment):
-        comment.backend_id = f"WLD-C-{comment.uuid.hex[:8].upper()}"
+        comment.backend_id = build_backend_id(comment.uuid, "C")
         comment.save(update_fields=["backend_id"])
 
         # Track first response time
@@ -81,11 +81,49 @@ class BasicBackend(SupportBackend):
         return
 
     def create_attachment(self, attachment):
-        attachment.backend_id = f"WLD-A-{attachment.uuid.hex[:8].upper()}"
+        attachment.backend_id = build_backend_id(attachment.uuid, "A")
         attachment.save(update_fields=["backend_id"])
 
     def delete_attachment(self, attachment):
         return
+
+    def issue_is_active(self, issue) -> bool:
+        """Cheaper than the base predicate, and answers the same question.
+
+        `resolution_date` is a stored column that `update_issue`, `set_resolved`
+        and `set_canceled` keep in step with the status, and it is already what
+        `Issue.objects.open()`, the SLA badge and the support statistics key
+        off. Reading it costs nothing, where the base `resolved` property runs
+        three or four queries every time. That matters here because these
+        predicates are serialized per issue *and per comment*: on the base
+        implementation a fifty-comment thread paid several hundred queries and
+        as many log lines to render.
+        """
+        return issue is not None and issue.resolution_date is None
+
+    # A ticket that has reached Resolved or Canceled is closed for changes.
+    # Staff are not exempt: the way to add something to a closed ticket is to
+    # reopen it, which staff and support can already do. This mirrors the SMAX
+    # backend, and keeps `add_comment_is_available` a property of the ticket
+    # rather than of whoever is asking.
+    def comment_create_is_available(self, issue=None):
+        return self.issue_is_active(issue)
+
+    def comment_update_is_available(self, comment=None):
+        return self.issue_is_active(comment.issue)
+
+    def comment_destroy_is_available(self, comment=None):
+        return self.issue_is_active(comment.issue)
+
+    def attachment_create_is_available(self, issue=None):
+        return self.issue_is_active(issue)
+
+    def attachment_destroy_is_available(self, attachment=None):
+        # Deliberately not gated on the ticket being open. Closing a ticket must
+        # not strip the only supported way to remove a file from it: an erasure
+        # request arrives long after the ticket is resolved, and the alternative
+        # is the Django admin or a shell.
+        return True
 
     def get_users(self):
         return
@@ -141,9 +179,6 @@ class BasicBackend(SupportBackend):
         else:
             candidates = self._registered_statuses
         return sorted(candidates - {issue.status})
-
-    def attachment_destroy_is_available(self, attachment=None):
-        return True
 
     def _set_sla_deadlines(self, issue):
         response_hours = config.WALDUR_SUPPORT_SLA_RESPONSE_HOURS

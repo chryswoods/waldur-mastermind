@@ -119,6 +119,42 @@ from waldur_mastermind.proposal.models import (
 )
 from waldur_openstack.models import Flavor, Image, Instance, Tenant, Volume
 
+OPENSTACK_TENANT_OFFERING = "OpenStack.Tenant"
+VOLUME_TYPE_COMPONENT_PREFIX = "gigabytes_"
+
+
+def is_plugin_provided_component(offering_type, component_type):
+    """The rule ``OfferingComponent.billed_per_plan`` replaced.
+
+    Used only for dumps taken before the field existed, so that importing one
+    reproduces what the offering would have resolved to at the time.
+    """
+    from waldur_mastermind.marketplace import plugins
+
+    if component_type in plugins.manager.get_component_types(offering_type):
+        return True
+    return offering_type == OPENSTACK_TENANT_OFFERING and component_type.startswith(
+        VOLUME_TYPE_COMPONENT_PREFIX
+    )
+
+
+def _without_delegated(defaults: dict, offering_user) -> dict:
+    """Drop the columns a provider account owns, when this row is backed by one.
+
+    These two updates go through ``QuerySet.update()``, which bypasses
+    ``Model.save()`` and so bypasses the refusal there. They are the only paths
+    that could leave a backed account's cached username diverged from its
+    parent in the database, and a dump is exactly where a stale one would come
+    from.
+    """
+    if not offering_user.is_provider_backed:
+        return defaults
+    return {
+        key: value
+        for key, value in defaults.items()
+        if key not in ("username", "backend_metadata")
+    }
+
 
 class Command(BaseCommand):
     help = """
@@ -4344,6 +4380,7 @@ class Command(BaseCommand):
                     "max_amount": plan_data.get("max_amount"),
                     "article_code": plan_data.get("article_code", ""),
                     "backend_id": plan_data.get("backend_id", ""),
+                    "billing_mode": plan_data.get("billing_mode", "inherit"),
                 }
 
                 if not self.dry_run:
@@ -4418,6 +4455,9 @@ class Command(BaseCommand):
                     "limit_period": component_data.get("limit_period")
                     or LimitPeriods.MONTH,
                     "limit_amount": component_data.get("limit_amount"),
+                    "limit_decimal_places": component_data.get(
+                        "limit_decimal_places", 0
+                    ),
                     "min_value": component_data.get("min_value"),
                     "max_value": component_data.get("max_value"),
                     "min_prepaid_duration": component_data.get("min_prepaid_duration"),
@@ -4431,6 +4471,15 @@ class Command(BaseCommand):
                         "renewal_duration_step"
                     ),
                     "is_prepaid": component_data.get("is_prepaid", False),
+                    # A dump taken before this field existed has no value for
+                    # it, and defaulting to False would leave an imported
+                    # builtin component no longer following its plan's billing
+                    # mode. Fall back to the rule the field replaced: a
+                    # component the plugin provides for this offering type.
+                    "billed_per_plan": component_data.get(
+                        "billed_per_plan",
+                        is_plugin_provided_component(offering.type, component_type),
+                    ),
                     "article_code": component_data.get("article_code", ""),
                     "backend_id": component_data.get("backend_id", ""),
                 }
@@ -5696,7 +5745,9 @@ class Command(BaseCommand):
                         if self.update_existing:
                             with transaction.atomic():
                                 OfferingUser.objects.filter(uuid=uuid).update(
-                                    **defaults
+                                    **_without_delegated(
+                                        defaults, existing_offering_user
+                                    )
                                 )
                             self.stats["offering_users"]["updated"] += 1
                         else:
@@ -5711,7 +5762,9 @@ class Command(BaseCommand):
                                 with transaction.atomic():
                                     OfferingUser.objects.filter(
                                         pk=existing_by_pair.pk
-                                    ).update(**defaults)
+                                    ).update(
+                                        **_without_delegated(defaults, existing_by_pair)
+                                    )
                                 self.stats["offering_users"]["updated"] += 1
                             else:
                                 self.stats["offering_users"]["skipped"] += 1
@@ -7312,16 +7365,22 @@ class Command(BaseCommand):
                     )
                     self.stats["customer_affiliates"][key] += 1
                     continue
-                existing = CustomerAffiliate.objects.filter(uuid=uuid).first()
-                if existing:
-                    if self.update_existing:
-                        CustomerAffiliate.objects.filter(uuid=uuid).update(**defaults)
-                        self.stats["customer_affiliates"]["updated"] += 1
+                # A savepoint per link: a constraint violation (e.g. a second
+                # active link for one customer) must not abort the step's
+                # outer transaction and take every other link with it.
+                with transaction.atomic():
+                    existing = CustomerAffiliate.objects.filter(uuid=uuid).first()
+                    if existing:
+                        if self.update_existing:
+                            CustomerAffiliate.objects.filter(uuid=uuid).update(
+                                **defaults
+                            )
+                            self.stats["customer_affiliates"]["updated"] += 1
+                        else:
+                            self.stats["customer_affiliates"]["skipped"] += 1
                     else:
-                        self.stats["customer_affiliates"]["skipped"] += 1
-                else:
-                    CustomerAffiliate.objects.create(uuid=uuid, **defaults)
-                    self.stats["customer_affiliates"]["created"] += 1
+                        CustomerAffiliate.objects.create(uuid=uuid, **defaults)
+                        self.stats["customer_affiliates"]["created"] += 1
             except Exception as e:
                 self.stdout.write(
                     self.style.WARNING(f"Failed to import affiliate {uuid}: {e}")

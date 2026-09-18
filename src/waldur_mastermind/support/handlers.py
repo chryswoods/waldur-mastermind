@@ -147,16 +147,17 @@ def send_comment_added_notification(
     if comment.is_forwarded:
         return
 
-    # Skip notifications about comments added to an issue by caller himself
-    if comment.author.user == comment.issue.caller:
-        return
+    # A comment from the caller is not sent back to them: the task routes it to
+    # whoever works the ticket instead. An edit of their own comment still
+    # notifies nobody, which is what it did before.
+    is_caller_comment = comment.author.user == comment.issue.caller
 
     serialized_comment = core_utils.serialize_instance(comment)
     if created:
         transaction.on_commit(
             lambda: tasks.send_comment_added_notification.delay(serialized_comment)
         )
-    else:
+    elif not is_caller_comment:
         old_description = comment.tracker.previous("description")
         if old_description != comment.description:
             transaction.on_commit(
@@ -209,6 +210,13 @@ def send_issue_updated_notification(
 
     # Skip notification if issue is not created on backend yet.
     if not instance.backend_id:
+        return
+
+    if not instance.tracker.previous("backend_id"):
+        # This is the save that materialised the ticket: the backend creates an
+        # issue in two saves — first without a backend id, then with one, along
+        # with the key and the default status. Nothing has been updated yet, so
+        # the caller must not be told that it has.
         return
 
     # Skip notifications if assignee or modification date changed

@@ -10,7 +10,11 @@ from dateutil.relativedelta import relativedelta
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
-from django.core.validators import MinValueValidator, RegexValidator
+from django.core.validators import (
+    MaxValueValidator,
+    MinValueValidator,
+    RegexValidator,
+)
 from django.db import models
 from django.db.models import Index, Q, Sum
 from django.db.models import signals as django_signals
@@ -41,12 +45,16 @@ from waldur_core.media.mixins import get_upload_path
 from waldur_core.media.validators import FileTypeValidator, ImageValidator
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.mixins import PermissionMixin
-from waldur_core.permissions.utils import get_permissions, get_users
+from waldur_core.permissions.utils import get_permissions, get_scope_ids, get_users
 from waldur_core.quotas import fields as quotas_fields
 from waldur_core.quotas import models as quotas_models
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.mixins import CoordinatesMixin
 from waldur_mastermind.marketplace.enums import (
+    MAX_LIMIT_DECIMAL_PLACES,
+    AccountScopes,
+    AccountSettingSources,
+    BillingModes,
     BillingTypes,
     CategoryColumnWidget,
     CourseAccountState,
@@ -73,7 +81,7 @@ from waldur_pid import mixins as pid_mixins
 
 from ..common import formula as common_formula
 from ..common import mixins as common_mixins
-from . import managers, plugins, signals
+from . import billing_mode, managers, plugins, signals
 from .attribute_types import ATTRIBUTE_TYPES
 from .secret_options import SecretOptionsField
 
@@ -128,6 +136,33 @@ class ServiceProvider(
             "Only staff can modify this field. "
         ),
     )
+    # Account settings for the provider's offerings, under the same keys and
+    # validated by the same serializer (AccountOptionsSerializer) as an
+    # offering's plugin options. An offering's own value wins, then the value
+    # here, then the built-in default -- exactly as PosixIdPool.resolve() picks a
+    # pool, one mental model for operators who configure both on the same
+    # provider. An absent key means the provider does not set it.
+    account_options = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_(
+            "Account settings for this provider's offerings: account_scope, "
+            "username_generation_policy, username_anonymized_prefix, "
+            "homedir_prefix and login_shell. Each applies to every offering "
+            "that does not set the plugin option of the same name."
+        ),
+    )
+
+    # A change to the username settings regenerates the usernames of the
+    # offerings that inherit them.
+    tracker = cast(FieldInstanceTracker, FieldTracker(fields=["account_options"]))
+
+    @property
+    def account_scope(self) -> str:
+        """The provider's own account scope; per offering when it sets none."""
+        return (self.account_options or {}).get(
+            "account_scope"
+        ) or AccountScopes.OFFERING
 
     class Permissions:
         customer_path = "customer"
@@ -853,40 +888,165 @@ class Offering(
         return "marketplace-provider-offering"
 
     @cached_property
+    def service_provider(self):
+        """The ServiceProvider row for this offering's customer, if there is one.
+
+        Through the reverse one-to-one rather than a filter, so a caller can
+        ``select_related("customer__serviceprovider")`` and pay nothing here at
+        all. Cached because resolve_account_setting consults it once per
+        setting -- scope, username policy, homedir prefix, login shell -- which
+        was four identical queries for every offering.
+        """
+        try:
+            return self.customer.serviceprovider
+        except ServiceProvider.DoesNotExist:
+            return None
+
+    #: The account settings and what each resolves to when neither the offering
+    #: nor its provider sets it -- the behaviour every offering had before
+    #: either could. Each is keyed by the same name in the offering's
+    #: ``plugin_options`` and the provider's ``account_options``; both are
+    #: validated by ``AccountOptionsSerializer``.
+    ACCOUNT_SETTING_DEFAULTS = {
+        "account_scope": AccountScopes.OFFERING,
+        "username_generation_policy": "service_provider",
+        "homedir_prefix": "/home/",
+        "login_shell": "/bin/bash",
+        "username_anonymized_prefix": "waldur_",
+    }
+
+    def resolve_account_setting_with_source(
+        self, name: str, default=None, plugin_options=None, provider_options=None
+    ) -> tuple[Any, str]:
+        """An account setting's value and where it came from.
+
+        The offering's value wins, else the provider's, else ``default`` --
+        which falls back to :attr:`ACCOUNT_SETTING_DEFAULTS`. The source is one
+        of :class:`AccountSettingSources`. Mirrors :meth:`PosixIdPool.resolve`
+        so operators meet one rule for every account-related setting rather
+        than one per field.
+
+        ``plugin_options`` resolves against options other than the stored ones,
+        such as the offering's options before a change; ``provider_options``
+        against provider options other than the stored ones, such as those a
+        preview proposes.
+        """
+        if plugin_options is None:
+            plugin_options = self.plugin_options
+        value = (plugin_options or {}).get(name)
+        if value:
+            return value, AccountSettingSources.OFFERING
+        return self.resolve_inherited_account_setting(name, default, provider_options)
+
+    def resolve_inherited_account_setting(
+        self, name: str, default=None, provider_options=None
+    ) -> tuple[Any, str]:
+        """What an account setting resolves to without the offering's own value.
+
+        The provider's value, else ``default`` -- which falls back to
+        :attr:`ACCOUNT_SETTING_DEFAULTS`. It is what removing the offering's
+        override leads to.
+        """
+        if provider_options is None:
+            provider = self.service_provider
+            provider_options = (
+                (provider.account_options or {}) if provider is not None else None
+            )
+        if provider_options is not None:
+            provider_value = provider_options.get(name)
+            if provider_value:
+                return provider_value, AccountSettingSources.PROVIDER
+        if default is None:
+            default = self.ACCOUNT_SETTING_DEFAULTS.get(name)
+        return default, AccountSettingSources.DEFAULT
+
+    def resolve_account_setting(self, name: str, default=None):
+        """Most specific value for an account setting: the offering's, else the provider's."""
+        return self.resolve_account_setting_with_source(name, default)[0]
+
+    @property
+    def account_settings(self) -> dict[str, dict]:
+        """Every account setting with its source and what it would inherit.
+
+        ``{name: {"value": ..., "source": ..., "inherited": {"value": ...,
+        "source": ...}}}``.
+        """
+        settings = {}
+        for name in self.ACCOUNT_SETTING_DEFAULTS:
+            value, source = self.resolve_account_setting_with_source(name)
+            inherited_value, inherited_source = self.resolve_inherited_account_setting(
+                name
+            )
+            settings[name] = {
+                "value": value,
+                "source": source,
+                "inherited": {"value": inherited_value, "source": inherited_source},
+            }
+        return settings
+
+    def resolve_account_scope(self) -> str:
+        """Whether this offering's accounts are held per offering or per provider."""
+        scope = self.resolve_account_setting("account_scope", AccountScopes.OFFERING)
+        # An unrecognised override must not silently turn provider accounts on or
+        # off; fall back to the historical behaviour.
+        return scope if scope in AccountScopes.VALUES else AccountScopes.OFFERING
+
+    @property
+    def uses_provider_accounts(self) -> bool:
+        return self.resolve_account_scope() == AccountScopes.PROVIDER
+
+    @cached_property
     def component_factors(self) -> dict[str, int]:
         # get factor from plugin components
         plugin_components = plugins.manager.get_components(self.type)
         return {c.type: c.factor for c in plugin_components}
 
+    def _has_plan_mode(self, mode: str) -> bool:
+        """Whether any plan overrides the builtin components to ``mode``."""
+        if not billing_mode.offering_has_builtin_components(self):
+            return False
+        return self.plans.filter(billing_mode=mode).exists()
+
     @cached_property
     def is_usage_based(self) -> bool:
         """
-        Returns True if the offering has at least one component with USAGE billing type.
+        Returns True if the offering bills anything by usage under at least one plan:
+        a component with USAGE billing type, or a plan whose billing mode is usage.
         Usage-based components are reported periodically and charged based on consumption.
         """
         return self.components.filter(
-            billing_type=BillingTypes.USAGE,
-        ).exists()
+            billing_type=BillingTypes.USAGE
+        ).exists() or self._has_plan_mode(BillingModes.USAGE)
 
-    def get_limit_components(self) -> dict[str, "OfferingComponent"]:
-        components = self.components.filter(
-            models.Q(billing_type=BillingTypes.LIMIT)
-            | models.Q(billing_type=BillingTypes.ONE_TIME, is_prepaid=True)
-        )
-        return {component.type: component for component in components}
+    def get_limit_components(
+        self, plan: "Plan | None" = None
+    ) -> dict[str, "OfferingComponent"]:
+        """Components whose quantity is a user-requested limit.
+
+        With ``plan`` the answer is resolved for that plan. Without it the
+        union over the stored components and every plan's mode is returned,
+        for callers that have no plan in hand.
+        """
+        if plan is not None:
+            return billing_mode.resolve_plan(plan).limit_components
+        result = billing_mode.resolve_offering(self).limit_components
+        if self._has_plan_mode(BillingModes.LIMIT):
+            for component in self.components.filter(billed_per_plan=True):
+                result.setdefault(component.type, component)
+        return result
 
     @cached_property
     def is_limit_based(self) -> bool:
         """
-        Returns True if the offering has at least one component with LIMIT billing type
+        Returns True if the offering bills anything on limits under at least one plan
         and the plugin supports updating limits. Limit-based components define a maximum
         quota that can be dynamically adjusted by the user.
         """
         if not plugins.manager.can_update_limits(self.type):
             return False
-        if not self.components.filter(billing_type=BillingTypes.LIMIT).exists():
-            return False
-        return True
+        return self.components.filter(
+            billing_type=BillingTypes.LIMIT
+        ).exists() or self._has_plan_mode(BillingModes.LIMIT)
 
     @property
     def is_private(self) -> bool:
@@ -1220,24 +1380,64 @@ class OfferingComponent(
     billing_type = models.CharField(
         choices=BillingTypes.CHOICES, default=BillingTypes.FIXED, max_length=5
     )
+    billed_per_plan = models.BooleanField(
+        default=False,
+        help_text=(
+            "The plan's billing mode decides how this component is billed, and "
+            "billing_type above is only what it falls back to. Set for the "
+            "components a plugin provides; a component the provider adds keeps "
+            "its own accounting type under every plan."
+        ),
+    )
     # limit_period and limit_amount fields are used if billing_type is USAGE or LIMIT
     limit_period = models.CharField(
         choices=LimitPeriods.CHOICES, default=LimitPeriods.MONTH, max_length=10
     )
-    limit_amount = models.IntegerField(blank=True, null=True)
+    # The bounds are Decimal rather than integer so a component that accepts a
+    # fractional limit can also describe one: a minimum of 0.5, a default of
+    # 0.1, a quota cap of 10.5. decimal_places matches ComponentQuota and
+    # MAX_LIMIT_DECIMAL_PLACES, so a bound can always express any limit the
+    # component is allowed to hold. They are rendered as JSON numbers rather
+    # than DRF's default decimal strings — see LimitBoundField.
+    limit_amount = models.DecimalField(
+        max_digits=20, decimal_places=2, blank=True, null=True
+    )
+    # Opt-in precision for the limits a customer may request. Zero keeps the
+    # component integer-only, which is what every backend that maps a limit onto
+    # an integer quota requires; a plugin declaring max_limit_decimal_places
+    # caps what a provider may configure here. The ceiling is two places because
+    # ComponentQuota and ResourceComponentUsageSummary store limits with
+    # decimal_places=2, so anything finer would round there while
+    # InvoiceItem.quantity kept it.
+    limit_decimal_places = models.PositiveSmallIntegerField(
+        default=0,
+        validators=[MaxValueValidator(MAX_LIMIT_DECIMAL_PLACES)],
+        help_text=_(
+            "Number of decimal places accepted for this component's limit. "
+            "0 keeps the limit integer-only."
+        ),
+    )
     # unit_factor is for metadata only and is not involved in any computations in Mastermind
     unit_factor = models.IntegerField(
         default=1,
         help_text=_("The conversion factor from backend units to measured_unit"),
     )
     # max_value and min_value fields are used if billing_type is LIMIT
-    max_value = models.IntegerField(blank=True, null=True)
-    min_value = models.IntegerField(blank=True, null=True)
-    max_available_limit = models.IntegerField(blank=True, null=True)
+    max_value = models.DecimalField(
+        max_digits=20, decimal_places=2, blank=True, null=True
+    )
+    min_value = models.DecimalField(
+        max_digits=20, decimal_places=2, blank=True, null=True
+    )
+    max_available_limit = models.DecimalField(
+        max_digits=20, decimal_places=2, blank=True, null=True
+    )
     # is_boolean field allows to render checkbox in UI which set limit amount to 1
     is_boolean = models.BooleanField(default=False)
     # default_limit field is used by UI to prefill limit values
-    default_limit = models.IntegerField(blank=True, null=True)
+    default_limit = models.DecimalField(
+        max_digits=20, decimal_places=2, blank=True, null=True
+    )
     # following fields are used for prepaid billing
     is_prepaid = models.BooleanField(default=False)
     overage_component = models.ForeignKey(
@@ -1307,7 +1507,10 @@ class OfferingComponent(
         elif self.limit_period == LimitPeriods.ANNUAL:
             usages = usages.filter(billing_period__year=date.year)
 
-        total = usages.aggregate(models.Sum("usage"))["usage__sum"] or 0
+        total = usages.aggregate(models.Sum("usage"))["usage__sum"] or Decimal(0)
+        # total is Decimal from ComponentUsage.usage; the reported amount may
+        # arrive as a float, and Decimal + float is a TypeError.
+        amount = Decimal(str(amount))
 
         if total + amount > self.limit_amount:
             message = _("Total amount exceeds limit. Total amount: %s, limit: %s.") % (
@@ -1321,9 +1524,15 @@ class OfferingComponent(
 
     @property
     def is_builtin(self) -> bool:
-        return self.type in [
-            c.type for c in plugins.manager.get_components(self.offering.type)
-        ]
+        """The API's older name for ``billed_per_plan``.
+
+        It used to ask the plugin registry whether this component's type is one
+        the plugin declares, which left out the OpenStack per-volume-type
+        quotas: they are created by the volume type sync rather than declared,
+        so the API called them provider components while the billing resolver
+        treated them as builtin. Reading the stored flag makes the two agree.
+        """
+        return self.billed_per_plan
 
     def __str__(self):
         return str(self.name)
@@ -1363,6 +1572,15 @@ class Plan(
     )
     archived = models.BooleanField(
         default=False, help_text=_("Forbids creation of new resources.")
+    )
+    billing_mode = models.CharField(
+        max_length=10,
+        choices=BillingModes.CHOICES,
+        default=BillingModes.INHERIT,
+        help_text=_(
+            "Overrides how the offering's builtin components are billed under "
+            "this plan. Custom components keep their own accounting type."
+        ),
     )
     objects = managers.MixinManager("scope")
     max_amount = models.PositiveSmallIntegerField(
@@ -1406,12 +1624,14 @@ class Plan(
         cost = self.unit_price
 
         if limits:
-            components_map = self.offering.get_limit_components()
+            components_map = self.offering.get_limit_components(self)
             component_prices = {
                 c.component.type: c.price for c in self.components.all()
             }
 
             factors = self.offering.component_factors
+
+            resolved = billing_mode.resolve_plan(self)
 
             for key, component in components_map.items():
                 price = component_prices.get(key, 0)
@@ -1419,7 +1639,9 @@ class Plan(
                 factor = factors.get(key, 1)
                 per_unit = Decimal(price) * Decimal(str(limit)) / Decimal(str(factor))
 
-                if component.is_prepaid:
+                effective = resolved.get(key)
+                is_prepaid = effective.is_prepaid if effective else component.is_prepaid
+                if is_prepaid:
                     months = duration_months
                     if not months and start_date and end_date:
                         months = core_utils.calculate_duration_months(
@@ -1451,23 +1673,31 @@ class Plan(
         get_estimate() with the duration multiplier. This avoids
         double-counting them via init_price.
         """
+        resolved = billing_mode.resolve_plan(self)
+
+        def is_plain_one_time(component) -> bool:
+            effective = resolved.get(component.type)
+            if effective is None:
+                return (
+                    component.billing_type == BillingTypes.ONE_TIME
+                    and not component.is_prepaid
+                )
+            return (
+                effective.billing_type == BillingTypes.ONE_TIME
+                and not effective.is_prepaid
+            )
+
         cached = self._cached_components()
         if cached is not None:
             return self._sum_prices(
-                item
-                for item in cached
-                if item.component.billing_type == BillingTypes.ONE_TIME
-                and not item.component.is_prepaid
+                item for item in cached if is_plain_one_time(item.component)
             )
-        components = self.components.filter(
-            component__billing_type=BillingTypes.ONE_TIME,
-            component__is_prepaid=False,
-        )
-        return (
-            components.aggregate(
-                sum=models.Sum(models.F("price") * models.F("amount"))
-            )["sum"]
-            or 0
+        # The plan's billing mode can turn a builtin component prepaid, which
+        # SQL cannot see, so the filter happens in Python.
+        return self._sum_prices(
+            item
+            for item in self.components.select_related("component")
+            if item.component and is_plain_one_time(item.component)
         )
 
     @property
@@ -1873,6 +2103,16 @@ class Resource(
             Index(fields=["offering", "state"], name="mp_resource_offering_state_idx"),
             Index(fields=["project", "state"], name="mp_resource_project_state_idx"),
         ]
+
+    @property
+    def is_usage_based(self) -> bool:
+        """Whether this resource bills anything by usage under its plan."""
+        return billing_mode.resolve_for_resource(self).is_usage_based
+
+    @property
+    def is_limit_based(self) -> bool:
+        """Whether this resource bills anything on limits under its plan."""
+        return billing_mode.resolve_for_resource(self).is_limit_based
 
     state = FSMIntegerField(default=States.CREATING, choices=States.CHOICES)
     project = models.ForeignKey(structure_models.Project, on_delete=models.CASCADE)
@@ -2317,14 +2557,17 @@ class Resource(
         end_date = start_date + relativedelta(months=extension_months)
 
         total = Decimal("0.0")
-        components_map = self.offering.get_limit_components()
+        components_map = self.offering.get_limit_components(self.plan)
         component_prices = {
             c.component.type: c.price for c in self.plan.components.all()
         }
         factors = self.offering.component_factors
 
+        resolved = billing_mode.resolve_plan(self.plan)
+
         for key, component in components_map.items():
-            if not component.is_prepaid:
+            effective = resolved.get(key)
+            if not (effective.is_prepaid if effective else component.is_prepaid):
                 continue
             price = component_prices.get(key, 0)
             limit = final_limits.get(key, 0)
@@ -2361,13 +2604,19 @@ class Resource(
 
         if self.plan:
             component_factors = self.offering.component_factors
+            # The plan's billing mode can make a builtin component prepaid or
+            # limit-based regardless of what is stored on the component, so the
+            # two loops below select on the resolved values rather than filtering
+            # in SQL.
+            resolved = billing_mode.resolve_plan(self.plan)
 
             # 1. Subscription items (prepaid components)
-            for plan_component in self.plan.components.filter(
-                component__is_prepaid=True
-            ):
+            for plan_component in self.plan.components.all():
                 component = plan_component.component
                 if not component:
+                    continue
+                effective = resolved.get(component.type)
+                if not (effective.is_prepaid if effective else component.is_prepaid):
                     continue
                 limit_amount = Decimal(str(final_limits.get(component.type, 0)))
                 factor = Decimal(str(component_factors.get(component.type, 1)))
@@ -2392,12 +2641,16 @@ class Resource(
                 subscription_total += total
 
             # 2. Limit change items (billing_type='limit', where new_limit > current_limit)
-            for plan_component in self.plan.components.filter(
-                component__billing_type=BillingTypes.LIMIT,
-                component__is_prepaid=False,
-            ):
+            for plan_component in self.plan.components.all():
                 component = plan_component.component
                 if not component:
+                    continue
+                effective = resolved.get(component.type)
+                billing_type = (
+                    effective.billing_type if effective else component.billing_type
+                )
+                is_prepaid = effective.is_prepaid if effective else component.is_prepaid
+                if billing_type != BillingTypes.LIMIT or is_prepaid:
                     continue
 
                 current_limit = self.limits.get(component.type, 0)
@@ -2407,8 +2660,13 @@ class Resource(
                 if delta <= 0:
                     continue
 
-                # Skip components with no periodic billing
-                limit_period = component.limit_period
+                # Skip components with no periodic billing. The plan's mode can
+                # impose a period of its own, and the invoice reads it through
+                # the resolver, so the estimate has to as well or it quotes a
+                # different period than it charges.
+                limit_period = (
+                    effective.limit_period if effective else component.limit_period
+                )
                 if not limit_period or limit_period == LimitPeriods.TOTAL:
                     continue
 
@@ -2594,6 +2852,13 @@ class Order(
     old_plan = models.ForeignKey(
         on_delete=models.CASCADE, to=Plan, related_name="+", null=True, blank=True
     )
+    # Snapshotted by init_cost() at creation time, over the same window as
+    # `cost`. old_cost_estimate reads this back instead of recomputing live,
+    # so the two figures stay comparable no matter how long the order sits
+    # before someone looks at it -- see old_cost_estimate's docstring.
+    old_cost = models.DecimalField(
+        max_digits=22, decimal_places=10, null=True, blank=True
+    )
     project = models.ForeignKey(on_delete=models.CASCADE, to=structure_models.Project)
     resource = models.ForeignKey(on_delete=models.CASCADE, to=Resource)
     state = FSMIntegerField(
@@ -2739,6 +3004,10 @@ class Order(
                 self.cost += self.plan.non_prepaid_init_price
             elif self.type == OrderTypes.UPDATE:
                 self.cost += self.plan.switch_price
+        # Snapshot now, over the same window as `cost` above, rather than
+        # leaving old_cost_estimate to recompute it on every future read (see
+        # that property's docstring for why that drifted).
+        self.old_cost = self._compute_old_cost_estimate()
         # Pre-flight check for UPDATE / plan-switch orders. CREATE orders are
         # validated at Resource.init_cost; here we cover the case where an
         # existing resource is scaled up or moved to a more expensive plan
@@ -2769,31 +3038,51 @@ class Order(
             return self.plan.fixed_price
         return 0
 
-    @property
-    def old_cost_estimate(self) -> float:
+    def _compute_old_cost_estimate(self) -> float:
+        """Price old_limits over the same window `cost` is priced over.
+
+        Renewals use their own pre-extension duration (old subscription
+        creation date through old_end_date); a plain limit-change order uses
+        today through the resource's real end date, matching _get_cost_dates().
+        """
         if "old_limits" not in self.attributes:
             return 0
         plan = self.old_plan or self.plan
         if not plan:
             return 0
 
-        # For renewals, include the old subscription duration
-        start_date = None
-        end_date = None
         old_end_date_str = self.attributes.get("old_end_date")
         if old_end_date_str:
             try:
                 end_date = datetime.date.fromisoformat(old_end_date_str)
             except (ValueError, TypeError):
-                pass
-        if end_date and self.resource_id and self.resource:
-            start_date = (
-                self.resource.created.date()
-                if hasattr(self.resource.created, "date")
-                else self.resource.created
-            )
+                end_date = None
+            if end_date and self.resource_id and self.resource:
+                start_date = (
+                    self.resource.created.date()
+                    if hasattr(self.resource.created, "date")
+                    else self.resource.created
+                )
+                return plan.get_estimate(
+                    self.attributes["old_limits"], start_date, end_date
+                )
 
+        start_date, end_date = self._get_cost_dates()
         return plan.get_estimate(self.attributes["old_limits"], start_date, end_date)
+
+    @property
+    def old_cost_estimate(self) -> float:
+        """The old-limits estimate, snapshotted by init_cost() at creation.
+
+        Must not recompute live: _compute_old_cost_estimate() prices from
+        "today", which keeps advancing on every read while `cost` stays fixed
+        from creation -- the shown cost change would grow the longer an order
+        sits unread. Orders that predate this field have no snapshot, so they
+        fall back to the live computation rather than a wrong zero.
+        """
+        if self.old_cost is not None:
+            return self.old_cost
+        return self._compute_old_cost_estimate()
 
     @property
     def activation_price(self) -> float:
@@ -3251,21 +3540,26 @@ class OfferingFile(
         return "offering: %s" % self.offering
 
 
-class OfferingUser(
+class BaseAccount(
     TimeStampedModel,
     core_models.UuidMixin,
     common_mixins.BackendMetadataMixin,
     LoggableMixin,
 ):
     """
-    User accounts within offerings.
+    A login/POSIX account held by a Waldur user within one namespace.
 
-    Manages user accounts with username mapping and restriction flags.
-    Provides user management functionality for offering-specific
-    access control and account management.
+    Subclasses supply the namespace: :class:`OfferingUser` scopes the account to a
+    single offering, :class:`ServiceProviderAccount` to a whole service provider. The
+    provider scope exists for the shared-directory topology, where one LDAP tree
+    fronts several offerings and the same person must resolve to one username, one
+    UID and one home directory everywhere.
+
+    Everything that describes the *account* lives here. What stays on the subclass
+    is the scope FK — and, on OfferingUser, the per-service facts (terms-of-service
+    consent, checklists, restriction) that are deliberately not shared.
     """
 
-    offering = models.ForeignKey(Offering, on_delete=models.CASCADE)
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     username = models.CharField(max_length=100, blank=True, null=True)
     is_restricted = models.BooleanField(
@@ -3297,26 +3591,10 @@ class OfferingUser(
             "URL link for additional information or actions related to service provider comment"
         ),
     )
-    tracker = cast(
-        FieldInstanceTracker,
-        FieldTracker(
-            fields=[
-                "username",
-                "state",
-                "runtime_state",
-                "is_restricted",
-                "service_provider_comment",
-                "service_provider_comment_url",
-            ]
-        ),
-    )
 
     class Meta:
-        unique_together = ("offering", "user")
+        abstract = True
         ordering = ["username", "id"]
-        indexes = [
-            Index(fields=["offering", "user"], name="mp_offeringuser_offer_user_idx"),
-        ]
 
     @transition(
         field=state,
@@ -3428,6 +3706,22 @@ class OfferingUser(
 
     @transition(
         field=state,
+        source=list(OfferingUserStates.DELETION_FLOW_STATES),
+        target=OfferingUserStates.OK,
+    )
+    def restore(self):
+        """A departed member is back: the account is live again under its old name.
+
+        Distinct from ``set_ok`` in accepting DELETED as a source. A provider that
+        parks a departing account (disables the directory entry, keeps uid and
+        username) re-enables it when the account is presented live again, so the
+        record must be able to come back from DELETED rather than asking for a
+        brand-new account under a new name.
+        """
+        pass
+
+    @transition(
+        field=state,
         source=[
             OfferingUserStates.CREATION_REQUESTED,
             OfferingUserStates.CREATING,
@@ -3475,7 +3769,6 @@ class OfferingUser(
 
     def get_log_fields(self):
         return (
-            "offering",
             "user",
             "username",
             "is_restricted",
@@ -3484,6 +3777,210 @@ class OfferingUser(
             "service_provider_comment",
             "service_provider_comment_url",
         )
+
+
+class ServiceProviderAccount(BaseAccount):
+    """
+    One account per user per service provider, for providers running a shared directory.
+
+    An offering resolves to a provider account when its scope resolves to
+    ``provider`` (see :meth:`Offering.resolve_account_scope`). Every
+    :class:`OfferingUser` of that provider then points here and reads its username
+    and POSIX attributes through, so the provider's directory sees one entry per
+    person however many of its offerings they use.
+
+    The provider scope is the same one :class:`PosixIdPool` already uses by default,
+    so a provider account and its UID/GID come from the same boundary.
+    """
+
+    service_provider = models.ForeignKey(
+        ServiceProvider, on_delete=models.CASCADE, related_name="provider_accounts"
+    )
+
+    tracker = cast(
+        FieldInstanceTracker,
+        FieldTracker(
+            fields=[
+                "username",
+                "state",
+                "runtime_state",
+                "is_restricted",
+                "service_provider_comment",
+                "service_provider_comment_url",
+                # Tracked so a POSIX identity change fires the update event: the
+                # payload carries uidnumber/primarygroup, and a directory writer
+                # that never hears about them is the whole point missed.
+                "backend_metadata",
+            ]
+        ),
+    )
+
+    class Meta(BaseAccount.Meta):
+        abstract = False
+        verbose_name = _("Service provider account")
+        unique_together = ("service_provider", "user")
+        indexes = [
+            Index(
+                fields=["service_provider", "user"],
+                name="mp_spaccount_provider_user_idx",
+            ),
+        ]
+        constraints = [
+            # One name per directory: two people at the same provider must never
+            # share a username. Unnamed accounts (still awaiting one) are exempt.
+            UniqueConstraint(
+                fields=["service_provider", "username"],
+                condition=Q(username__isnull=False) & ~Q(username=""),
+                name="marketplace_spaccount_unique_username",
+            ),
+        ]
+
+    @classmethod
+    def get_url_name(cls):
+        return "marketplace-service-provider-account"
+
+    def get_log_fields(self):
+        return ("service_provider", *super().get_log_fields())
+
+    def __str__(self) -> str:
+        return f"{self.service_provider}: {self.username}"
+
+
+class OfferingUser(BaseAccount):
+    """
+    User accounts within offerings.
+
+    Manages user accounts with username mapping and restriction flags.
+    Provides user management functionality for offering-specific
+    access control and account management.
+
+    When ``service_provider_account`` is set the account is owned at provider level:
+    ``username`` and ``backend_metadata`` are projections of that row, kept as
+    columns so existing querysets, filters and ordering keep working, and written
+    only through the parent. ``is_restricted`` and the consent/checklist records
+    stay per offering — they are facts about a service, not about an account.
+    """
+
+    offering = models.ForeignKey(Offering, on_delete=models.CASCADE)
+    service_provider_account = models.ForeignKey(
+        ServiceProviderAccount,
+        # RESTRICT, not PROTECT: both models hang off User with CASCADE, so
+        # deleting a user collects the provider account and its offering
+        # accounts in one pass. PROTECT refuses that even though the
+        # referencing rows are themselves being deleted; RESTRICT allows it
+        # while still refusing a direct delete that would orphan a live one,
+        # which is the ordering guarantee this FK exists for.
+        on_delete=models.RESTRICT,
+        null=True,
+        blank=True,
+        related_name="offering_users",
+        help_text=_(
+            "Provider-level account backing this one. When set, the username and "
+            "POSIX attributes are owned there and must not be written here."
+        ),
+    )
+
+    tracker = cast(
+        FieldInstanceTracker,
+        FieldTracker(
+            fields=[
+                "username",
+                "state",
+                "runtime_state",
+                "is_restricted",
+                "service_provider_comment",
+                "service_provider_comment_url",
+            ]
+        ),
+    )
+
+    class Meta(BaseAccount.Meta):
+        abstract = False
+        unique_together = ("offering", "user")
+        indexes = [
+            Index(fields=["offering", "user"], name="mp_offeringuser_offer_user_idx"),
+        ]
+
+    @property
+    def is_provider_backed(self) -> bool:
+        """Whether the account is owned by a ServiceProviderAccount rather than here."""
+        return self.service_provider_account_id is not None
+
+    def pull_from_provider_account(self) -> bool:
+        """Copy the provider account's **identity** down onto this row.
+
+        Only ``username`` and ``backend_metadata`` are delegated: they describe the
+        person's account at the provider, and the columns here are a cache of them
+        so querysets, the ordering and ``OfferingUserFilter`` (which searches
+        ``backend_metadata__uidnumber``) keep working.
+
+        ``state``, ``runtime_state`` and ``is_restricted`` are deliberately NOT
+        delegated. They describe *this association* -- whether the user still holds
+        this offering, and whether they are restricted on it -- and the provider
+        account's own release works by counting offering accounts that are still
+        live. Delegating ``state`` makes that count constant and the two-stage
+        deletion impossible.
+
+        Returns whether anything changed, so callers can skip a pointless save.
+        """
+        parent = self.service_provider_account
+        if parent is None:
+            return False
+        changed = False
+        if self.username != parent.username:
+            self.username = parent.username
+            changed = True
+        if self.backend_metadata != parent.backend_metadata:
+            self.backend_metadata = dict(parent.backend_metadata or {})
+            changed = True
+        return changed
+
+    def save(self, *args, **kwargs):
+        """Refuse a delegated write on a backed account.
+
+        The serializer refuses one on the API path, but several older paths set
+        ``username`` straight on the model — ``set_offerings_username``,
+        ``refresh_offering_usernames``, the FreeIPA and identity-claim signal
+        handlers, and the remote-sync task. This used to re-sync them silently,
+        which stopped the divergence but left the caller believing a write had
+        landed: the remote sync rewrote a username every hour and had it
+        reverted every hour, logging nothing.
+
+        A caller's own write is told apart from a legitimate one by comparing
+        against the parent rather than by inspecting the caller. Every path that
+        is allowed to touch these columns — ``propagate_provider_account``,
+        adoption, the provider-aware creator — calls
+        ``pull_from_provider_account()`` first, so the values already match and
+        nothing here fires. A path that assigned its own value does not match,
+        and that is exactly the case worth refusing.
+
+        On insert there is nothing to refuse: a new backed row simply takes the
+        parent's values, which is how the creator builds one.
+        """
+        if self.service_provider_account_id:
+            if self._state.adding:
+                self.pull_from_provider_account()
+            else:
+                self._refuse_delegated_write()
+        return super().save(*args, **kwargs)
+
+    def _refuse_delegated_write(self):
+        parent = self.service_provider_account
+        diverged = [
+            field
+            for field in ("username", "backend_metadata")
+            if getattr(self, field) != getattr(parent, field)
+        ]
+        if diverged:
+            raise ValidationError(
+                f"{', '.join(sorted(diverged))} on offering account {self.pk} "
+                f"{'is' if len(diverged) == 1 else 'are'} owned by service "
+                f"provider account {parent.uuid.hex}. Change it there and let it "
+                f"propagate; writing it here would be undone."
+            )
+
+    def get_log_fields(self):
+        return ("offering", *super().get_log_fields())
 
     def __str__(self) -> str:
         return f"{self.offering.name}: {self.username}"
@@ -4855,14 +5352,15 @@ class ResourceMemberSyncStatus(core_models.UuidMixin, TimeStampedModel):
     """Agent-reported propagation state of a single role grant.
 
     One row per (resource, user, scope, role name), written by the site
-    agent via ``set_membership_sync_statuses`` with full-replace-per-
-    resource semantics: the agent owns these rows, a report replaces the
-    resource's previous rows atomically, so a revoked grant's row cannot
-    outlive the grant. Enabled per offering via the
-    ``enable_membership_sync_status`` plugin option.
+    agent via ``set_membership_sync_statuses``. The agent owns these rows
+    and every report is complete: rows for grants it no longer lists are
+    deleted, so a revoked grant's row cannot outlive the grant. Enabled per
+    offering via the ``enable_membership_sync_status`` plugin option.
 
-    ``modified`` (TimeStampedModel) doubles as the reported-at
-    timestamp because rows are recreated on every report.
+    A report writes only what changed, so an unchanged grant's row is left
+    as it is: ``modified`` (TimeStampedModel) is when this grant's state
+    last changed. When the agent last reported is
+    ``ResourceMemberSyncReport.reported_at``.
     """
 
     class States:
@@ -4918,6 +5416,34 @@ class ResourceMemberSyncStatus(core_models.UuidMixin, TimeStampedModel):
 
     def __str__(self):
         return f"{self.user.username} @ {self.resource.name} [{self.role_name}]: {self.state}"
+
+    @property
+    def report_key(self) -> tuple:
+        """The grant this row reports on; a resource holds one row per key."""
+        return (self.user_id, self.scope_type, self.resource_project_id, self.role_name)
+
+
+class ResourceMemberSyncReport(models.Model):
+    """When the site agent last reported a resource's member sync statuses.
+
+    Kept apart from the status rows so that an unchanged report does not
+    rewrite them, and apart from Resource so that a full ``Resource.save()``
+    from a stale instance cannot roll it back.
+    """
+
+    resource = models.OneToOneField(
+        Resource,
+        on_delete=models.CASCADE,
+        related_name="member_sync_report",
+    )
+    reported_at = models.DateTimeField()
+
+    class Meta:
+        verbose_name = "Resource member sync report"
+        verbose_name_plural = "Resource member sync reports"
+
+    def __str__(self):
+        return f"{self.resource.name}: {self.reported_at}"
 
 
 class IntegrationStatus(core_models.UuidMixin):
@@ -4992,6 +5518,27 @@ class IntegrationStatus(core_models.UuidMixin):
         self.last_request_timestamp = timezone.now()
 
 
+def filter_by_backend_resource_permission(user):
+    """Rows whose offering the user may manage backend resources for.
+
+    Mirrors the detail check, permission_factory(MANAGE_OFFERING_BACKEND_RESOURCES,
+    ["offering", "offering.customer"]): roles are matched on the permission itself,
+    as has_permission does. Staff and global support never reach this query, since
+    filter_queryset_for_user returns every row to them. Support can therefore list
+    rows whose detail check refuses them, as on any model scoped by GenericRoleFilter.
+    """
+    permission = PermissionEnum.MANAGE_OFFERING_BACKEND_RESOURCES
+    customer_ids = get_scope_ids(
+        user,
+        ContentType.objects.get_for_model(structure_models.Customer),
+        permission=permission,
+    )
+    offering_ids = get_scope_ids(
+        user, ContentType.objects.get_for_model(Offering), permission=permission
+    )
+    return Q(offering__customer__in=customer_ids) | Q(offering__in=offering_ids)
+
+
 class BackendResource(
     core_models.UuidMixin,
     core_models.NameMixin,
@@ -5011,6 +5558,9 @@ class BackendResource(
 
     offering = models.ForeignKey(to=Offering, on_delete=models.CASCADE)
     project = models.ForeignKey(to=structure_models.Project, on_delete=models.CASCADE)
+
+    class Permissions:
+        build_query = filter_by_backend_resource_permission
 
 
 class BackendResourceRequest(
@@ -5058,6 +5608,9 @@ class BackendResourceRequest(
     @transition(field=state, source="*", target=States.ERRED)
     def set_erred(self):
         self.finished = timezone.now()
+
+    class Permissions:
+        build_query = filter_by_backend_resource_permission
 
 
 class ResourceApiKey(

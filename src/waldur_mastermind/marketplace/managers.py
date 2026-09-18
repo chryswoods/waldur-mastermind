@@ -39,9 +39,13 @@ class OfferingQuerySet(django_models.QuerySet):
         connected_customers = get_connected_customers(user)
         connected_projects = get_connected_projects(user)
         connected_offerings = get_connected_offerings(user)
+        # A service provider manager holds their role on the ServiceProvider,
+        # not on its customer, so the customer clause alone misses them.
+        connected_service_providers = get_connected_serviceproviders(user)
 
         return self.filter(
             Q(customer__in=connected_customers)
+            | Q(customer__serviceprovider__in=connected_service_providers)
             | Q(project__in=connected_projects)
             | Q(id__in=connected_offerings)
         ).distinct()
@@ -358,6 +362,17 @@ def get_user_resource_descended_customer_ids(user):
     return _user_resource_descended_resource_ids_qs(user).values_list(
         "project__customer_id", flat=True
     )
+
+
+def get_user_managed_service_provider_customer_ids(user):
+    """Lazy QuerySet of Customer IDs whose ServiceProvider the user holds any
+    active role on. The role sits on the provider, not on its customer, so
+    ``get_connected_customers`` never sees it; it lets the user find the
+    organization in the portal, nothing more. Uses the same notion of a
+    provider-side role as ``OfferingQuerySet.filter_for_user``."""
+    return models.ServiceProvider.objects.filter(
+        id__in=get_connected_serviceproviders(user)
+    ).values_list("customer_id", flat=True)
 
 
 class ResourceManager(MixinManager):

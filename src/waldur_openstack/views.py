@@ -1,4 +1,5 @@
 import logging
+from ipaddress import ip_address
 
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import (
@@ -41,7 +42,6 @@ from waldur_core.structure import views as structure_views
 from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_core.structure.serializers import ConsoleUrlSerializer
 from waldur_core.structure.signals import resource_imported
-from waldur_mastermind.marketplace_openstack.utils import delete_instance
 from waldur_openstack import routes, topology
 from waldur_openstack.apps import OpenStackConfig
 from waldur_openstack.backend import OpenStackBackend
@@ -1331,27 +1331,45 @@ class RouterViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
                 # the operation may fail with an IP address conflict.
                 # To avoid this, we first find a free IP in the subnet, create a port with this IP,
                 # and then pass the port to the router interface addition.
-                free_ip = backend.get_free_ip(subnet)
-                if not free_ip:
-                    return response.Response(
-                        {
-                            "status": _(
-                                f"No available IP addresses in subnet {subnet.backend_id}."
-                            )
-                        },
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
+                from_prefix = models.SubNet.Ipv6Modes.FROM_PREFIX
+                if (
+                    subnet.ipv6_ra_mode in from_prefix
+                    or subnet.ipv6_address_mode in from_prefix
+                ):
+                    # Neutron derives addresses on such a subnet from the
+                    # prefix and refuses a fixed one on a port that is not yet
+                    # a router interface, so it has to pick the address itself.
+                    fixed_ip = {"subnet_id": subnet.backend_id}
+                else:
+                    free_ip = backend.get_free_ip(subnet)
+                    if not free_ip:
+                        return response.Response(
+                            {
+                                "status": _(
+                                    f"No available IP addresses in subnet {subnet.backend_id}."
+                                )
+                            },
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    fixed_ip = {"subnet_id": subnet.backend_id, "ip_address": free_ip}
                 port = models.Port.objects.create(
                     subnet=subnet,
                     network=subnet.network,
-                    tenant=subnet.tenant,
-                    project=subnet.project,
+                    # The interface belongs to the tenant whose router holds it,
+                    # not to the subnet's owner (#394). For an own subnet the two
+                    # are the same; for one shared over RBAC, Neutron puts the
+                    # port in the router's project, and billing and quota have to
+                    # follow it there. Same convention as
+                    # OpenStackPortSerializer's `target_tenant` branch, which
+                    # keeps the service settings of the network.
+                    tenant=router.tenant,
+                    project=router.project,
                     service_settings=subnet.service_settings,
-                    fixed_ips=[{"subnet_id": subnet.backend_id, "ip_address": free_ip}],
+                    fixed_ips=[fixed_ip],
                 )
                 backend.create_port(port)
                 logger.info(
-                    f"Port {port.backend_id} with IP {free_ip} was created for router interface addition."
+                    f"Port {port.backend_id} with fixed IPs {port.fixed_ips} was created for router interface addition."
                 )
             backend.add_router_interface(router, port=port)
         except OpenStackBackendError as e:
@@ -1359,6 +1377,16 @@ class RouterViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
                 {"status": _(f"Unable to add a new router interface: {e.args[0]}")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # A router now holds it, so say so rather than waiting for the next
+        # `pull_subnets` -- the only other writer of this flag -- to notice. The
+        # Subnets tab renders "<router> (disconnected)" from it, which for a
+        # subnet just handed to a consumer's router is precisely the wrong answer
+        # to the question #388 added the column for.
+        connected_subnet = subnet or port.subnet
+        if connected_subnet and not connected_subnet.is_connected:
+            connected_subnet.is_connected = True
+            connected_subnet.save(update_fields=["is_connected"])
 
         added_interface = None
         if subnet:
@@ -1780,6 +1808,26 @@ class LoadBalancerViewSet(
         if floating_ip.tenant != load_balancer.tenant:
             raise exceptions.ValidationError(
                 _("Floating IP must belong to the same tenant as the load balancer.")
+            )
+        # Floating IPs are IPv4, and Neutron associates one only with a port
+        # that has an IPv4 address; for an IPv6-only VIP the attach would fail
+        # after the request was accepted.
+        vip_addresses = [
+            fixed_ip.get("ip_address")
+            for fixed_ip in load_balancer.vip_port.fixed_ips or []
+        ] or [load_balancer.vip_address]
+        vip_versions = set()
+        for vip_address in filter(None, vip_addresses):
+            try:
+                vip_versions.add(ip_address(vip_address).version)
+            except ValueError:
+                pass
+        if vip_versions and 4 not in vip_versions:
+            raise exceptions.ValidationError(
+                _(
+                    "A floating IP is IPv4 and cannot be attached to a load "
+                    "balancer whose VIP has no IPv4 address."
+                )
             )
         executors.LoadBalancerAttachFloatingIPExecutor().execute(
             load_balancer,
@@ -2291,8 +2339,11 @@ class PortViewSet(structure_views.ResourceViewSet):
         subnet = serializer.validated_data["subnet"]
         ip_address = serializer.validated_data["ip_address"]
         backend = port.get_backend()
-        backend.update_port_ip(port, subnet.backend_id, ip_address)
-        port.fixed_ips = [{"subnet_id": subnet.backend_id, "ip_address": ip_address}]
+        try:
+            fixed_ips = backend.update_port_ip(port, subnet.backend_id, ip_address)
+        except OpenStackBackendError as e:
+            raise exceptions.ValidationError(str(e))
+        port.fixed_ips = fixed_ips
         port.save(update_fields=["fixed_ips"])
         return response.Response(status=status.HTTP_200_OK)
 
@@ -2351,7 +2402,9 @@ class PortViewSet(structure_views.ResourceViewSet):
     @decorators.action(detail=True, methods=["post"])
     def set_allowed_address_pairs(self, request, uuid=None):
         port: models.Port = self.get_object()
-        serializer = serializers.SetAllowedAddressPairsSerializer(data=request.data)
+        serializer = serializers.SetAllowedAddressPairsSerializer(
+            data=request.data, context={"port": port}
+        )
         serializer.is_valid(raise_exception=True)
         new_pairs = list(serializer.validated_data["allowed_address_pairs"])
         old_pairs = list(port.allowed_address_pairs or [])
@@ -2479,8 +2532,15 @@ class NetworkViewSet(structure_views.ResourceViewSet):
     def create_subnet(self, request, uuid=None):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        # Read before save(): the serializer pops it, since it instructs the
+        # executor rather than describing the subnet.
+        skip_router_connection = serializer.validated_data.get(
+            "skip_router_connection", False
+        )
         subnet = serializer.save()
-        executors.SubNetCreateExecutor.execute(subnet)
+        executors.SubNetCreateExecutor.execute(
+            subnet, skip_router_connection=skip_router_connection
+        )
         return response.Response(serializer.data, status=status.HTTP_201_CREATED)
 
     create_subnet_validators = [core_validators.StateValidator(CoreStates.OK)]
@@ -2652,7 +2712,9 @@ class SubNetViewSet(structure_views.ResourceViewSet):
 
     def get_queryset(self):
         user: structure_models.User = self.request.user
-        queryset = models.SubNet.objects.all().order_by("network")
+        queryset = (
+            models.SubNet.objects.all().select_related("router").order_by("network")
+        )
 
         if user.is_staff or user.is_support:
             return queryset
@@ -2666,7 +2728,9 @@ class SubNetViewSet(structure_views.ResourceViewSet):
     @extend_schema(
         request=None,
         summary="Connect subnet to router",
-        description="Connect the subnet to the default tenant router.",
+        description="Connect the subnet to its router: the one chosen when the "
+        "subnet was created or last attached to, and otherwise the tenant router "
+        "Waldur picks.",
         responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
@@ -2679,7 +2743,8 @@ class SubNetViewSet(structure_views.ResourceViewSet):
     @extend_schema(
         request=None,
         summary="Disconnect subnet from router",
-        description="Disconnect the subnet from the default tenant router.",
+        description="Disconnect the subnet from its router. The router is "
+        "remembered, so connecting again returns the subnet to it.",
         responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
@@ -3261,6 +3326,32 @@ class InstanceViewSet(
     unrescue_permissions = [openstack_permissions.can_manage_openstack_instance_power]
 
     @extend_schema(
+        summary="Set instance metadata",
+        description=(
+            "Replace the instance metadata with the given string key/value "
+            "pairs. Keys absent from the payload are removed from Nova as well."
+        ),
+        request=serializers.InstanceSetMetadataSerializer,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def set_metadata(self, request, uuid=None):
+        instance: models.Instance = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        instance.metadata = serializer.validated_data["metadata"]
+        instance.save(update_fields=["metadata"])
+        executors.InstanceUpdateMetadataExecutor().execute(instance)
+        return response.Response(
+            {"status": _("set_metadata was scheduled")},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    set_metadata_serializer_class = serializers.InstanceSetMetadataSerializer
+    set_metadata_validators = [core_validators.StateValidator(CoreStates.OK)]
+    set_metadata_permissions = [openstack_permissions.can_manage_openstack_instance]
+
+    @extend_schema(
         summary="Update instance security groups",
         description="Update security groups of the instance",
         request=serializers.OpenStackInstanceSecurityGroupsUpdateSerializer,
@@ -3469,6 +3560,7 @@ class InstanceViewSet(
     console_permissions = [openstack_permissions.has_permissions_for_console]
 
     @extend_schema(
+        methods=["get"],
         summary="Get console log",
         description="Get console log for the instance",
         parameters=[OpenApiParameter("length", int, OpenApiParameter.QUERY)],
@@ -3476,11 +3568,25 @@ class InstanceViewSet(
         responses={200: str},
         filters=False,
     )
-    @decorators.action(detail=True, methods=["get"])
+    @extend_schema(
+        methods=["post"],
+        summary="Get console log",
+        description=(
+            "Get console log for the instance. Same as the GET form, but takes "
+            "`length` in the request body, so action-oriented clients such as the "
+            "Ansible collection can call it like any other instance action."
+        ),
+        request=serializers.OpenStackConsoleLogSerializer,
+        responses={200: str},
+        filters=False,
+    )
+    @decorators.action(detail=True, methods=["get", "post"])
     def console_log(self, request, uuid=None):
         instance: models.Instance = self.get_object()
         backend = instance.get_backend()
-        serializer = self.get_serializer(data=request.query_params)
+        # GET carries `length` in the query string, POST in the body.
+        params = request.data if request.method == "POST" else request.query_params
+        serializer = self.get_serializer(data=params)
         serializer.is_valid(raise_exception=True)
         length = serializer.validated_data.get("length")
 
@@ -3552,29 +3658,6 @@ class MarketplaceInstanceViewSet(structure_views.ResourceViewSet):
     filter_backends = structure_views.ResourceViewSet.filter_backends + (
         structure_filters.StartTimeFilter,
     )
-
-    @extend_schema(
-        summary="Force destroy instance",
-        description="Forcefully destroy the instance, bypassing some state checks. This action is intended for recovery from failed states and should be used with caution.",
-    )
-    @decorators.action(detail=True, methods=["delete"])
-    def force_destroy(self, request, uuid=None):
-        """This action completely repeats 'destroy', with the exclusion of validators.
-        Destroy's validators require stopped VM. This requirement has expired.
-        But for compatibility with old documentation, it must be left.
-        """
-        instance = self.get_object()
-        delete_instance(instance, request.query_params)
-        return response.Response(status=status.HTTP_202_ACCEPTED)
-
-    force_destroy_validators = [
-        InstanceViewSet._has_backups,
-        InstanceViewSet._has_snapshots,
-        core_validators.StateValidator(
-            CoreStates.OK,
-            CoreStates.ERRED,
-        ),
-    ]
 
     def perform_create(self, serializer):
         instance: models.Instance = serializer.save()

@@ -217,6 +217,13 @@ USER_ATTRIBUTE_CHOICES = [
     ("primary_gid", "Primary GID"),
 ]
 
+# Keep in sync with waldur_core.users.scim.server.matching.IDENTIFYING_ATTRIBUTES.
+SCIM_USER_MATCH_ATTRIBUTE_CHOICES = [
+    ("username", "Username"),
+    ("email", "Email"),
+    ("civil_number", "Civil number"),
+]
+
 REPORTING_SCREEN_CHOICES = [
     # Resources
     ("resource-usage", "Resources: Usage"),
@@ -231,6 +238,10 @@ REPORTING_SCREEN_CHOICES = [
     ("usage-by-customer", "Resources: Usage by customer"),
     ("usage-by-org-type", "Resources: Usage by organization type"),
     ("usage-by-creator", "Resources: Usage by creator"),
+    (
+        "projects-by-affiliated-organization",
+        "Resources: Projects by affiliated organization",
+    ),
     # Proposals
     ("call-performance", "Proposals: Call performance"),
     ("review-progress", "Proposals: Review progress"),
@@ -277,6 +288,14 @@ CONSTANCE_ADDITIONAL_FIELDS = {
     # String setting that must not be blanked out - an empty value would change
     # the meaning of the setting rather than just unset it.
     "non_empty_field": ["django.forms.CharField", {"required": True}],
+    # Three to five capital latin letters. Validated here as well as in the
+    # settings serializer: the Django admin builds its form straight from this
+    # table and never reaches DRF, so a serializer-only rule let an admin store
+    # a prefix with a space or a newline in it.
+    "issue_key_prefix_field": [
+        "django.forms.RegexField",
+        {"regex": r"^[A-Z]{3,5}$", "required": True, "strip": True},
+    ],
     "url_field": ["django.forms.URLField", {"required": False}],
     "secret_field": ["django.forms.CharField", {"required": False}],
     "dict_field": ["waldur_core.core.serializers.DictField", {"required": False}],
@@ -325,6 +344,7 @@ CONSTANCE_CONFIG_CHOICES = {
     "FEDERATED_IDENTITY_LOCKED_FIELDS": USER_ATTRIBUTE_CHOICES,
     "FEDERATED_IDENTITY_DEACTIVATION_POLICY": DEACTIVATION_POLICY_CHOICES,
     "SCIM_INBOUND_ALLOWED_ATTRIBUTES": USER_ATTRIBUTE_CHOICES,
+    "SCIM_USER_MATCH_WALDUR_ATTRIBUTE": SCIM_USER_MATCH_ATTRIBUTE_CHOICES,
     "RESTRICTED_OFFERING_VISIBILITY_MODE": OFFERING_VISIBILITY_CHOICES,
     "SERVICE_ACCESS_MODE": SERVICE_ACCESS_MODE_CHOICES,
     "SSH_KEY_ALLOWED_TYPES": SSH_KEY_TYPE_CHOICES,
@@ -509,7 +529,7 @@ CONSTANCE_CONFIG = {
     ),
     "INVITATION_DISABLE_MULTIPLE_ROLES": (
         False,
-        "Do not allow user to accept multiple roles within the same scope (project or organization) using invitation. When enabled, users can still accept invitations to different scopes but cannot have multiple roles in the same scope.",
+        "Do not allow a user to hold multiple roles within the same scope (project or organization). Applies to invitations, permission requests and direct role assignment. When enabled, users can still get roles in different scopes but cannot have multiple roles in the same scope.",
     ),
     "ONLY_ONE_PROJECT_MANAGER": (
         False,
@@ -694,6 +714,13 @@ CONSTANCE_CONFIG = {
         True,
         "Toggler for request type displaying",
     ),
+    "WALDUR_SUPPORT_ISSUE_KEY_PREFIX": (
+        "WLD",
+        "Prefix of ticket keys created by the built-in service desk, "
+        "e.g. WLD in WLD-A1B2C3D4. Three to five capital latin letters. "
+        "Keys of existing tickets are not rewritten.",
+        "issue_key_prefix_field",
+    ),
     "WALDUR_SUPPORT_PROVIDER_ROUTING_ENABLED": (
         False,
         "Enable automatic routing of tickets to provider helpdesks.",
@@ -744,6 +771,12 @@ CONSTANCE_CONFIG = {
         "secret_field",
     ),
     "ATLASSIAN_OAUTH2_CLIENT_ID": ("", "OAuth 2.0 Client ID", "secret_field"),
+    "ATLASSIAN_OAUTH2_CLIENT_SECRET": (
+        "",
+        "OAuth 2.0 Client Secret. With the client ID set, Waldur obtains and renews "
+        "access tokens itself (client credentials grant).",
+        "secret_field",
+    ),
     "ATLASSIAN_OAUTH2_ACCESS_TOKEN": ("", "OAuth 2.0 Access Token", "secret_field"),
     "ATLASSIAN_OAUTH2_TOKEN_TYPE": ("Bearer", "OAuth 2.0 Token Type"),
     "ATLASSIAN_VERIFY_SSL": (
@@ -765,7 +798,7 @@ CONSTANCE_CONFIG = {
     ),
     "ATLASSIAN_EXCLUDED_ATTACHMENT_TYPES": (
         "",
-        "Comma-separated list of file extenstions not allowed for attachment.",
+        "Comma-separated list of file extensions not allowed for attachment.",
     ),
     "ATLASSIAN_DESCRIPTION_TEMPLATE": ("", "Template for issue description"),
     "ATLASSIAN_SUMMARY_TEMPLATE": ("", "Template for issue summary"),
@@ -1032,6 +1065,31 @@ CONSTANCE_CONFIG = {
         "a full-replace (PUT / PATCH replace) that omits a key deletes it, including "
         "keys the user added via the UI. Off by default because SSH keys grant access.",
     ),
+    "SCIM_USER_MATCH_WALDUR_ATTRIBUTE": (
+        "username",
+        "Waldur user attribute that links an inbound SCIM user to an existing "
+        "account. Must be username or an enabled identifying attribute. With "
+        "username, new accounts are named after the matched value.",
+        "choice_field",
+    ),
+    "SCIM_USER_MATCH_SCIM_ATTRIBUTE": (
+        "userName",
+        "SCIM attribute holding the value matched against "
+        "SCIM_USER_MATCH_WALDUR_ATTRIBUTE, e.g. userName, emails, or an extension "
+        "path such as urn:mace:surf.nl:sram:scim:extension:User.eduPersonUniqueId.",
+    ),
+    "SRAM_INTEGRATION_ENABLED": (
+        False,
+        "Accept SCIM provisioning from SURF Research Access Management (SRAM) at "
+        "/scim/v2/sram/. Also requires SCIM_INBOUND_ENABLED and a staff service-account "
+        "token registered as the service's SCIM bearer token in SRAM.",
+    ),
+    "SRAM_PLACEHOLDER_ROLE_TEMPLATE": (
+        "",
+        "Name of the organization role whose permissions SRAM placeholder roles "
+        "copy. Empty gives placeholders no permissions. Placeholders are refreshed "
+        "on the next push or by 'waldur sram_resync'.",
+    ),
     "SCIM_PULL_API_URL": (
         "",
         "Base URL for outbound SCIM pull (fetching user attributes from an external IdP).",
@@ -1124,6 +1182,13 @@ CONSTANCE_CONFIG = {
         300,
         "Seconds to cache successful token introspection results. Reduces load on the introspection endpoint. "
         "Set to 0 to disable caching. Default: 300 (5 minutes).",
+    ),
+    "OIDC_REGISTRATION_METHOD": (
+        "oidc",
+        "Value stored in User.registration_method for accounts created or adopted "
+        "via Bearer token introspection (OIDCAuthentication). Set to the social "
+        "IdP provider slug (e.g. 'eduteams') when introspection and OAuth share "
+        "the same identity provider so IdentityProvider.protected_fields apply.",
     ),
     "OIDC_ACCESS_TOKEN_ENABLED": (
         False,
@@ -1764,7 +1829,7 @@ CONSTANCE_CONFIG = {
     ),
     "MATRIX_LIVEKIT_KEY": (
         "",
-        "LiveKit API key for the Element Call SFU (Calls observability tab).",
+        "LiveKit API key for the call SFU (Calls observability tab).",
     ),
     "MATRIX_LIVEKIT_SECRET": (
         "",
@@ -1924,6 +1989,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "WALDUR_SUPPORT_ENABLED",
         "WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE",
         "WALDUR_SUPPORT_DISPLAY_REQUEST_TYPE",
+        "WALDUR_SUPPORT_ISSUE_KEY_PREFIX",
         "WALDUR_SUPPORT_PROVIDER_ROUTING_ENABLED",
         "WALDUR_SUPPORT_AUTO_ASSIGN",
         "WALDUR_SUPPORT_AUTO_ASSIGN_STRATEGY",
@@ -1939,6 +2005,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ATLASSIAN_TOKEN",
         "ATLASSIAN_PERSONAL_ACCESS_TOKEN",
         "ATLASSIAN_OAUTH2_CLIENT_ID",
+        "ATLASSIAN_OAUTH2_CLIENT_SECRET",
         "ATLASSIAN_OAUTH2_ACCESS_TOKEN",
         "ATLASSIAN_OAUTH2_TOKEN_TYPE",
         "ATLASSIAN_PROJECT_ID",
@@ -2070,6 +2137,10 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "SCIM_INBOUND_SOURCE_NAME",
         "SCIM_INBOUND_ALLOWED_ATTRIBUTES",
         "SCIM_INBOUND_SSH_KEYS_ENABLED",
+        "SCIM_USER_MATCH_WALDUR_ATTRIBUTE",
+        "SCIM_USER_MATCH_SCIM_ATTRIBUTE",
+        "SRAM_INTEGRATION_ENABLED",
+        "SRAM_PLACEHOLDER_ROLE_TEMPLATE",
         "SCIM_PULL_API_URL",
         "SCIM_PULL_API_KEY",
         "SCIM_PULL_SOURCE_NAME",
@@ -2081,6 +2152,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "OIDC_CLIENT_SECRET",
         "OIDC_USER_FIELD",
         "OIDC_CACHE_TIMEOUT",
+        "OIDC_REGISTRATION_METHOD",
         "OIDC_DEFAULT_LOGOUT_URL",
         "WALDUR_AUTH_SOCIAL_ROLE_CLAIM",
     ),
@@ -2281,6 +2353,7 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "AI_ASSISTANT_NAME",
     "MATRIX_ENABLED",
     "AFFILIATES_ENABLED",
+    "SRAM_INTEGRATION_ENABLED",
     # Support plugin
     "WALDUR_SUPPORT_ENABLED",
     "WALDUR_SUPPORT_DISPLAY_REQUEST_TYPE",
@@ -2319,4 +2392,5 @@ PUBLIC_CONSTANCE_SETTINGS = (
     # Personal Access Tokens
     "PAT_ENABLED",
     "ONLY_ONE_PROJECT_MANAGER",
+    "INVITATION_DISABLE_MULTIPLE_ROLES",
 )

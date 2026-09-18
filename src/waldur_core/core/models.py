@@ -32,6 +32,7 @@ from waldur_core.core.fields import JSONField, UUIDField
 from waldur_core.core.utils import normalize_unicode, send_mail
 from waldur_core.core.validators import (
     is_potentially_dangerous_regex,
+    matches_access_email_pattern,
     normalize_network_acl,
     validate_gender,
     validate_iso_3166_alpha2,
@@ -1126,6 +1127,27 @@ class RuleEvaluationResult:
     filter_results: list[FilterCheckResult] = field(default_factory=list)
 
 
+# User columns a claim lookup may fall back to when the claim is not present in
+# ``User.details``. Restricted to identity-provider-sourced profile attributes:
+# the claim name is administrator-supplied, and a bare ``getattr`` would happily
+# read ``password`` or ``is_staff``.
+_CLAIM_FALLBACK_USER_FIELDS = frozenset(
+    {
+        "affiliations",
+        "country_of_residence",
+        "eduperson_assurance",
+        "identity_source",
+        "job_title",
+        "nationalities",
+        "nationality",
+        "organization",
+        "organization_country",
+        "organization_type",
+        "registration_method",
+    }
+)
+
+
 class UserDetailsMatchMixin(models.Model):
     class Meta:
         abstract = True
@@ -1342,19 +1364,95 @@ class UserDetailsMatchMixin(models.Model):
             )
         )
 
+        # Claim filter (AND across claim names, OR within one claim's values).
+        # Deliberately not part of the basic OR group: a rule that grants a role
+        # off an identity provider claim must not be satisfied by an unrelated
+        # email match. Only models that declare `user_claims` carry it.
+        claims = getattr(item, "user_claims", None) or {}
+        claims_configured = bool(claims)
+        claims_matched = True
+        claims_user_value: dict[str, list] = {}
+        unmatched_claims: list[str] = []
+        for claim_name, accepted in claims.items():
+            present = cls._get_user_claim_values(user, claim_name)
+            claims_user_value[claim_name] = present
+            if not any(
+                cls._is_claim_value_match(pattern, value)
+                for pattern in (accepted or [])
+                for value in present
+            ):
+                claims_matched = False
+                unmatched_claims.append(claim_name)
+        filter_results.append(
+            FilterCheckResult(
+                name="claims",
+                configured=claims_configured,
+                matched=claims_matched,
+                user_value=claims_user_value,
+                rule_value=claims,
+                reason=(
+                    "Not configured"
+                    if not claims_configured
+                    else (
+                        "User claims satisfy every configured claim"
+                        if claims_matched
+                        else "User does not carry an accepted value for: "
+                        + ", ".join(unmatched_claims)
+                    )
+                ),
+            )
+        )
+
         aai_match = nat_matched and org_type_matched and assurance_matched
 
         any_configured = any_basic_configured or bool(
-            nationalities or org_types or assurance
+            nationalities or org_types or assurance or claims
         )
 
         if not required and not any_configured:
             return RuleEvaluationResult(matched=True, filter_results=filter_results)
 
         return RuleEvaluationResult(
-            matched=bool(basic_match and aai_match),
+            matched=bool(basic_match and aai_match and claims_matched),
             filter_results=filter_results,
         )
+
+    @staticmethod
+    def _get_user_claim_values(user: "User", claim: str) -> list:
+        """Values a user carries for an identity provider claim.
+
+        ``User.details`` holds the raw claims listed in
+        ``IdentityProvider.extra_fields`` and is therefore the primary source.
+        A claim whose name matches a mapped ``User`` column (``affiliations``,
+        ``organization``, …) falls back to that column, so a deployment that
+        maps the claim through ``attribute_mapping`` instead of ``extra_fields``
+        still matches. Scalars are normalised to a single-element list.
+        """
+        raw = (user.details or {}).get(claim)
+        if raw in (None, "", []) and claim in _CLAIM_FALLBACK_USER_FIELDS:
+            raw = getattr(user, claim, None)
+        if raw in (None, "", []):
+            return []
+        if isinstance(raw, list | tuple | set):
+            return [value for value in raw if value not in (None, "")]
+        return [raw]
+
+    @staticmethod
+    def _is_claim_value_match(pattern, value) -> bool:
+        """Exact match, or prefix match when the pattern ends in ``*``.
+
+        Deliberately not a regex: unlike ``user_email_patterns`` this field
+        decides whether a role is granted, so it stays off the ReDoS surface.
+        The prefix form covers entitlement URNs, which commonly carry a
+        trailing ``#authority`` fragment
+        (``urn:mace:example.org:group:hpc-*``).
+        """
+        if not isinstance(pattern, str) or not isinstance(value, str):
+            return False
+        if pattern.endswith("*"):
+            prefix = pattern[:-1]
+            return bool(prefix) and value.startswith(prefix)
+        return pattern == value
 
     @classmethod
     def get_objects_by_user_patterns(cls, user: "User", required=True):
@@ -1371,27 +1469,38 @@ class UserDetailsMatchMixin(models.Model):
 
     @staticmethod
     def _is_pattern_match(pattern, email):
-        """Safely check if email matches pattern, handling invalid regex patterns."""
-        if not pattern or not isinstance(pattern, str):
-            return False
-        if not email or not isinstance(email, str):
-            return False
+        """Whether ``email`` matches ``pattern``, with access-control semantics.
 
-        # Check for potentially dangerous patterns
-        if UserDetailsMatchMixin._is_potentially_dangerous_pattern(pattern):
-            logger.warning(
-                "Potentially dangerous regex pattern rejected: '%s'", pattern[:50]
-            )
-            return False
+        Every caller decides access. Auto-provisioning rules grant roles, and
+        membership restrictions, invitations and call eligibility decide who may
+        join. So this delegates to :func:`matches_access_email_pattern`: the whole
+        address must match, case-insensitively, and an invalid or potentially
+        dangerous pattern never matches. Matching only at the start would let
+        ``.*@example\\.com`` admit ``alice@example.com.attacker.net``.
+        """
+        return matches_access_email_pattern([pattern], email)
 
-        try:
-            # Use re.match with a compiled pattern for better performance
-            # re.match only matches at the beginning, limiting backtracking
-            compiled = re.compile(pattern)
-            return bool(compiled.match(email))
-        except re.error as e:
-            logger.warning("Invalid regex pattern '%s': %s", pattern, e)
-            return False
+    @staticmethod
+    def _suggest_regex_for_wildcard(pattern) -> str | None:
+        """The regex equivalent of a wildcard pattern, or None if it isn't one.
+
+        A pattern counts as a wildcard when it has a ``*`` and no other regex
+        metacharacter apart from ``.``. A broken regex such as ``(.*@x`` is
+        left alone, because escaping it would produce a misleading suggestion.
+
+        Each ``*`` becomes ``.*`` and everything else is escaped. The result
+        ends with ``$`` unless the wildcard ended with ``*``, so
+        ``*@example.org`` becomes ``.*@example\\.org$``. ``_is_pattern_match``
+        already matches the whole address, so the ``$`` is redundant here. It is
+        kept because the suggestion is meant to be copied, and it stays correct
+        wherever the regex ends up.
+        """
+        if not isinstance(pattern, str) or "*" not in pattern:
+            return None
+        if re.search(r"[\\^$+?()\[\]{}|]", pattern):
+            return None
+        regex = ".*".join(re.escape(part) for part in pattern.split("*"))
+        return regex if pattern.endswith("*") else regex + "$"
 
     @staticmethod
     def validate_user_email_patterns(patterns: list) -> None:
@@ -1415,6 +1524,17 @@ class UserDetailsMatchMixin(models.Model):
         errors = []
         if invalid_patterns:
             errors.append(f"Invalid regex patterns: {invalid_patterns}")
+            # The usual mistake is a shell-style wildcard such as
+            # "*@example.org", which is not a valid regex. Suggest the regex
+            # that means the same thing, rather than leaving the administrator
+            # to work out why an obvious pattern is rejected.
+            for pattern in invalid_patterns:
+                suggestion = UserDetailsMatchMixin._suggest_regex_for_wildcard(pattern)
+                if suggestion:
+                    errors.append(
+                        "Patterns are regular expressions, not wildcards: "
+                        f"use '{suggestion}' instead of '{pattern}'."
+                    )
         if dangerous_patterns:
             errors.append(
                 f"Potentially dangerous patterns (nested quantifiers or too long): {dangerous_patterns}"

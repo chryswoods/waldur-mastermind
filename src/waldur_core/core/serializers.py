@@ -38,6 +38,7 @@ from waldur_core.core.validators import (
 )
 from waldur_core.permissions.enums import TYPE_KEY_BY_CT, TYPE_MAP, PermissionEnum
 from waldur_core.permissions.utils import get_scope_ancestors, has_any_permission
+from waldur_core.users.scim.server import matching as scim_matching
 from waldur_mastermind.common.serializers import StringListSerializer
 
 from . import fields as core_fields
@@ -667,6 +668,14 @@ color_hex_validator = RegexValidator(
 )
 
 
+ISSUE_KEY_PREFIX_RE = re.compile("^[A-Z]{3,5}$")
+issue_key_prefix_validator = RegexValidator(
+    ISSUE_KEY_PREFIX_RE,
+    _("Enter three to five capital latin letters, eg. WLD"),
+    "invalid",
+)
+
+
 class ConstanceSettingsSerializer(serializers.Serializer):
     def get_fields(self):
         fields = OrderedDict()
@@ -721,6 +730,7 @@ class ConstanceSettingsSerializer(serializers.Serializer):
                 "url_field",
                 "secret_field",
                 "non_empty_field",
+                "issue_key_prefix_field",
             ):
                 field_class = serializers.CharField
             if not field_class:
@@ -732,6 +742,9 @@ class ConstanceSettingsSerializer(serializers.Serializer):
                 kwargs["allow_null"] = True
             if config_type == "secret_field":
                 kwargs["allow_blank"] = True
+            if config_type == "issue_key_prefix_field":
+                kwargs["allow_blank"] = False
+                kwargs["validators"] = [issue_key_prefix_validator]
             if config_type == "non_empty_field":
                 # The setting stays optional in the payload, but it cannot be
                 # blanked out once it is submitted.
@@ -753,6 +766,21 @@ class ConstanceSettingsSerializer(serializers.Serializer):
                 kwargs["allow_blank"] = True
             fields[name] = field_class(**kwargs)
         return fields
+
+    def validate_WALDUR_SUPPORT_ISSUE_KEY_PREFIX(self, value):
+        # The prefix is pasted into every ticket key, so a stray space or a
+        # lowercase letter would show up in mail subjects forever.
+        issue_key_prefix_validator(value)
+        return value
+
+    def validate_SCIM_USER_MATCH_WALDUR_ATTRIBUTE(self, value):
+        # Matching links SCIM identities to existing accounts, so only an
+        # enabled identifying attribute may be used.
+        try:
+            scim_matching.validate_waldur_attribute(value or "username")
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc))
+        return value
 
     def validate_OIDC_ALLOWED_USER_EMAIL_PATTERNS(self, value):
         # An unusable pattern never matches, so a silently accepted typo would

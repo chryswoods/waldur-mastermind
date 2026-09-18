@@ -1235,6 +1235,21 @@ class OfferingCreateTest(test.APITestCase):
         )
         self.assertEqual(offering.plugin_options["heappe_username"], "test_user")
 
+    def test_heappe_identifier_can_be_cleared(self):
+        """Clearing the field in Homeport submits an empty string."""
+        offering = factories.OfferingFactory(
+            customer=self.customer,
+            plugin_options={"heappe_identifier": "example-cluster"},
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        response = self.client.post(url, {"plugin_options": {"heappe_identifier": ""}})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertEqual(offering.plugin_options["heappe_identifier"], "")
+
     def test_update_offering_plugin_options_with_openstack_max_security_groups(self):
         """Test that offering plugin options can be updated with max_security_groups"""
         offering = factories.OfferingFactory(customer=self.customer)
@@ -1273,6 +1288,42 @@ class OfferingCreateTest(test.APITestCase):
             offering.plugin_options["latest_date_for_resource_termination"],
             "2026-02-28",
         )
+
+    def test_update_offering_plugin_options_heappe_cluster_id_allows_blank(self):
+        """Clearing heappe_cluster_id must accept empty string."""
+        offering = factories.OfferingFactory(
+            customer=self.customer,
+            plugin_options={"heappe_cluster_id": "1"},
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        response = self.client.post(
+            url,
+            {"plugin_options": {"heappe_cluster_id": ""}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertEqual(offering.plugin_options["heappe_cluster_id"], "")
+
+    def test_update_offering_plugin_options_heappe_cluster_id_allows_null(self):
+        """Clearing heappe_cluster_id must accept null."""
+        offering = factories.OfferingFactory(
+            customer=self.customer,
+            plugin_options={"heappe_cluster_id": "1"},
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        response = self.client.post(
+            url,
+            {"plugin_options": {"heappe_cluster_id": None}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertIsNone(offering.plugin_options["heappe_cluster_id"])
 
     def test_update_offering_plugin_options_required_team_role_allows_blank(self):
         """Clearing required_team_role_for_provisioning must accept empty string."""
@@ -1433,8 +1484,6 @@ class OfferingCreateTest(test.APITestCase):
             "require_effective_id_for_highlighted_display": False,
             "show_ssh_key_loss_warning": False,
             "enable_posix_account": True,
-            "homedir_prefix": "/home/",
-            "login_shell": "/bin/bash",
             "uid_source": "pool",
             "gid_source": "pool",
             "emit_display_name": False,
@@ -1448,8 +1497,6 @@ class OfferingCreateTest(test.APITestCase):
             "resource_role_group_template": "${resource_slug}_${role_name}",
             "resource_role_map": {},
             "slurm_periodic_policy_enabled": False,
-            "username_anonymized_prefix": "waldur_",
-            "username_generation_policy": "service_provider",
         }
         self.assertEqual(offering.plugin_options, default_plugin_options)
 

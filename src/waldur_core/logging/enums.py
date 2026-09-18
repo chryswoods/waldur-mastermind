@@ -116,6 +116,7 @@ class EventType(StrEnum):
     MARKETPLACE_RESOURCE_UPDATE_LIMITS_SUCCEEDED = (
         "marketplace_resource_update_limits_succeeded"
     )
+    MARKETPLACE_RESOURCE_PLAN_SWITCHED = "marketplace_resource_plan_switched"
     MARKETPLACE_RESOURCE_PROJECT_CREATED = "marketplace_resource_project_created"
     MARKETPLACE_RESOURCE_PROJECT_RECOVERED = "marketplace_resource_project_recovered"
     MARKETPLACE_RESOURCE_PROJECT_REMOVED = "marketplace_resource_project_removed"
@@ -357,6 +358,9 @@ class EventType(StrEnum):
     RESOURCE_UPDATE_FLOATING_IPS_FAILED = "resource_update_floating_ips_failed"
     RESOURCE_UPDATE_FLOATING_IPS_SCHEDULED = "resource_update_floating_ips_scheduled"
     RESOURCE_UPDATE_FLOATING_IPS_SUCCEEDED = "resource_update_floating_ips_succeeded"
+    RESOURCE_UPDATE_METADATA_FAILED = "resource_update_metadata_failed"
+    RESOURCE_UPDATE_METADATA_SCHEDULED = "resource_update_metadata_scheduled"
+    RESOURCE_UPDATE_METADATA_SUCCEEDED = "resource_update_metadata_succeeded"
     RESOURCE_UPDATE_PORTS_FAILED = "resource_update_ports_failed"
     RESOURCE_UPDATE_PORTS_SCHEDULED = "resource_update_ports_scheduled"
     RESOURCE_UPDATE_PORTS_SUCCEEDED = "resource_update_ports_succeeded"
@@ -428,6 +432,9 @@ class EventType(StrEnum):
     PASSKEY_REVOKED_BY_STAFF = "passkey_revoked_by_staff"
     PASSKEY_AUTHENTICATION_SUCCEEDED = "passkey_authentication_succeeded"
     PASSKEY_AUTHENTICATION_FAILED = "passkey_authentication_failed"
+    EVENT_CONSUMER_REGISTERED_WITH_BROAD_CREDENTIAL = (
+        "event_consumer_registered_with_broad_credential"
+    )
 
 
 class EventGroup(StrEnum):
@@ -448,6 +455,8 @@ class EventGroup(StrEnum):
     OPENSTACK_NETWORK = "openstack_network"
     OPENSTACK_PORT = "openstack_port"
     OPENSTACK_RBAC = "openstack_rbac"
+    # Every OpenStack-specific resource event, composed out of RESOURCES below.
+    OPENSTACK_RESOURCES = "openstack_resources"
     OPENSTACK_ROUTER = "openstack_router"
     OPENSTACK_SECURITY_GROUP = "openstack_security_group"
     OPENSTACK_SUBNET = "openstack_subnet"
@@ -494,6 +503,7 @@ EVENT_GROUP_MAPPING = {
         EventType.PASSKEY_REVOKED_BY_STAFF,
         EventType.PASSKEY_AUTHENTICATION_SUCCEEDED,
         EventType.PASSKEY_AUTHENTICATION_FAILED,
+        EventType.EVENT_CONSUMER_REGISTERED_WITH_BROAD_CREDENTIAL,
     ],
     EventGroup.CALL: [
         EventType.CALL_DOCUMENT_ADDED,
@@ -814,6 +824,9 @@ EVENT_GROUP_MAPPING = {
         EventType.RESOURCE_UPDATE_FLOATING_IPS_FAILED,
         EventType.RESOURCE_UPDATE_FLOATING_IPS_SCHEDULED,
         EventType.RESOURCE_UPDATE_FLOATING_IPS_SUCCEEDED,
+        EventType.RESOURCE_UPDATE_METADATA_FAILED,
+        EventType.RESOURCE_UPDATE_METADATA_SCHEDULED,
+        EventType.RESOURCE_UPDATE_METADATA_SUCCEEDED,
         EventType.RESOURCE_UPDATE_PORTS_FAILED,
         EventType.RESOURCE_UPDATE_PORTS_SCHEDULED,
         EventType.RESOURCE_UPDATE_PORTS_SUCCEEDED,
@@ -957,6 +970,25 @@ EVENT_GROUP_MAPPING[EventGroup.USERS] = list(
     )
 )
 
+# RESOURCES is the generic marketplace resource lifecycle group, offered to every
+# deployment. Two thirds of its entries used to be OpenStack-specific (load
+# balancers, listeners, pools, ports, floating IPs), so a deployment running no
+# OpenStack still advertised them - see waldur/waldur-mastermind#340.
+#
+# Composed rather than hand-split for the same reason USERS is composed above: an
+# OPENSTACK_* event appended to the RESOURCES literal lands in the OpenStack group
+# by itself, instead of quietly re-entering the generic one.
+EVENT_GROUP_MAPPING[EventGroup.OPENSTACK_RESOURCES] = [
+    event
+    for event in EVENT_GROUP_MAPPING[EventGroup.RESOURCES]
+    if event.name.startswith("OPENSTACK_")
+]
+EVENT_GROUP_MAPPING[EventGroup.RESOURCES] = [
+    event
+    for event in EVENT_GROUP_MAPPING[EventGroup.RESOURCES]
+    if not event.name.startswith("OPENSTACK_")
+]
+
 RESOURCE_CHANGE_EVENTS = (
     EventType.MARKETPLACE_RESOURCE_CREATE_SUCCEEDED,
     EventType.MARKETPLACE_RESOURCE_CREATE_FAILED,
@@ -986,7 +1018,60 @@ class ObservableObjectType(Enum):
     USER_PROFILE = "user_profile"
     USER_SSH_KEY = "user_ssh_key"
     USER_LIFECYCLE = "user_lifecycle"
+    # Provider-scoped account changes. Emitted alongside the per-offering
+    # OFFERING_USER events rather than instead of them, so a consumer that only
+    # knows the older type keeps working -- and one that does not recognise this
+    # one drops it with a warning rather than mis-handling it.
+    SERVICE_PROVIDER_ACCOUNT = "service_provider_account"
 
     @classmethod
     def choices(cls):
         return [(t.value, t.value) for t in cls]
+
+
+class QueueKind(StrEnum):
+    """How Waldur uses a RabbitMQ queue, as opposed to RabbitMQ's own queue type.
+
+    Derived from the queue name: ``consumer_{uuid}`` is a unified consumer
+    queue, ``subscription_{uuid}_offering_{uuid}_{type}`` a legacy subscription
+    one, and anything else is not ours to classify.
+    """
+
+    CONSUMER = "consumer"
+    LEGACY = "legacy"
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def choices(cls):
+        return [(k.value, k.value) for k in cls]
+
+
+class ConsumerAuthorization(StrEnum):
+    """Which permission branch let a caller register an event consumer.
+
+    Recorded on ``EventConsumer.authorized_via`` at every registration, so an
+    operator can tell a site agent running on a staff session from one on a
+    scoped credential of an offering manager. ``staff``, ``customer_owner``,
+    ``offering_manager`` and ``identity_manager`` are the branches of
+    ``_can_manage_offering_agent`` (the site-agent path); ``staff``,
+    ``support``, ``scope_role`` and ``self`` are the standalone
+    ``/api/event-consumers/register/`` path.
+    """
+
+    STAFF = "staff"
+    SUPPORT = "support"
+    CUSTOMER_OWNER = "customer_owner"
+    OFFERING_MANAGER = "offering_manager"
+    IDENTITY_MANAGER = "identity_manager"
+    SCOPE_ROLE = "scope_role"
+    SELF = "self"
+
+    @classmethod
+    def choices(cls, include_blank=False):
+        """``include_blank`` adds the empty string a row registered before the
+        branch was recorded holds; a read-only serializer field must declare it
+        or the generated SDK enum rejects those rows."""
+        choices = [(a.value, a.value) for a in cls]
+        if include_blank:
+            choices.insert(0, ("", ""))
+        return choices

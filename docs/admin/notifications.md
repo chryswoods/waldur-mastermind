@@ -1,5 +1,7 @@
 # Notifications
 
+When a notification is removed from a release, its database row is not deleted automatically. Run `waldur load_notifications <file> --prune` to report and remove notifications whose key is no longer listed below, along with any of their templates that no other notification declares and that have no operator-customised content. Customised template content is never deleted automatically.
+
 ## WALDUR_CORE.STRUCTURE
 
 ### structure.change_email_request
@@ -1510,6 +1512,7 @@ A notification of a successful resource plan update. The recipients are all the 
 
     {% if resource_old_plan %}
     The plan has been changed from {{ resource_old_plan }} to {{ resource_plan }}.
+    {% if billing_consequence %}{{ billing_consequence }}{% endif %}
     {% endif %}
 
     {% if support_email or support_phone %}
@@ -1544,6 +1547,11 @@ A notification of a successful resource plan update. The recipients are all the 
     <p>
         The plan has been changed from {{ resource_old_plan }} to {{ resource_plan }}.
     </p>
+    {% if billing_consequence %}
+    <p>
+        {{ billing_consequence }}
+    </p>
+    {% endif %}
     {% endif %}
     {% if support_email or support_phone %}
     <p>
@@ -2780,6 +2788,57 @@ Notification about a new comment in the issue. The recipient is issue caller.
     </div>
     </body>
     </html>
+
+```
+
+### support.notification_comment_added_staff
+
+Notification to the assignee, or to all staff and support users when the ticket is unassigned, about a comment the issue caller added. Sent only by the built-in service desk — the Atlassian, Zammad and SMAX backends notify their own agents.
+
+#### Templates
+
+=== "support/notification_comment_added_staff_subject.txt"
+
+```txt
+
+    [{{ issue.key }}] New comment from {{ comment.author.name|default:"the requester" }}: {{ issue.summary.strip }}
+
+```
+
+=== "support/notification_comment_added_staff_message.txt"
+
+```txt
+
+    {{ comment.author.name|default:"The requester" }} has commented on a support request.
+
+    Request: {{ issue.key }}
+    Summary: {{ issue.summary.strip }}
+    Status: {{ issue.status }}
+    {% if issue.assignee %}Assignee: {{ issue.assignee.name }}
+    {% endif %}{% if issue.customer %}Organization: {{ issue.customer.name }}
+    {% endif %}{% if issue.project %}Project: {{ issue.project.name }}
+    {% endif %}
+    Comment:
+    {{ comment.description.strip }}
+
+    Open the request: {{ issue_url }}
+
+```
+
+=== "support/notification_comment_added_staff_message.html"
+
+```txt
+
+    <p>{{ comment.author.name|default:"The requester" }} has commented on a support request.</p>
+    <p><strong>Request:</strong> {{ issue.key }}<br>
+    <strong>Summary:</strong> {{ issue.summary.strip }}<br>
+    <strong>Status:</strong> {{ issue.status }}
+    {% if issue.assignee %}<br><strong>Assignee:</strong> {{ issue.assignee.name }}{% endif %}
+    {% if issue.customer %}<br><strong>Organization:</strong> {{ issue.customer.name }}{% endif %}
+    {% if issue.project %}<br><strong>Project:</strong> {{ issue.project.name }}{% endif %}</p>
+    <p><strong>Comment:</strong></p>
+    <p>{{ comment.description.strip }}</p>
+    <p><a href="{{ issue_url }}">Open the request</a></p>
 
 ```
 

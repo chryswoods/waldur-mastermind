@@ -32,7 +32,7 @@ from waldur_mastermind.marketplace_openstack import (
 from waldur_pid import tasks as pid_tasks
 from waldur_pid import utils as pid_utils
 
-from . import executors, models, utils
+from . import billing_mode, executors, models, utils
 
 
 class GoogleCredentialsAdminForm(ModelForm):
@@ -282,9 +282,32 @@ class PlanOrganizationGroupsInline(admin.StackedInline):
     extra = 1
 
 
+class PlanAdminForm(ModelForm):
+    """Same rules as the API: a mode needs builtin components and is frozen
+    while resources use the plan."""
+
+    def clean_billing_mode(self):
+        mode = self.cleaned_data.get("billing_mode")
+        offering = self.instance.offering if self.instance.pk else None
+        if offering is None:
+            return mode
+        error = billing_mode.check_plan_billing_mode(offering, mode, self.instance)
+        if error:
+            raise ValidationError(error)
+        return mode
+
+
 class PlanAdmin(ConnectedResourceMixin, VersionAdmin, admin.ModelAdmin):
-    list_display = ("name", "offering", "archived", "unit", "unit_price")
-    list_filter = ("offering", "archived")
+    form = PlanAdminForm
+    list_display = (
+        "name",
+        "offering",
+        "archived",
+        "billing_mode",
+        "unit",
+        "unit_price",
+    )
+    list_filter = ("offering", "archived", "billing_mode")
     search_fields = ("name", "offering__name")
     inlines = [PlanComponentInline, PlanOrganizationGroupsInline]
     protected_fields = ("unit", "unit_price", "article_code")
@@ -297,6 +320,7 @@ class PlanAdmin(ConnectedResourceMixin, VersionAdmin, admin.ModelAdmin):
         "article_code",
         "max_amount",
         "archived",
+        "billing_mode",
     ) + readonly_fields
 
     def scope_link(self, obj):
@@ -348,7 +372,12 @@ def get_admin_link_for_scope(scope):
 class OfferingUserInline(admin.TabularInline):
     model = models.OfferingUser
     fields = ("user", "username", "created")
-    readonly_fields = ("created",)
+    # username is read-only because a provider-backed account's is owned by its
+    # ServiceProviderAccount and the model refuses a write here. Read-only for
+    # every row rather than conditionally: the inline is a view onto one
+    # offering's accounts, some backed and some not, and a field that is
+    # editable on some rows and not others is worse than one that never is.
+    readonly_fields = ("created", "username")
     extra = 1
 
 

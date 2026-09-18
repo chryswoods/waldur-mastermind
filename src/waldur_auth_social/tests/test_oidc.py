@@ -4,13 +4,14 @@ from urllib.parse import parse_qs, urlparse
 
 import responses
 from constance.test.unittest import override_config
+from django.contrib.sessions.models import Session
 from django.utils import timezone
 from rest_framework import status, test
 from rest_framework.authtoken.models import Token
 from rest_framework.exceptions import ValidationError
 from rest_framework.reverse import reverse
 
-from waldur_auth_social import models
+from waldur_auth_social import models, views
 from waldur_auth_social.const import PROVIDER_DEFAULTS, ProviderChoices
 from waldur_auth_social.serializers import IdentityProviderSerializer
 from waldur_auth_social.utils import (
@@ -127,7 +128,135 @@ class OAuthViewInitTest(test.APITestCase):
         self.assertIn("Identity provider is not defined", str(response.content))
 
 
-class OAuthViewCompleteTest(test.APITransactionTestCase):
+class OAuthViewDefaultInitTest(test.APITestCase):
+    def setUp(self):
+        super().setUp()
+        self.provider = models.IdentityProvider.objects.create(
+            provider=ProviderChoices.KEYCLOAK,
+            client_id="test_client_id",
+            client_secret="test_client_secret",
+            discovery_url="http://keycloak.test/.well-known/openid-configuration",
+            userinfo_url="http://keycloak.test/userinfo",
+            token_url="http://keycloak.test/token",
+            auth_url="http://keycloak.test/auth",
+            **PROVIDER_DEFAULTS[ProviderChoices.KEYCLOAK],
+        )
+        self.url = reverse("auth_default_init")
+
+    def assert_not_found(self, response):
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertIn("No default identity provider", str(response.content))
+        self.assertNotIn(OIDC_STATE_KEY, self.client.session)
+
+    @override_config(DEFAULT_IDP=ProviderChoices.KEYCLOAK)
+    def test_redirects_to_default_provider(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertIn(OIDC_STATE_KEY, self.client.session)
+
+        parsed_url = urlparse(response.url)
+        self.assertEqual(parsed_url.netloc, "keycloak.test")
+        self.assertEqual(parsed_url.path, "/auth")
+        query_params = parse_qs(parsed_url.query)
+        self.assertEqual(query_params["client_id"], [self.provider.client_id])
+        self.assertEqual(query_params["state"], [self.client.session[OIDC_STATE_KEY]])
+        self.assertTrue(
+            query_params["redirect_uri"][0].endswith("/api-auth/keycloak/complete/")
+        )
+
+    @override_config(DEFAULT_IDP=ProviderChoices.KEYCLOAK)
+    def test_return_url_and_locale_are_forwarded(self):
+        response = self.client.get(
+            self.url,
+            {"return_url": "https://portal.example.com", "ui_locales": "et"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertEqual(
+            self.client.session[OIDC_RETURN_URL_KEY], "https://portal.example.com"
+        )
+        query_params = parse_qs(urlparse(response.url).query)
+        self.assertEqual(query_params["ui_locales"], ["et"])
+
+    @override_config(DEFAULT_IDP=ProviderChoices.KEYCLOAK)
+    def test_pkce_of_default_provider_is_honoured(self):
+        self.provider.enable_pkce = True
+        self.provider.save()
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertIn(OIDC_CODE_VERIFIER_KEY, self.client.session)
+        query_params = parse_qs(urlparse(response.url).query)
+        self.assertEqual(query_params["code_challenge_method"], ["S256"])
+
+    @override_config(DEFAULT_IDP="")
+    def test_unset_default_is_not_found(self):
+        response = self.client.get(self.url, {"return_url": "https://evil.example"})
+        self.assert_not_found(response)
+
+    @override_config(DEFAULT_IDP=ProviderChoices.KEYCLOAK)
+    def test_inactive_default_provider_is_not_found(self):
+        self.provider.is_active = False
+        self.provider.save()
+        self.assert_not_found(self.client.get(self.url))
+
+    @override_config(DEFAULT_IDP=ProviderChoices.TARA)
+    def test_missing_default_provider_is_not_found(self):
+        self.assert_not_found(self.client.get(self.url))
+
+    @override_config(DEFAULT_IDP=ProviderChoices.KEYCLOAK)
+    def test_probe_reports_that_a_default_provider_exists(self):
+        response = self.client.get(self.url, {"probe": "1"})
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+    @override_config(DEFAULT_IDP=ProviderChoices.KEYCLOAK)
+    def test_probe_writes_no_session(self):
+        before = Session.objects.count()
+        self.client.get(self.url, {"probe": "1"})
+        self.assertEqual(Session.objects.count(), before)
+        self.assertNotIn(OIDC_STATE_KEY, self.client.session)
+
+    @override_config(DEFAULT_IDP=ProviderChoices.KEYCLOAK)
+    def test_navigation_writes_the_session_the_flow_needs(self):
+        before = Session.objects.count()
+        response = self.client.get(self.url, HTTP_SEC_FETCH_MODE="navigate")
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertEqual(Session.objects.count(), before + 1)
+        self.assertIn(OIDC_STATE_KEY, self.client.session)
+
+    @override_config(DEFAULT_IDP=ProviderChoices.KEYCLOAK)
+    def test_fetch_is_treated_as_a_probe_without_the_parameter(self):
+        response = self.client.get(self.url, HTTP_SEC_FETCH_MODE="cors")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertNotIn(OIDC_STATE_KEY, self.client.session)
+
+    @override_config(DEFAULT_IDP=ProviderChoices.KEYCLOAK)
+    def test_missing_fetch_metadata_is_treated_as_a_navigation(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+
+    @override_config(DEFAULT_IDP="")
+    def test_probe_without_default_is_not_found(self):
+        self.assert_not_found(self.client.get(self.url, {"probe": "1"}))
+
+    @override_config(DEFAULT_IDP=ProviderChoices.KEYCLOAK)
+    def test_probe_and_navigation_have_separate_throttle_budgets(self):
+        factory = test.APIRequestFactory()
+        view = views.OAuthViewDefaultInit()
+        probe = view.initialize_request(factory.get(self.url, {"probe": "1"}))
+        navigation = view.initialize_request(
+            factory.get(self.url, HTTP_SEC_FETCH_MODE="navigate")
+        )
+        self.assertTrue(view._is_probe(probe))
+        self.assertFalse(view._is_probe(navigation))
+
+    @override_config(DEFAULT_IDP=ProviderChoices.KEYCLOAK)
+    def test_authenticated_user_is_rejected(self):
+        user = structure_factories.UserFactory()
+        self.client.force_authenticate(user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class OAuthViewCompleteTest(test.APITestCase):
     def setUp(self):
         super().setUp()
         self.provider = models.IdentityProvider.objects.create(
@@ -151,6 +280,7 @@ class OAuthViewCompleteTest(test.APITransactionTestCase):
 
         # Mock external requests
         responses.start()
+        self.addCleanup(responses.reset)
         self.addCleanup(responses.stop)
 
     def _mock_token_request(
@@ -279,6 +409,66 @@ class OAuthViewCompleteTest(test.APITransactionTestCase):
         # Assert that the login fails with a specific error message
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
         self.assertIn("User is deactivated", str(response.content))
+
+    def _use_mail_as_lookup_claim(self):
+        self.provider.user_claim = "mail"
+        self.provider.save()
+
+    def test_single_value_list_lookup_claim_is_unwrapped(self):
+        self._use_mail_as_lookup_claim()
+        self._mock_token_request()
+        self._mock_userinfo_request(
+            {
+                "sub": "test_sub",
+                "mail": ["first.second@example.com"],
+                "email": "first.second@example.com",
+            }
+        )
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertEqual(
+            list(User.objects.values_list("username", flat=True)),
+            ["first.second@example.com"],
+        )
+
+    def test_single_value_list_lookup_claim_matches_existing_user(self):
+        self._use_mail_as_lookup_claim()
+        user = structure_factories.UserFactory(username="first.second@example.com")
+        self._mock_token_request()
+        self._mock_userinfo_request(
+            {"sub": "test_sub", "mail": ["first.second@example.com"]}
+        )
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertEqual(list(User.objects.values_list("pk", flat=True)), [user.pk])
+
+    def test_multi_value_lookup_claim_is_refused(self):
+        self._use_mail_as_lookup_claim()
+        self._mock_token_request()
+        self._mock_userinfo_request(
+            {"sub": "test_sub", "mail": ["a@example.com", "b@example.com"]}
+        )
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertIn("identity claim mail has multiple values", str(response.content))
+        self.assertFalse(User.objects.exists())
+
+    def test_empty_list_lookup_claim_is_treated_as_missing(self):
+        self._use_mail_as_lookup_claim()
+        self._mock_token_request()
+        self._mock_userinfo_request({"sub": "test_sub", "mail": []})
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertIn("identity field is missing", str(response.content))
+        self.assertFalse(User.objects.exists())
 
     @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
     def test_deactivated_user_with_pending_invitation_can_login(self):
@@ -898,7 +1088,7 @@ class OAuthViewCompleteTest(test.APITransactionTestCase):
         self.assertTrue(user.is_support)
 
 
-class MultiHomeportRedirectTest(test.APITransactionTestCase):
+class MultiHomeportRedirectTest(test.APITestCase):
     """Tests for multi-homeport redirect functionality"""
 
     def setUp(self):
@@ -924,6 +1114,7 @@ class MultiHomeportRedirectTest(test.APITransactionTestCase):
 
         # Mock external requests
         responses.start()
+        self.addCleanup(responses.reset)
         self.addCleanup(responses.stop)
 
     def _mock_token_request(
@@ -1549,7 +1740,7 @@ class SchacPersonalUniqueIDParsingTest(test.APITestCase):
         self.assertEqual(result, "LT37510040173")
 
 
-class EnabledUserProfileAttributesSyncTest(test.APITransactionTestCase):
+class EnabledUserProfileAttributesSyncTest(test.APITestCase):
     """Test that IdP sync respects ENABLED_USER_PROFILE_ATTRIBUTES setting."""
 
     def setUp(self):
@@ -1575,6 +1766,7 @@ class EnabledUserProfileAttributesSyncTest(test.APITransactionTestCase):
 
         # Mock external requests
         responses.start()
+        self.addCleanup(responses.reset)
         self.addCleanup(responses.stop)
 
     def _mock_token_request(
@@ -1879,7 +2071,7 @@ class EnabledUserProfileAttributesSyncTest(test.APITransactionTestCase):
         self.assertIsNone(user.gender)
 
 
-class OIDCEmailMatchmakingTest(test.APITransactionTestCase):
+class OIDCEmailMatchmakingTest(test.APITestCase):
     """Tests for OIDC email-based failover user matching."""
 
     def setUp(self):
@@ -1905,6 +2097,7 @@ class OIDCEmailMatchmakingTest(test.APITransactionTestCase):
 
         # Mock external requests
         responses.start()
+        self.addCleanup(responses.reset)
         self.addCleanup(responses.stop)
 
     def _mock_token_request(self):
@@ -2178,7 +2371,7 @@ class OIDCEmailMatchmakingTest(test.APITransactionTestCase):
         self.assertEqual(existing_user.last_name, "NewLast")
 
 
-class OIDCAllowedEmailPatternsTest(test.APITransactionTestCase):
+class OIDCAllowedEmailPatternsTest(test.APITestCase):
     """Tests for the OIDC_ALLOWED_USER_EMAIL_PATTERNS allowlist.
 
     The allowlist widens signup beyond invitations and, once configured, also
@@ -2206,6 +2399,7 @@ class OIDCAllowedEmailPatternsTest(test.APITransactionTestCase):
         session.save()
 
         responses.start()
+        self.addCleanup(responses.reset)
         self.addCleanup(responses.stop)
 
     def _mock_token_request(self):
@@ -2712,3 +2906,152 @@ class OIDCAllowedEmailPatternsTest(test.APITransactionTestCase):
         response = self._login(self._user_info_for(user))
 
         self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+
+
+class CreateOrUpdateOauthUserRegistrationMethodTest(test.APITestCase):
+    @override_config(FEDERATED_IDENTITY_SYNC_ENABLED=True)
+    def test_update_promotes_default_registration_method_to_idp(self):
+        user = structure_factories.UserFactory(
+            username="federated_user",
+            email="federated@example.com",
+            registration_method="default",
+        )
+        idp = models.IdentityProvider(
+            provider=ProviderChoices.EDUTEAMS,
+            **PROVIDER_DEFAULTS[ProviderChoices.EDUTEAMS],
+        )
+
+        synced, created = create_or_update_oauth_user(
+            idp,
+            {
+                "sub": "federated_user",
+                "given_name": "Federated",
+                "family_name": "User",
+                "email": "federated@example.com",
+            },
+        )
+
+        self.assertFalse(created)
+        self.assertEqual(synced.pk, user.pk)
+        user.refresh_from_db()
+        self.assertEqual(user.registration_method, ProviderChoices.EDUTEAMS)
+
+    @override_config(FEDERATED_IDENTITY_SYNC_ENABLED=True)
+    def test_update_maps_remote_eduteams_provider_to_eduteams_registration_method(self):
+        user = structure_factories.UserFactory(
+            username="remote_user",
+            email="remote@example.com",
+            registration_method="default",
+        )
+        idp = models.IdentityProvider(
+            provider=ProviderChoices.REMOTE_EDUTEAMS,
+            **PROVIDER_DEFAULTS[ProviderChoices.REMOTE_EDUTEAMS],
+        )
+
+        synced, created = create_or_update_oauth_user(
+            idp,
+            {
+                "voperson_id": "remote_user",
+                "given_name": "Remote",
+                "family_name": "User",
+                "mail": "remote@example.com",
+            },
+            is_interactive_login=False,
+        )
+
+        self.assertFalse(created)
+        self.assertEqual(synced.pk, user.pk)
+        user.refresh_from_db()
+        self.assertEqual(user.registration_method, ProviderChoices.EDUTEAMS)
+
+    @override_config(FEDERATED_IDENTITY_SYNC_ENABLED=True)
+    def test_update_keeps_matching_registration_method(self):
+        user = structure_factories.UserFactory(
+            username="eduteams_user",
+            email="eduteams@example.com",
+            registration_method=ProviderChoices.EDUTEAMS,
+        )
+        idp = models.IdentityProvider(
+            provider=ProviderChoices.EDUTEAMS,
+            **PROVIDER_DEFAULTS[ProviderChoices.EDUTEAMS],
+        )
+
+        synced, created = create_or_update_oauth_user(
+            idp,
+            {
+                "sub": "eduteams_user",
+                "given_name": "Edu",
+                "family_name": "Teams",
+                "email": "eduteams@example.com",
+            },
+        )
+
+        self.assertFalse(created)
+        self.assertEqual(synced.pk, user.pk)
+        user.refresh_from_db()
+        self.assertEqual(user.registration_method, ProviderChoices.EDUTEAMS)
+
+
+class ExtraFieldsWithdrawalTest(test.APITestCase):
+    """A claim the provider stops asserting must disappear from `User.details`.
+
+    Before, `details` was only assigned when at least one configured extra field
+    had a value, so the previous login's claims stayed on the account for ever.
+    That was invisible while `details` was purely informational; it stops being
+    invisible once authorization is derived from it — an auto-provisioning rule
+    keyed on a claim could never see the claim withdrawn, so the role it granted
+    could never be revoked.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.provider = models.IdentityProvider.objects.create(
+            provider=ProviderChoices.KEYCLOAK,
+            client_id="test_client_id",
+            client_secret="test_client_secret",
+            discovery_url="http://keycloak.test/.well-known/openid-configuration",
+            userinfo_url="http://keycloak.test/userinfo",
+            token_url="http://keycloak.test/token",
+            auth_url="http://keycloak.test/auth",
+            user_field="username",
+            user_claim="sub",
+            extra_fields="roles",
+            attribute_mapping={"email": "email"},
+        )
+
+    def test_claim_is_recorded(self):
+        user, _ = create_or_update_oauth_user(
+            self.provider,
+            {"sub": "alice", "email": "alice@example.com", "roles": ["acme-owner"]},
+        )
+        self.assertEqual(user.details, {"roles": ["acme-owner"]})
+
+    def test_withdrawn_claim_is_cleared(self):
+        create_or_update_oauth_user(
+            self.provider,
+            {"sub": "alice", "email": "alice@example.com", "roles": ["acme-owner"]},
+        )
+        user, _ = create_or_update_oauth_user(
+            self.provider,
+            {"sub": "alice", "email": "alice@example.com", "roles": []},
+        )
+        self.assertEqual(user.details, {})
+
+    def test_claim_absent_from_the_response_is_cleared(self):
+        create_or_update_oauth_user(
+            self.provider,
+            {"sub": "alice", "email": "alice@example.com", "roles": ["acme-owner"]},
+        )
+        user, _ = create_or_update_oauth_user(
+            self.provider, {"sub": "alice", "email": "alice@example.com"}
+        )
+        self.assertEqual(user.details, {})
+
+    def test_details_untouched_when_no_extra_fields_configured(self):
+        self.provider.extra_fields = ""
+        self.provider.save()
+        user, _ = create_or_update_oauth_user(
+            self.provider,
+            {"sub": "bob", "email": "bob@example.com", "roles": ["acme-owner"]},
+        )
+        self.assertEqual(user.details, {})

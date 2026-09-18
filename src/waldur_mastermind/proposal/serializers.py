@@ -22,6 +22,7 @@ from waldur_core.core import models as core_models
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core.models import DESCRIPTION_LENGTH
 from waldur_core.core.validators import get_project_name_regex_error
+from waldur_core.media.validators import DocumentValidator
 from waldur_core.permissions import enums as permissions_enums
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.fixtures import CallRole
@@ -32,10 +33,14 @@ from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import permissions as marketplace_permissions
 from waldur_mastermind.marketplace.serializers import (
     BasePublicPlanSerializer,
+    LimitValueField,
     OfferingComponentSerializer,
     OfferingOptionsField,
     UserAttributeConfigBaseSerializer,
     validate_prepaid_duration_against_component,
+)
+from waldur_mastermind.proposal import (
+    permissions as proposal_permissions,
 )
 from waldur_mastermind.proposal.enums import (
     MANDATORY_STEPS,
@@ -53,6 +58,7 @@ from waldur_mastermind.proposal.enums import (
     RequestedOfferingStates,
     ReviewerPoolInvitationStatuses,
     RoundStatuses,
+    SupportTicketCallers,
     WorkflowStepInstanceStatuses,
     WorkflowStepOutcomes,
 )
@@ -317,6 +323,11 @@ class NestedRequestedResourceSerializer(serializers.HyperlinkedModelSerializer):
     has_purchase_order = serializers.ReadOnlyField()
     # Written through the dedicated multipart action, as orders do.
     attachment = serializers.FileField(read_only=True)
+    # Copied verbatim into Order.limits when the proposal is allocated, so this
+    # has to accept exactly what the ordering path accepts rather than staying
+    # an untyped JSONField. Precision is settled per component by
+    # validate_limits on the resulting order.
+    limits = serializers.DictField(child=LimitValueField(), required=False)
 
     class Meta:
         model = models.RequestedResource
@@ -807,7 +818,10 @@ class CallResourceTemplateSerializer(
         view_name="proposal-call-offering-detail",
         lookup_field="uuid",
     )
-    limits = serializers.DictField(child=serializers.IntegerField(), required=False)
+    # Copied verbatim into Order.limits when the proposal is allocated, so it
+    # has to accept exactly what the ordering path accepts. Precision is
+    # settled per component by validate_limits on that order.
+    limits = serializers.DictField(child=LimitValueField(), required=False)
 
     class Meta:
         model = models.CallResourceTemplate
@@ -1458,6 +1472,38 @@ class ProtectedCallSerializer(PublicCallSerializer):
         source="panel_chair.uuid", read_only=True, format="hex"
     )
     panel_chair_name = serializers.ReadOnlyField(source="panel_chair.full_name")
+    support_ticket_caller = serializers.ChoiceField(
+        choices=SupportTicketCallers.CHOICES,
+        required=False,
+        help_text="Who helpdesk tickets for granted resources are raised for.",
+    )
+    # The queryset is narrowed to the call's own people in get_fields(); what
+    # stands here is only the schema's view of the field.
+    support_ticket_caller_user = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=core_models.User.objects.all(),
+        required=False,
+        allow_null=True,
+        help_text=(
+            "The person tickets go to when the caller is a named contact. "
+            "Must hold a role on this call or on the organisation managing it."
+        ),
+    )
+    # allow_null is load-bearing on a dotted source over a nullable FK: without
+    # it DRF raises SkipField and drops the key from the payload entirely, while
+    # make_readonly_fields_required still marks it required in the generated
+    # SDK. Most calls have no named contact, so that mismatch would be the norm.
+    support_ticket_caller_user_uuid = serializers.UUIDField(
+        source="support_ticket_caller_user.uuid",
+        read_only=True,
+        format="hex",
+        allow_null=True,
+    )
+    support_ticket_caller_user_name = serializers.CharField(
+        source="support_ticket_caller_user.full_name",
+        read_only=True,
+        allow_null=True,
+    )
     compliance_checklist_name = serializers.CharField(
         source="compliance_checklist.name", read_only=True
     )
@@ -1548,9 +1594,75 @@ class ProtectedCallSerializer(PublicCallSerializer):
             "proposal_field_config",
             "proposal_field_metadata",
             "has_proposals",
+            "support_ticket_caller",
+            "support_ticket_caller_user",
+            "support_ticket_caller_user_uuid",
+            "support_ticket_caller_user_name",
         )
         view_name = "proposal-protected-call-detail"
         protected_fields = ("manager",)
+
+    def get_fields(self):
+        fields = super().get_fields()
+        contact = fields.get("support_ticket_caller_user")
+        if contact is not None:
+            contact.queryset = self._ticket_caller_candidates()
+            # Same message whichever way the lookup failed, so the field cannot
+            # be used to tell an unrelated account apart from one that does not
+            # exist. It still says what a usable answer looks like.
+            contact.error_messages["does_not_exist"] = _(
+                "No such user, or they hold no role on this call or on the "
+                "organisation managing it."
+            )
+        return fields
+
+    def _ticket_caller_candidates(self):
+        """Users this call may name as its support contact.
+
+        Whoever is named starts receiving the call's ticket mail -- project
+        name, order description, limits -- and gets an account created for them
+        on the helpdesk. Anyone holding UPDATE_CALL could otherwise point that
+        at an arbitrary account in the deployment, so the choice is kept to
+        people already attached to the call: its own team, the managing
+        organisation, and that organisation's customer.
+
+        Empty when there is no call to read roles from -- during creation, and
+        while drf-spectacular is building the schema.
+        """
+        call = self.instance
+        if not isinstance(call, models.Call):
+            return core_models.User.objects.none()
+        manager = call.manager
+        return (
+            permissions_utils.get_users(call)
+            | permissions_utils.get_users(manager)
+            | permissions_utils.get_users(manager.customer)
+        )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        self._validate_support_ticket_caller(attrs)
+        return attrs
+
+    def _validate_support_ticket_caller(self, attrs):
+        """A named contact, if given, has to be able to receive a ticket.
+
+        A missing contact is deliberately *not* an error. The settings page
+        edits one field per request, so demanding the contact in the same
+        request that selects "specific_user" would leave the manager unable to
+        select it at all -- and the resolver already falls back to the
+        project's roles rather than failing an order over it.
+        """
+        user = attrs.get("support_ticket_caller_user")
+        if user is not None and not user.email:
+            raise serializers.ValidationError(
+                {
+                    "support_ticket_caller_user": _(
+                        "The named contact has no email address, so the "
+                        "helpdesk cannot raise tickets on their behalf."
+                    )
+                }
+            )
 
     def validate_panel_chair(self, user):
         if self.instance is None:
@@ -1559,14 +1671,8 @@ class ProtectedCallSerializer(PublicCallSerializer):
             raise serializers.ValidationError(
                 _("Assign panel members first; the chair is set on an existing call.")
             )
-        # The call PATCH itself is only queryset-scoped, so gate this field
-        # explicitly: choosing the chair is a call-management decision.
-        if not permissions_utils.has_permission(
-            self.context["request"],
-            permissions_enums.PermissionEnum.UPDATE_CALL,
-            self.instance,
-        ):
-            raise PermissionDenied()
+        # The viewset gates every write on UPDATE_CALL held on the call or its
+        # managing organisation, so no field-level check is needed here.
         if user is None:
             return None
         if (
@@ -1852,6 +1958,7 @@ class ProposalDocumentationSerializer(serializers.ModelSerializer):
         model = models.ProposalDocumentation
         fields = ["uuid", "file", "file_name", "file_size", "created"]
         read_only_fields = ["uuid"]
+        extra_kwargs = {"file": {"validators": [DocumentValidator]}}
 
 
 class ProposalDetachDocumentsSerializer(serializers.Serializer):
@@ -2362,10 +2469,11 @@ class ProposalProjectRoleMappingSerializer(serializers.HyperlinkedModelSerialize
             call = self.instance.call
         else:
             call = attrs["call"]
-        if not permissions_utils.has_permission(
+        if not permissions_utils.has_permission_on_any_source(
             self.context["request"],
             permissions_enums.PermissionEnum.UPDATE_CALL,
             call,
+            proposal_permissions.CALL_PERMISSION_SOURCES,
         ):
             raise PermissionDenied()
 
@@ -3082,6 +3190,9 @@ class ConflictOfInterestSerializer(
             "detected_at",
             "evidence_description",
             "evidence_data",
+            # Only dismiss/waive/recuse may move the status: they also stamp
+            # reviewed_by/reviewed_at and unblock the held assignment items.
+            "status",
             "reviewed_by",
             "reviewed_at",
             "conflicting_user",
@@ -4942,10 +5053,11 @@ class CallWorkflowStepNotificationRuleSerializer(
             raise serializers.ValidationError(
                 _("A rule cannot be moved to another workflow step.")
             )
-        if not permissions_utils.has_permission(
+        if not permissions_utils.has_permission_on_any_source(
             self.context["request"],
             permissions_enums.PermissionEnum.UPDATE_CALL,
             workflow_step.call,
+            proposal_permissions.CALL_PERMISSION_SOURCES,
         ):
             raise PermissionDenied()
         if workflow_step.call.state == CallStates.ARCHIVED:

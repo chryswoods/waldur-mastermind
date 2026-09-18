@@ -7,6 +7,7 @@ This document lists all mixin classes found in the Waldur codebase.
 | [`BaseChecklistMixin`](#basechecklistmixin) | `waldur_core.checklist.mixins` | Base mixin providing common checklist functionality |
 | [`ReviewerChecklistMixin`](#reviewerchecklistmixin) | `waldur_core.checklist.mixins` | Mixin for ViewSets that provide checklist review functionality to reviewers |
 | [`UserChecklistMixin`](#userchecklistmixin) | `waldur_core.checklist.mixins` | Mixin for ViewSets that provide checklist functionality to end users |
+| [`LatestAnswerTestMixin`](#latestanswertestmixin) | `waldur_core.checklist.tests.test_latest_answers` | No description available |
 | [`CopyButtonMixin`](#copybuttonmixin) | `waldur_core.core.admin` | Mixin to add copy-to-clipboard functionality to form fields in Django admin |
 | [`ExcludedFieldsAdminMixin`](#excludedfieldsadminmixin) | `waldur_core.core.admin` | This mixin allows to toggle display of fields in Django model admin according... |
 | [`ExtraActionsMixin`](#extraactionsmixin) | `waldur_core.core.admin` | Allows to add extra actions to admin list page |
@@ -85,6 +86,7 @@ This document lists all mixin classes found in the Waldur codebase.
 | [`FieldFilteringMixin`](#fieldfilteringmixin) | `waldur_core.structure.serializers` | Mixin allowing to filter fields by user |
 | [`PermissionFieldFilteringMixin`](#permissionfieldfilteringmixin) | `waldur_core.structure.serializers` | Mixin allowing to filter related fields |
 | [`SshPublicKeySerializerMixin`](#sshpublickeyserializermixin) | `waldur_core.structure.serializers` | A type of `ModelSerializer` that uses hyperlinked relationships instead of pr... |
+| [`DashboardFeedHelpersMixin`](#dashboardfeedhelpersmixin) | `waldur_core.structure.tests.test_dashboard` | Helpers for driving the dashboard feed from throwaway providers |
 | [`ProjectMetadataTestMixin`](#projectmetadatatestmixin) | `waldur_core.structure.tests.test_project_metadata` | Shared test setup and utilities for project metadata tests |
 | [`AvailabilityCheckViewMixin`](#availabilitycheckviewmixin) | `waldur_core.structure.views` | A viewset that provides default `create()`, `retrieve()`, `update()`, `partia... |
 | [`ScopeInvitationMixin`](#scopeinvitationmixin) | `waldur_core.users.models` | Mixin for invitations scoped to a Customer with a system Role |
@@ -128,6 +130,7 @@ This document lists all mixin classes found in the Waldur codebase.
 | [`SettingsMixin`](#settingsmixin) | `waldur_rancher.models` | Make subclasses preserve the alters_data attribute on overridden methods |
 | [`SyncDestroyMixin`](#syncdestroymixin) | `waldur_rancher.views` | No description available |
 | [`YamlMixin`](#yamlmixin) | `waldur_rancher.views` | No description available |
+| [`SramIntegrationEnabledMixin`](#sramintegrationenabledmixin) | `waldur_sram.rest_views` | No description available |
 | [`VirtualMachineMixin`](#virtualmachinemixin) | `waldur_vmware.models` | Make subclasses preserve the alters_data attribute on overridden methods |
 
 ## Detailed Descriptions
@@ -193,6 +196,12 @@ Default permissions are IsAdminUser but should be overridden with app-specific p
 - submit_answers_permissions = [permission_factory(...)]
 
 **Base classes:** `BaseChecklistMixin`
+
+### LatestAnswerTestMixin
+
+**Module:** `waldur_core.checklist.tests.test_latest_answers`
+
+**Description:** No description available.
 
 ### CopyButtonMixin
 
@@ -1238,6 +1247,17 @@ of primary key relationships. Specifically:
 
 **Base classes:** `HyperlinkedModelSerializer`
 
+### DashboardFeedHelpersMixin
+
+**Module:** `waldur_core.structure.tests.test_dashboard`
+
+**Description:**
+
+Helpers for driving the dashboard feed from throwaway providers.
+
+Shared rather than copied: _item encodes the eight-key feed contract, so
+two copies drift the moment that contract changes.
+
 ### ProjectMetadataTestMixin
 
 **Module:** `waldur_core.structure.tests.test_project_metadata`
@@ -1756,6 +1776,12 @@ Make subclasses preserve the alters_data attribute on overridden methods.
 ### YamlMixin
 
 **Module:** `waldur_rancher.views`
+
+**Description:** No description available.
+
+### SramIntegrationEnabledMixin
+
+**Module:** `waldur_sram.rest_views`
 
 **Description:** No description available.
 

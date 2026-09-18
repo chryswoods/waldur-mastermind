@@ -2,6 +2,7 @@ import fnmatch
 import logging
 
 import rest_framework
+from django.contrib.contenttypes.models import ContentType
 from django.db import connection, transaction
 from django.db.models import Count, Max
 from django_filters.rest_framework import DjangoFilterBackend
@@ -29,7 +30,7 @@ from waldur_core.core import permissions as core_permissions
 from waldur_core.core import utils as core_utils
 from waldur_core.core.serializers import StatusSerializer
 from waldur_core.logging import backend, enums, filters, models, serializers, utils
-from waldur_core.logging.event_logger import get_event_groups
+from waldur_core.logging.availability import get_available_event_groups
 from waldur_core.structure.serializers_data_access import (
     GlobalUserDataAccessLogSerializer,
 )
@@ -84,8 +85,11 @@ class EventViewSet(viewsets.ReadOnlyModelViewSet):
         """
         Returns a list of groups with event types.
         Group is used in exclude_features query param.
+
+        Narrowed to the groups this deployment can emit. Groups left out stay
+        deliverable and writable -- see waldur_core.logging.availability.
         """
-        return response.Response(get_event_groups())
+        return response.Response(get_available_event_groups())
 
 
 class BaseHookViewSet(viewsets.ModelViewSet):
@@ -639,9 +643,13 @@ Requires support user permissions.""",
                     "offering_uuid": parsed["offering_uuid"] if parsed else None,
                     "object_type": parsed["object_type"] if parsed else None,
                     "consumer_uuid": consumer_uuid,
-                    "queue_type": "consumer"
+                    # Not queue_type: that key already carries RabbitMQ's own
+                    # x-queue-type (classic/quorum/stream) from **queue.
+                    "queue_kind": enums.QueueKind.CONSUMER
                     if consumer_uuid
-                    else ("legacy" if parsed else "unknown"),
+                    else (
+                        enums.QueueKind.LEGACY if parsed else enums.QueueKind.UNKNOWN
+                    ),
                 }
                 enriched_queues.append(enriched_queue)
 
@@ -1172,6 +1180,29 @@ class UserDataAccessLogViewSet(
         return super().get_permissions()
 
 
+def _resolve_consumer_authorization(request, resolved_scopes) -> str:
+    """Which permission branch let this standalone registration through.
+
+    Mirrors the guards `register` applies, in the same order: privilege first
+    (a staff/support caller may bind to anything, and is the only one who may
+    request the global empty binding set), then identity (a caller binding only
+    to their own user scope needs no role at all), then the per-scope role the
+    serializer validated with `holds_any_role_on_scope_or_ancestor`.
+    """
+    user = request.user
+    if user.is_staff:
+        return enums.ConsumerAuthorization.STAFF
+    if user.is_support:
+        return enums.ConsumerAuthorization.SUPPORT
+    user_ct_id = ContentType.objects.get_for_model(core_models.User).id
+    if resolved_scopes and all(
+        scope["content_type_id"] == user_ct_id and scope["object_id"] == user.id
+        for scope in resolved_scopes
+    ):
+        return enums.ConsumerAuthorization.SELF
+    return enums.ConsumerAuthorization.SCOPE_ROLE
+
+
 class EventConsumerViewSet(
     mixins.ListModelMixin,
     mixins.DestroyModelMixin,
@@ -1189,9 +1220,18 @@ class EventConsumerViewSet(
     """
 
     lookup_field = "uuid"
-    queryset = models.EventConsumer.objects.all().order_by("-created")
+    # scopes are prefetched for the serializer's bindings and for is_global,
+    # which reads the populated cache instead of an exists() query per row.
+    queryset = (
+        models.EventConsumer.objects.all()
+        .select_related("user")
+        .prefetch_related("scopes__content_type", "scopes__scope")
+        .order_by("-created")
+    )
     serializer_class = serializers.EventConsumerSerializer
     permission_classes = [permissions.IsAuthenticated]
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.EventConsumerFilter
 
     def get_queryset(self):
         # Consumers owned by a site agent are excluded platform-wide: they are
@@ -1302,6 +1342,12 @@ class EventConsumerViewSet(
 
         effective_object_types = consumer.object_types or all_object_types
 
+        # Resolved once, recorded on each successful exit below: the attribution
+        # must describe a registration that actually completed, or a 400 from
+        # provisioning would leave the row claiming a credential the queue never
+        # got (and an audit event for a registration that never happened).
+        authorized_via = _resolve_consumer_authorization(request, resolved_scopes)
+
         rmq_backend = backend.RabbitMQManagementBackend()
 
         # Fast path: already provisioned and valid — refresh the password.
@@ -1323,6 +1369,11 @@ class EventConsumerViewSet(
                     utils.resolve_consumer_rmq_password(request),
                 )
             ):
+                # The RMQ password now matches the presented credential, so the
+                # attribution can be recorded: a re-registration on a different
+                # credential must refresh it even when the queue itself is
+                # untouched.
+                utils.record_consumer_attribution(consumer, request, authorized_via)
                 data = {
                     "rmq_username": consumer.rmq_username,
                     "queue_name": consumer.queue_name,
@@ -1341,6 +1392,7 @@ class EventConsumerViewSet(
         result = utils.provision_consumer_queue(
             consumer, utils.resolve_consumer_rmq_password(request)
         )
+        utils.record_consumer_attribution(consumer, request, authorized_via)
         result["observable_object_types"] = effective_object_types
         out = serializers.EventConsumerRegistrationResponseSerializer(data=result)
         out.is_valid(raise_exception=True)

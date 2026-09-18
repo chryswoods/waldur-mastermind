@@ -152,12 +152,14 @@ def resolve(offering: models.Offering) -> models.PosixIdPool | None:
 def principal_filter(consumer) -> dict:
     """Lookup keys identifying the principal that owns ``consumer``'s identity.
 
-    An offering user's identity belongs to the Waldur **user**, so every offering
-    account of that user which resolves to the same pool shares one UID and one
-    primary GID. Robot accounts and groups have no user behind them, so they stay
-    keyed on the consumer row itself.
+    A user account's identity belongs to the Waldur **user**, so every account of
+    that user which resolves to the same pool shares one UID and one primary GID.
+    That covers both scopes: an OfferingUser and the ServiceProviderAccount backing
+    it are the same principal and must not be handed different numbers. Robot
+    accounts and groups have no user behind them, so they stay keyed on the
+    consumer row itself.
     """
-    if isinstance(consumer, models.OfferingUser):
+    if isinstance(consumer, models.BaseAccount):
         return {"user_id": consumer.user_id}
     ct = ContentType.objects.get_for_model(consumer.__class__)
     return {"content_type": ct, "object_id": consumer.pk}
@@ -184,12 +186,13 @@ def _get_or_create_active_identity(consumer, pool, offering):
     return identity
 
 
-def _next_value(pool: models.PosixIdPool, namespace: str) -> int | None:
-    """Lowest value to hand out for ``namespace`` in a locked pool, or ``None``.
+def _candidate_value(pool: models.PosixIdPool, namespace: str) -> tuple:
+    """``(value, from_counter)`` for the next ``namespace`` value, taking nothing.
 
     Released values in bounds are recycled first (auto-recycle policy), lowest
     first; otherwise the high-water mark ``next_*`` is used, skipping any value
-    held by an in-range manual override. ``None`` means the pool is exhausted.
+    held by an in-range manual override. ``value`` is ``None`` when the pool is
+    exhausted; ``from_counter`` says whether taking it advances the mark.
 
     A released row flagged ``recyclable=False`` is skipped: the retrofit and the
     re-point action free values that are still stamped on files on the provider's
@@ -218,7 +221,7 @@ def _next_value(pool: models.PosixIdPool, namespace: str) -> int | None:
         .first()
     )
     if recycled is not None:
-        return recycled
+        return recycled, False
 
     # 2) High-water mark, skipping any value already held by an in-range override
     #    (an override does not advance the counter, so it leaves a hole below it).
@@ -234,10 +237,32 @@ def _next_value(pool: models.PosixIdPool, namespace: str) -> int | None:
     while value in taken:
         value += 1
     if value > max_v:
-        return None
-    setattr(pool, f"next_{namespace}", value + 1)
-    pool.save(update_fields=[f"next_{namespace}"])
+        return None, False
+    return value, True
+
+
+def _next_value(pool: models.PosixIdPool, namespace: str) -> int | None:
+    """Lowest value to hand out for ``namespace`` in a locked pool, or ``None``.
+
+    See :func:`_candidate_value`; a value from the high-water mark advances it.
+    """
+    value, from_counter = _candidate_value(pool, namespace)
+    if from_counter:
+        setattr(pool, f"next_{namespace}", value + 1)
+        pool.save(update_fields=[f"next_{namespace}"])
     return value
+
+
+def peek_next_value(pool: models.PosixIdPool | None, namespace: str) -> int | None:
+    """The value the pool would hand out next for ``namespace``, taking nothing.
+
+    For previews only: nothing is locked, so a concurrent allocation may take
+    the value first. ``None`` when there is no pool, it does not manage the
+    namespace, or it is exhausted.
+    """
+    if pool is None or not pool.manages(namespace):
+        return None
+    return _candidate_value(pool, namespace)[0]
 
 
 def allocate(offering: models.Offering, namespace: str, consumer) -> int | None:
@@ -254,7 +279,7 @@ def allocate(offering: models.Offering, namespace: str, consumer) -> int | None:
     the value already allocated for the first one.
     """
     if isinstance(
-        consumer, models.OfferingUser
+        consumer, models.BaseAccount
     ) and namespace not in pool_sourced_namespaces(offering):
         # The offering takes this identifier from the user rather than from the
         # allocator (or manages no POSIX account at all). Allocating here would
@@ -391,6 +416,20 @@ def _pool_ids_still_in_use_by(user_id: int) -> set:
         pool_id = resolved[offering_id]
         if pool_id is not None:
             pool_ids.add(pool_id)
+
+    # A provider account outlives the offering accounts that read through it: it
+    # is only deleted once the user has lost access to every offering of that
+    # provider. Until then it still holds the reservation, so its pool must not
+    # be treated as free just because the last OfferingUser row went away.
+    provider_accounts = models.ServiceProviderAccount.objects.filter(
+        user_id=user_id
+    ).select_related("service_provider")
+    for account in provider_accounts:
+        pool = models.PosixIdPool.objects.filter(
+            service_provider=account.service_provider
+        ).first()
+        if pool is not None:
+            pool_ids.add(pool.pk)
     return pool_ids
 
 
@@ -417,8 +456,8 @@ def release_posix_allocations(consumer) -> int:
             consumer.__class__.__name__,
             consumer.pk,
         )
-    if isinstance(consumer, models.OfferingUser):
-        # The consumer-scoped pass above is not dead code for offering users:
+    if isinstance(consumer, models.BaseAccount):
+        # The consumer-scoped pass above is not dead code for user accounts:
         # deployments retrofitted by the migration keep the duplicate rows of a
         # (pool, user) group consumer-scoped until the collapse command is run,
         # and those rows belong to one account each.

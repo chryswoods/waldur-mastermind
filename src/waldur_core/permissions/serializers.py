@@ -13,6 +13,7 @@ from waldur_core.core.serializers import (
     TranslatedModelSerializerMixin,
 )
 from waldur_core.core.utils import is_uuid_like
+from waldur_core.permissions import hygiene
 from waldur_core.permissions.enums import TYPE_KEYS, TYPE_MAP, PermissionEnum
 from waldur_core.permissions.utils import (
     build_org_role_name,
@@ -294,6 +295,12 @@ def clone_role_for_customer(
         raise ValidationError(
             "Only customer and project roles can be cloned into an organization."
         )
+    # Access checks resolve clones one level deep (role or role.template), so a
+    # chain would silently escape them — and double up the slug in the name.
+    if template.template_id is not None:
+        raise ValidationError(
+            "A clone cannot be cloned. Clone the original role instead."
+        )
     customer_ct = ContentType.objects.get_for_model(structure_models.Customer)
     already_cloned = models.Role.objects.filter(
         template=template,
@@ -463,6 +470,7 @@ class UserRoleDetailsSerializer(serializers.ModelSerializer):
     user_image = serializers.ImageField(source="user.image", read_only=True)
     created_by_full_name = serializers.ReadOnlyField(source="created_by.full_name")
     created_by_uuid = serializers.UUIDField(read_only=True, source="created_by.uuid")
+    source = serializers.CharField(read_only=True)
 
     class Meta:
         model = models.UserRole
@@ -481,6 +489,7 @@ class UserRoleDetailsSerializer(serializers.ModelSerializer):
             "user_image",
             "created_by_full_name",
             "created_by_uuid",
+            "source",
         )
 
 
@@ -514,6 +523,8 @@ class PermissionSerializer(serializers.ModelSerializer):
     resource_uuid = serializers.SerializerMethodField()
     project_uuid = serializers.SerializerMethodField()
     scope_is_removed = serializers.SerializerMethodField()
+    # Provenance of a machine-issued grant; never settable over the API.
+    source = serializers.CharField(read_only=True)
 
     class Meta:
         model = models.UserRole
@@ -532,6 +543,7 @@ class PermissionSerializer(serializers.ModelSerializer):
             "revoked_by_full_name",
             "revoked_by_username",
             "revoke_reason",
+            "source",
             "role_name",
             "role_description",
             "role_uuid",
@@ -765,3 +777,29 @@ class UserRolePermissionActionSerializer(serializers.Serializer):
     """Input for revoke/restore actions on a specific user role grant."""
 
     reason = serializers.CharField(required=False, allow_blank=True, max_length=255)
+
+
+class RoleHygieneFindingSerializer(serializers.Serializer):
+    """One problem found with one role. See waldur_core.permissions.hygiene."""
+
+    check = serializers.CharField()
+    severity = serializers.ChoiceField(choices=hygiene.SEVERITY_ORDER)
+    role_uuid = serializers.CharField()
+    role_name = serializers.CharField()
+    role_description = serializers.CharField(allow_blank=True)
+    # A ChoiceField rather than a CharField: _scope_type only ever returns a
+    # TYPE_MAP key or None, so the generated SDK gets a union instead of a bare
+    # string, and the frontend can switch on it without casting.
+    scope_type = serializers.ChoiceField(choices=list(TYPE_MAP), allow_null=True)
+    is_system_role = serializers.BooleanField()
+    message = serializers.CharField()
+    details = serializers.DictField()
+
+
+class RoleHygieneReportSerializer(serializers.Serializer):
+    roles_checked = serializers.IntegerField()
+    roles_with_findings = serializers.IntegerField()
+    error_count = serializers.IntegerField()
+    warning_count = serializers.IntegerField()
+    info_count = serializers.IntegerField()
+    findings = RoleHygieneFindingSerializer(many=True)

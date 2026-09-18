@@ -11,6 +11,7 @@ class MarketplaceConfig(AppConfig):
     def ready(self):
         from waldur_core.core import models as core_models
         from waldur_core.core import signals as core_signals
+        from waldur_core.logging import availability as event_availability
         from waldur_core.permissions import signals as permission_signals
         from waldur_core.quotas import signals as quota_signals
         from waldur_core.structure import models as structure_models
@@ -33,6 +34,16 @@ class MarketplaceConfig(AppConfig):
             sender=models.Resource,
             dispatch_uid="waldur_mastermind.marketplace.process_billing_on_resource_save",
         )
+
+        # The advertised event-group catalogue is derived from the offering
+        # types a deployment holds, so the first offering of a plugin has to
+        # make that plugin's groups appear without waiting for a restart.
+        for signal in (signals.post_save, signals.post_delete):
+            signal.connect(
+                event_availability.invalidate_cache_on_commit,
+                sender=models.Offering,
+                dispatch_uid="waldur_core.logging.availability.invalidate_cache_on_commit",
+            )
 
         # Pub/sub state-change events: one emitter per model, every transition,
         # any offering type. Consumers (site agents, UI clients) demultiplex on
@@ -400,6 +411,7 @@ class MarketplaceConfig(AppConfig):
 
         for posix_consumer_model in (
             models.OfferingUser,
+            models.ServiceProviderAccount,
             models.RobotAccount,
             models.OfferingUserGroup,
             models.OfferingRoleGroup,
@@ -412,9 +424,9 @@ class MarketplaceConfig(AppConfig):
             )
 
         signals.post_save.connect(
-            handlers.log_offering_user_username_updated,
+            handlers.log_offering_user_fields_updated,
             sender=models.OfferingUser,
-            dispatch_uid="waldur_mastermind.marketplace.log_offering_user_username_updated",
+            dispatch_uid="waldur_mastermind.marketplace.log_offering_user_fields_updated",
         )
 
         signals.post_save.connect(
@@ -433,6 +445,28 @@ class MarketplaceConfig(AppConfig):
             handlers.send_offering_user_created_message,
             sender=models.OfferingUser,
             dispatch_uid="waldur_mastermind.marketplace.send_offering_user_created_message",
+        )
+
+        # Provider-level accounts announce themselves on their own object type,
+        # anchored on the provider's customer. The per-offering OFFERING_USER
+        # events keep firing too, so a consumer that only knows those is
+        # unaffected by this.
+        signals.post_save.connect(
+            handlers.send_provider_account_created_message,
+            sender=models.ServiceProviderAccount,
+            dispatch_uid="waldur_mastermind.marketplace.send_provider_account_created_message",
+        )
+
+        signals.post_save.connect(
+            handlers.send_provider_account_updated_message,
+            sender=models.ServiceProviderAccount,
+            dispatch_uid="waldur_mastermind.marketplace.send_provider_account_updated_message",
+        )
+
+        signals.post_delete.connect(
+            handlers.send_provider_account_deleted_message,
+            sender=models.ServiceProviderAccount,
+            dispatch_uid="waldur_mastermind.marketplace.send_provider_account_deleted_message",
         )
 
         signals.post_save.connect(
@@ -556,6 +590,12 @@ class MarketplaceConfig(AppConfig):
             handlers.update_offering_user_username_after_offering_settings_change,
             sender=models.Offering,
             dispatch_uid="waldur_mastermind.marketplace.update_offering_user_username_after_offering_settings_change",
+        )
+
+        signals.post_save.connect(
+            handlers.update_offering_user_username_after_provider_settings_change,
+            sender=models.ServiceProvider,
+            dispatch_uid="waldur_mastermind.marketplace.update_offering_user_username_after_provider_settings_change",
         )
 
         signals.post_save.connect(

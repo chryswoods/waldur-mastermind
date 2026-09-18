@@ -37,6 +37,7 @@ from waldur_auth_social.utils import pull_remote_eduteams_user
 from waldur_core.checklist import mixins as checklist_mixins
 from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist.models import Answer, ChecklistCompletion, Question
+from waldur_core.checklist.utils import latest_answers_by_question
 from waldur_core.core import mixins as core_mixins
 from waldur_core.core import models as core_models
 from waldur_core.core import permissions as core_permissions
@@ -128,11 +129,21 @@ PROJECT_UUID_PARAMETER = OpenApiParameter(
 @extend_schema_view(
     list=extend_schema(
         summary="List customers",
-        description="Retrieve a list of customers. The list is filtered based on the user's permissions.",
+        description=(
+            "Retrieve a list of customers. The list is filtered based on the user's permissions. "
+            "A user whose only link to an organization is a role on its service provider sees it "
+            "with a restricted field set: url, uuid, name, native_name, display_name, abbreviation, "
+            "slug, image, country, country_name, is_service_provider, service_provider and "
+            "service_provider_uuid. All other fields are omitted for that row."
+        ),
     ),
     retrieve=extend_schema(
         summary="Retrieve customer details",
-        description="Fetch the details of a specific customer by its UUID.",
+        description=(
+            "Fetch the details of a specific customer by its UUID. "
+            "A user whose only link to the organization is a role on its service provider "
+            "receives the restricted field set described on the list operation."
+        ),
     ),
     create=extend_schema(
         summary="Create a new customer",
@@ -174,8 +185,8 @@ class CustomerViewSet(
     serializer_class = serializers.CustomerSerializer
     lookup_field = "uuid"
     filter_backends = (
-        filters.GenericUserFilter,
-        filters.GenericRoleFilter,
+        filters.CustomerUserFilter,
+        filters.CustomerRoleFilter,
         DjangoFilterBackend,
         rf_filters.OrderingFilter,
         filters.AccountingStartDateFilter,
@@ -223,6 +234,21 @@ class CustomerViewSet(
             queryset = queryset.prefetch_related(prefetch_projects)
 
         return queryset
+
+    def get_object(self):
+        customer = super().get_object()
+        # A service provider manager may read the provider's organization, but
+        # every other action on it stays out of reach, exactly as before it
+        # became visible to them.
+        if (
+            self.action != "retrieve"
+            and customer.id
+            in managers.get_service_provider_manager_only_customer_ids(
+                self.request.user, [customer.id]
+            )
+        ):
+            raise Http404
+        return customer
 
     def _get_project_prefetch(self, user):
         """Returns a Prefetch object restricted by user permissions"""
@@ -1492,6 +1518,36 @@ class ProjectOtherUsersViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
         return core_models.User.objects.filter(id__in=get_project_users(projects))
 
 
+# What a feed item carries beyond the eight keys every provider has always
+# returned. Declared once here rather than per provider: only queue-backed
+# items set them, and the serializer needs the keys present either way.
+DASHBOARD_ITEM_DEFAULTS = {
+    "uuid": None,
+    "urgency": None,
+    "route_name": None,
+    "route_params": {},
+    "can_silence": False,
+    "actions": [],
+}
+
+
+def _dashboard_feed_sort_key(item):
+    """Order the feed by severity, then by how soon it is due.
+
+    The queue sorted on due_date and the feed had no tiebreak at all, so
+    merging them without one would interleave dated and undated rows of equal
+    severity in provider-registration order. Undated rows sort last within
+    their severity; the second element keeps datetimes and None out of the same
+    comparison.
+    """
+    deadline = item.get("deadline")
+    return (
+        DASHBOARD_VARIANT_ORDER.get(item.get("variant"), 99),
+        0 if deadline else 1,
+        deadline,
+    )
+
+
 class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
     queryset = core_models.User.all_objects.select_related(
         "auth_token", "changeemailrequest"
@@ -1736,7 +1792,11 @@ class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
         description=(
             "Returns a typed feed of actions the current user should take, "
             "aggregating pending orders, failed resources, overdue invoices, "
-            "missing Terms of Service consents, and incomplete profile state."
+            "missing Terms of Service consents, and incomplete profile state. "
+            "Where USER_ACTIONS_ENABLED is set, the persistent UserAction "
+            "queue is folded in as well; those items carry a uuid addressing "
+            "the user-actions endpoints, along with any corrective actions "
+            "and the route recorded for them."
         ),
         responses={200: serializers.DashboardPendingActionSerializer(many=True)},
     )
@@ -1764,12 +1824,19 @@ class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
             # one that emits a row per object (ToS consent, one per offering)
             # would otherwise build and sort an unbounded list to render ten.
             feed.extend(items[:DASHBOARD_LIST_LIMIT])
+        # Providers that predate the UserAction bridge return only the original
+        # eight keys. Filling the rest here keeps them untouched: without it
+        # every live provider would have to learn about corrective actions it
+        # never offers. Merged into new dicts rather than set on the originals,
+        # which belong to the provider and may well be reused across calls.
+        feed = [{**DASHBOARD_ITEM_DEFAULTS, **item} for item in feed]
         # Severity decides what survives the cap, rather than provider
         # registration order — that order is an accident of
         # apps.get_app_configs(), so without this an "error" row silently falls
-        # off the end as soon as an extension is reordered. sorted() is stable,
-        # so items of equal severity keep their provider's order.
-        feed.sort(key=lambda item: DASHBOARD_VARIANT_ORDER.get(item["variant"], 99))
+        # off the end as soon as an extension is reordered. Within one severity
+        # the sort falls through to the deadline, so provider order only decides
+        # between items that match on both.
+        feed.sort(key=_dashboard_feed_sort_key)
         serializer = serializers.DashboardPendingActionSerializer(
             feed[:DASHBOARD_LIST_LIMIT], many=True
         )
@@ -3341,7 +3408,9 @@ class CustomerProjectMetadataComplianceDetailsViewSet(
                 answers = []
                 answered_question_ids = set()
 
-                for answer in completion.answers.all():
+                # Answers are per-user rows; list each question once, by its latest.
+                latest_answers = latest_answers_by_question(completion.answers.all())
+                for answer in latest_answers.values():
                     question_id = answer.question_id
                     answered_question_ids.add(question_id)
 
@@ -3655,13 +3724,18 @@ class CustomerProjectMetadataQuestionAnswersViewSet(
 
         # Bulk query for all answers for questions on this page
         question_ids = [q.id for q in questions]
-        answers = Answer.objects.filter(
-            question_id__in=question_ids,
-            completion__scope_content_type=project_ct,
-            completion__scope_object_id__in=project_ids,
-        ).select_related("user", "completion")
+        answers = (
+            Answer.objects.filter(
+                question_id__in=question_ids,
+                completion__scope_content_type=project_ct,
+                completion__scope_object_id__in=project_ids,
+            )
+            .select_related("user", "completion")
+            .order_by("modified", "id")
+        )
 
-        # Group answers by question_id
+        # Group answers by question_id. Answers are per-user rows; later rows
+        # overwrite earlier ones, so each project keeps its latest answer.
         answers_by_question = {}
         for answer in answers:
             question_id = answer.question_id
