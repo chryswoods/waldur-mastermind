@@ -385,6 +385,34 @@ schema, and each is worth knowing if you extend the script.
   code under test". `scripts/repair_sanitised_email_domain.sql` fixes a copy
   made before this, rewriting text columns, JSON values, JSON object keys and
   text arrays.
+- **A credential whose absence looks like a bug.** Impersonating a user on the
+  copy fails with
+
+  ```text
+  403: Unable to impersonate user that does not have an active session.
+  ```
+
+  The message misdirects: `core/authentication.py` `set_user_context()` tests
+  `Token.objects.filter(user=user).exists()` -- a DRF authtoken row, not a
+  session. Waldur mints one per user at creation, so every user on a real
+  deployment has one; the sanitiser wipes `authtoken_token` and
+  `core_personalaccesstoken`, and the verifier fails the run unless both are
+  empty. That is right and should stay: a token is a live credential, and a
+  dump carrying production's tokens would let anyone hold it authenticate as
+  those users.
+
+  The repair belongs after the restore, not in the dump.
+  `scripts/restore_impersonation_tokens.py` mints fresh random tokens locally
+  -- values that never existed in production:
+
+  ```bash
+  docker compose exec -T -e TOKENS_APPLY=1 waldur-mastermind-api waldur shell \
+      -c "$(cat scripts/restore_impersonation_tokens.py)"
+  ```
+
+  The general shape, again: anything the sanitiser removes *because* it is a
+  credential will be missed by some feature that assumes it exists, and the
+  error will name something other than the credential.
 - **Columns that mix secrets with configuration.**
   `structure_servicesettings.options` holds credentials *and* the settings a
   backend needs to work -- OpenPortal reads `instance_name`,
