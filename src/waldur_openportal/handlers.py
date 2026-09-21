@@ -218,8 +218,12 @@ def update_user(sender, instance, force_add=False, **kwargs):
 
     user = instance
 
-    if force_add or set(user.tracker.changed()) & {"unix_username"}:
-        # Either the user's unix_username has changed, or the user has
+    # slug, not unix_username: that field is gone, so this condition could
+    # never fire and the handler only ever ran through force_add.
+    # UserInfo.set_shortname() copies the shortname to User.slug, so slug is
+    # what changes when a user's local username is set.
+    if force_add or set(user.tracker.changed()) & {"slug"}:
+        # Either the user's local username has changed, or the user has
         # just been added to the project - we need to update the user
         # (updating is the same as adding in OpenPortal)
         logger.debug(f"OpenPortal - updating user {user}")

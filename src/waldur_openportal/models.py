@@ -974,40 +974,23 @@ class UserInfo(models.Model):
 
     def sanitise(self):
         """
-        Double check that our shortname matches the user unix_username
-        if this field exists
+        Nothing to reconcile: the shortname is this model's own field, and
+        set_shortname() copies it to User.slug as it writes.
+
+        It used to mirror core.User.unix_username, which no longer exists -
+        UserInfo.shortname IS that field now, and User.slug the copy of it.
+        Kept as a no-op because two backends, the API and both viewsets call
+        it, and ProjectInfo.sanitise() still does real work.
         """
-        if hasattr(self.user, "unix_username"):
-            if (
-                self.shortname != self.user.unix_username
-                and self.user.unix_username is not None
-            ):
-                self.set_shortname(self.user.unix_username)
-                self.save()
 
     def set_shortname(self, shortname: str):
         """
-        Set the shortname, checking whether or not this has not already
-        been set, and making sure it lines up with the unix_username if
-        that field is present in the user
+        Set the shortname, refusing to change one that is already set:
+        external systems form local usernames from it and cannot follow a
+        rename. Copies it to User.slug as it goes.
         """
         if not shortname:
             raise ValueError("Shortname cannot be empty.")
-
-        if hasattr(self.user, "unix_username"):
-            if (
-                shortname != self.user.unix_username
-                and self.user.unix_username is not None
-            ):
-                # Set flag to prevent circular updates when saving unix_username
-                self.user._syncing_to_userinfo = True
-                try:
-                    self.user.unix_username = self.shortname
-                    self.user.save(update_fields=["unix_username"])
-                finally:
-                    self.user._syncing_to_userinfo = False
-
-            self.shortname = self.user.unix_username
 
         # make sure to copy the shortname to the slug
         # Set flag to prevent circular updates
