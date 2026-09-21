@@ -621,14 +621,26 @@ portal is not this one. Around 400 rows needed rewriting on the sanitised copy,
 which is the same number production carries. Dry run first; it refuses a
 rewrite that would collide with another `ManagedProject`.
 
-**The migration nobody has timed.**
-`marketplace/0270_scrub_secret_options_from_reversion` walks the version
-history, and the sanitiser empties `reversion_version` -- so every rehearsal
-has run it against an empty table. Production's is full. The 5m58s figure in
-§6.6 therefore excludes it, and the deployment window should not be planned as
-though it were included. Worth measuring `reversion_version` before the window
-(the pre-flight's `largest_table` output sizes it) and, if it is large, timing
-that migration alone against an unsanitised restore.
+**`marketplace/0270` -- measured, negligible.** It scrubs plaintext
+`secret_options` from Offering versions in the reversion history, and the
+sanitiser empties `reversion_version`, so every rehearsal ran it against an
+empty table and the 5m58s figure in §6.6 excluded it. Measured on production:
+
+| | |
+|---|---|
+| `reversion_version` rows | 110 (232 kB) |
+| Offering versions | 12 |
+| rows `0270` rewrites | 12 |
+
+One batch, one `bulk_update`, effectively instant. The 5m58s figure stands.
+Note the other side of that 12: production's reversion history currently holds
+twelve Offering versions with **cleartext** `secret_options`, which is what
+the migration exists to remove.
+
+Measure it on PRODUCTION, not on a sanitised copy -- the sanitiser wipes
+`reversion_version` and `reversion_revision`, so a copy answers 0 by
+construction, and any rows it does show were generated locally since the
+restore.
 
 **The OpenPortal service upgrade -- done.** Production already runs the latest
 OpenPortal, and it serves older clients, so moving the library pin to
@@ -657,6 +669,33 @@ backfills did run. The script proves that rather than assuming it.
 merge, the local-portal fix and the `RemoteOpenPortalClient` removal. The rest
 of the suite has not been run against this branch end to end, and should be
 before the window.
+
+**The three backfills `0281` cannot recover -- checked, nothing at risk.**
+`0281` WILL re-run on this deployment: `check_0281_classification.py` reports
+all four conditions true for `marketplace.0226_squashed_0263`,
+`marketplace.0264_squashed_0279` and `core.0033_squashed_0045`. That is
+correct, not a misclassification -- those are upstream migrations this fork
+never carried, so Django applies each squash as a replacement and the
+backfills genuinely never ran. Condition 4 separates it from a fresh install
+because the oldest `django_migrations` row is production's own (2024-05-23)
+while the blocks are written by the deployment's `migrate`.
+
+Three of its steps can only report, because the same squash dropped their
+inputs. Checked on production before migrating, while the columns still
+exist:
+
+| Step | Source | Rows at risk |
+|---|---|---|
+| `0245_plancomponent_discount_formula` | `plancomponent.discount_threshold` / `.discount_rate` | **0** |
+| `0271_missing_usage_policy` | `componentusage.recurring` | **0** |
+| `0259_access_subnet_offering_scopes` | `marketplace_resourceaccesssubnet` | n/a -- the table never existed here |
+
+The third needs no query: `0226_squashed_0263` both creates and deletes
+`ResourceAccessSubnet` (added by `0251`, collapsed by `0259`), and production
+never applied `0251`. The other two pre-date the squashed range -- the
+squashes carry only `RemoveField` for them, no `AddField` -- so production does
+have the columns, and both are empty. Nothing to capture; `0281` re-running is
+pure upside.
 
 **Not resync-related, but open.** One project shows an invoice month charged
 with no credit compensation recorded (2026-06, mid-life for a Feb-Nov project),
