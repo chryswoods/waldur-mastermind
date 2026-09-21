@@ -1,5 +1,6 @@
 import logging
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Q
 from django.http import Http404
 from django.utils import timezone
@@ -326,18 +327,20 @@ class UserInfoViewSet(core_views.ActionsViewSet):
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    set_shortname_serializer_class = serializers.SetUserShortnameSerializer
+
     @extend_schema(
+        request=serializers.SetUserShortnameSerializer,
         responses={status.HTTP_200_OK: serializers.UserInfoSerializer},
         description="Set shortname for user",
     )
-    @action(detail=True, methods=["PUT"])
+    # The viewset is staff-write (IsAdminOrReadOnly), but a shortname is the
+    # user's own local username to choose, once. Authentication is enough
+    # here; the owner-or-staff check below is what authorises the write.
+    @action(
+        detail=True, methods=["PUT"], permission_classes=[permissions.IsAuthenticated]
+    )
     def set_shortname(self, request, user=None):
-        try:
-            shortname = str(request.data["shortname"])
-        except Exception as e:
-            logger.error(f"You must provide the 'shortname' field: {e}")
-            return Response(status=status.HTTP_400_BAD_REQUEST)
-
         try:
             userinfo = self._get(user)
         except Exception as e:
@@ -352,12 +355,21 @@ class UserInfoViewSet(core_views.ActionsViewSet):
             )
             return Response(status=status.HTTP_403_FORBIDDEN)
 
+        serializer = serializers.SetUserShortnameSerializer(
+            instance=userinfo, data=request.data, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+
         try:
-            userinfo.set_shortname(shortname)
-            userinfo.save()
-        except Exception as e:
+            userinfo.set_shortname(serializer.validated_data["shortname"])
+        except DjangoValidationError as e:
             logger.error(f"Error setting shortname for user {user}: {e}")
-            return Response(status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"shortname": e.messages}, status=status.HTTP_400_BAD_REQUEST
+            )
+        except ValueError as e:
+            logger.error(f"Error setting shortname for user {user}: {e}")
+            return Response({"shortname": [str(e)]}, status=status.HTTP_400_BAD_REQUEST)
 
         serializer = serializers.UserInfoSerializer(
             instance=userinfo, context={"request": request}

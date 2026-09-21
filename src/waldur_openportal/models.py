@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 
 import openportal
 from django.conf import settings
@@ -953,11 +954,21 @@ class UserInfo(models.Model):
         validators=[
             validators.RegexValidator(
                 regex=r"^[a-z][a-z0-9]+$",
-                message="Must start with a letter and only contain numbers and letters.",
+                message=_(
+                    "Must start with a letter and only contain numbers and letters."
+                ),
             ),
+            # RegexValidator searches rather than matches, so this rejects
+            # "admin" and "root" anywhere in the shortname, not only at the
+            # end: the shortname becomes a local account name, and a
+            # privileged-looking one is worth refusing wherever it appears.
+            # IGNORECASE is belt and braces - the rule above already limits
+            # the shortname to lower case.
             validators.RegexValidator(
-                regex=r"(admin)|(root)$",
+                regex=r"admin|root",
+                flags=re.IGNORECASE,
                 inverse_match=True,
+                message=_("Cannot contain 'admin' or 'root'."),
             ),
             validators.MinLengthValidator(4),
             validators.MaxLengthValidator(MAX_USER_SHORTNAME_LENGTH),
@@ -988,18 +999,19 @@ class UserInfo(models.Model):
         Set the shortname, refusing to change one that is already set:
         external systems form local usernames from it and cannot follow a
         rename. Copies it to User.slug as it goes.
+
+        This is the only writer of the field, so it is where the rules
+        declared on it are enforced - full_clean() runs the validators
+        (save() does not) and the uniqueness check. Everything is checked
+        before anything is written, and the write of the shortname and the
+        write of its copy on User.slug share a transaction: a rejected
+        shortname must not leave a slug behind, or the copy everyone reads
+        drifts away from the value it copies.
         """
         if not shortname:
             raise ValueError("Shortname cannot be empty.")
 
-        # make sure to copy the shortname to the slug
-        # Set flag to prevent circular updates
-        self.user._syncing_to_userinfo = True
-        try:
-            self.user.slug = shortname
-            self.user.save(update_fields=["slug"])
-        finally:
-            self.user._syncing_to_userinfo = False
+        shortname = shortname.strip()
 
         if self.shortname and self.shortname != shortname:
             logger.error(
@@ -1010,6 +1022,19 @@ class UserInfo(models.Model):
             )
 
         self.shortname = shortname
+        self.full_clean()
+
+        with transaction.atomic():
+            self.save()
+
+            # make sure to copy the shortname to the slug
+            # Set flag to prevent circular updates
+            self.user._syncing_to_userinfo = True
+            try:
+                self.user.slug = shortname
+                self.user.save(update_fields=["slug"])
+            finally:
+                self.user._syncing_to_userinfo = False
 
     def save(self, *args, **kwargs):
         if "update_fields" in kwargs and "query_field" not in kwargs["update_fields"]:
