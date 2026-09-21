@@ -342,8 +342,10 @@ Detailed guides are in `docs/guides/`:
 ## Quick Commands
 
 ```bash
-# Run tests
-DJANGO_SETTINGS_MODULE=waldur_core.server.test_settings_local uv run pytest
+# Run tests (--no-migrations matches CI: the schema is built from the models,
+# and some tests -- e.g. GenerateSlugTest, test_no_missing_migrations -- only
+# pass in that mode)
+DJANGO_SETTINGS_MODULE=waldur_core.server.test_settings_local uv run pytest --no-migrations
 
 # Lint/format
 uvx prek run --all-files

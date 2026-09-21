@@ -713,9 +713,42 @@ host. `waldur_core/server/my_test_settings.py` overrides that to a local
 PostgreSQL instance, keeping the command in `CLAUDE.md` working:
 
 ```bash
-DJANGO_SETTINGS_MODULE=waldur_core.server.my_test_settings uv run pytest
+DJANGO_SETTINGS_MODULE=waldur_core.server.my_test_settings uv run pytest --no-migrations
 uv run pre-commit run --all-files
 ```
+
+**`--no-migrations` is not optional.** CI runs the suite through
+`tests/waldur-test`, whose base command carries `--no-migrations -m 'not slow'`:
+the schema is built from the models rather than by replaying the migration
+graph. Several tests are written against that (they say so in comments), and
+two groups fail outright without it:
+
+- `GenerateSlugTest` (10 tests) uses `TestSlugModel`, a test-only model with
+  `app_label = "core"` and no migration, so with migrations enabled its table
+  is never created (`relation "core_testslugmodel" does not exist`).
+- `test_no_missing_migrations` calls `makemigrations --check` in-process. That
+  same test-only model is registered by the time it runs, so the autodetector
+  reports a model change with no migration -- while the identical command on
+  the command line, where the test module is never imported, says
+  "No changes detected". `--no-migrations` empties `MIGRATION_MODULES`, which
+  puts every app in the autodetector's *unmigrated* set and skips the check.
+
+A full run in this resync (19,232 passed) produced 21 failures, 20 of which
+were this flag being missing. The 21st was real: `ManagedProjectAttachment`,
+added by the `feature_snags` merge, had `ordering = ["-attached_at"]` with no
+unique tie-breaker, which `PaginationOrderingTest::test_ordering_is_a_total_order`
+rejects. Fixed to `["-attached_at", "-id"]` in
+`waldur_openportal/0041_alter_managedprojectattachment_options`.
+
+One more test behaves differently under the two modes:
+`test_no_reuse_of_deleted_migration_names` walks git history for deleted
+migration files and compares them against the live graph. Under
+`--no-migrations` the graph is empty so it passes vacuously; with migrations it
+flags `openstack.0036_merge_volume_type` (moved between directories inside the
+same Django app) and `logging.0028_split_openstack_resource_event_groups`
+(deleted and restored by this resync's rewind commits). Both are the same
+migration under the same identity, not a reused name, and are now listed in the
+test's `known_reused` set with that reasoning.
 
 Note that `uv sync` needs LDAP headers (`libldap2-dev`, `libsasl2-dev`) to
 build `python-ldap`.

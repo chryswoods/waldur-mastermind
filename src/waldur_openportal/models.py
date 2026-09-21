@@ -2657,7 +2657,10 @@ class ManagedProjectAttachment(models.Model):
     )
 
     class Meta:
-        ordering = ["-attached_at"]
+        # -id breaks ties: attachments recorded in the same instant (or
+        # backdated to the same reconstructed timestamp) would otherwise float
+        # between pages. See PaginationOrderingTest.
+        ordering = ["-attached_at", "-id"]
         verbose_name = _("Managed Project Attachment")
         verbose_name_plural = _("Managed Project Attachments")
 

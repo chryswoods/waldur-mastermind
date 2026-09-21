@@ -113,6 +113,15 @@ class DeletedMigrationReuseTest(TestCase):
         known_reused = {
             # Placeholder matching the old waldur_keycloak app's 0001_initial
             "waldur_keycloak.0001_initial",
+            # Moved between directories inside the same Django app
+            # (src/waldur_openstack/openstack/migrations -> src/waldur_openstack/
+            # migrations, both app_label "openstack"), so the identity never
+            # changed and no database saw two different migrations under it.
+            "openstack.0036_merge_volume_type",
+            # Deleted and restored by the upstream-resync rewind commits, which
+            # rolled the tree back to a tag and then put the untouched files
+            # back. Same file, same identity.
+            "logging.0028_split_openstack_resource_event_groups",
         }
         unexpected = sorted(set(reused) - known_reused)
 
