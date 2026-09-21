@@ -630,11 +630,28 @@ though it were included. Worth measuring `reversion_version` before the window
 (the pre-flight's `largest_table` output sizes it) and, if it is large, timing
 that migration alone against an unsanitised restore.
 
-**The OpenPortal service upgrade.** `pyproject.toml` now pins
-`openportal>=0.93.0`, against `>=0.32.2` before the resync. The deployed
-OpenPortal *service* has to move in step; this is sequencing step 1 and the
-main scheduling risk in the whole resync, not something to discover during the
-window.
+**The OpenPortal service upgrade -- done.** Production already runs the latest
+OpenPortal, and it serves older clients, so moving the library pin to
+`>=0.93.0` brings Waldur up to what is deployed rather than requiring a
+coordinated change. This was sequencing step 1 and the main scheduling risk;
+it is closed.
+
+**How marketplace/0281 will classify this database.** `0281` re-runs the data
+migrations a replacement squash skipped, and infers which databases need that
+from `django_migrations` -- rows this deployment edits by hand. Run
+`scripts/check_0281_classification.py` against a restore of production *before*
+the window: it reports, per squash, which of the four conditions
+`applied_as_replacement()` tests actually hold, and therefore whether the
+backfills re-run against live data.
+
+The reconciliation should not perturb it: `resync_reconcile_db.sql` only ever
+DELETEs from `django_migrations`, never INSERTs, and the rows it removes
+(`waldur_openportal`, `proposal`, `core.0011_user_unix_username`, `structure`,
+`notifications`) are in none of the blocks `0281` inspects -- deleting an
+unrelated row does not move the ids of the rows in a block. A database that
+applied the originals one by one over months fails the contiguous-ids and
+one-second tests and is left alone, which is the right answer because its
+backfills did run. The script proves that rather than assuming it.
 
 **The test suite.** The OpenPortal app is covered -- 268 tests pass against the
 merge, the local-portal fix and the `RemoteOpenPortalClient` removal. The rest
