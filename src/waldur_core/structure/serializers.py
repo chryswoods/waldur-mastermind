@@ -705,6 +705,9 @@ class ProjectSerializer(
             "science_domain_code",
         )
         read_only_fields = (
+            # As on the user: the project's local name is set once through
+            # waldur_openportal ProjectInfo.set_shortname() and copied here.
+            "slug",
             "end_date_requested_by",
             "end_date_updated_at",
             "is_removed",
@@ -2545,6 +2548,11 @@ class UserSerializer(
         )
         read_only_fields = (
             "uuid",
+            # The local (POSIX) username, set once through
+            # waldur_openportal UserInfo.set_shortname() and copied here.
+            # Writable, it let a user rename the copy while the
+            # authoritative shortname stayed put.
+            "slug",
             "civil_number",
             "registration_method",
             "date_joined",

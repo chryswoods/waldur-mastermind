@@ -12,6 +12,7 @@ from django.conf import settings
 from django.conf import settings as django_settings
 from django.contrib.auth.models import PermissionsMixin, UserManager
 from django.core import validators
+from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.template.defaultfilters import slugify
 from django.utils import timezone as django_timezone
@@ -635,6 +636,39 @@ class User(
             update_fields.add("query_field")
             kwargs["update_fields"] = update_fields
         self.query_field = normalize_unicode(self.full_name)
+
+        # The slug is set once and never changes. It holds the user's local
+        # (POSIX) username: waldur_openportal.UserInfo.set_shortname() writes
+        # it, refusing to change a shortname that is already set because
+        # external systems form account names from it and cannot follow a
+        # rename. The slug is a copy of that, so it has to be just as fixed -
+        # otherwise the authoritative value stays put while the copy everyone
+        # reads drifts away from it.
+        #
+        # set_shortname() announces its own writes by setting
+        # _syncing_to_userinfo, a flag that already existed for this purpose
+        # and was never read. Bulk reconciliation
+        # (waldur_openportal.utils) sets it too.
+        if (
+            self.pk
+            and not getattr(self, "_syncing_to_userinfo", False)
+            and self.tracker.has_changed("slug")
+            and self.tracker.previous("slug")
+        ):
+            raise ValidationError(
+                {
+                    "slug": _(
+                        "Cannot change the local username of %(user)s from "
+                        "'%(old)s' to '%(new)s' once it is set."
+                    )
+                    % {
+                        "user": self.username,
+                        "old": self.tracker.previous("slug"),
+                        "new": self.slug,
+                    }
+                }
+            )
+
         super().save(*args, **kwargs)
 
     def get_log_fields(self):

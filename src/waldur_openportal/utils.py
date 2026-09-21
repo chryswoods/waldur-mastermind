@@ -2233,10 +2233,16 @@ def sync_openportal_shortnames_to_slugs():
                 )
                 continue
 
-            # Update the slug
+            # Update the slug. The flag is what distinguishes a sanctioned
+            # write from a user renaming themselves - core.User.save()
+            # refuses the latter once the slug is set.
             old_slug = user.slug
-            user.slug = shortname
-            user.save(update_fields=["slug"])
+            user._syncing_to_userinfo = True
+            try:
+                user.slug = shortname
+                user.save(update_fields=["slug"])
+            finally:
+                user._syncing_to_userinfo = False
             users_updated += 1
 
             logger.info(
