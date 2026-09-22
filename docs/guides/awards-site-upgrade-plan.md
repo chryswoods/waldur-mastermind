@@ -285,39 +285,58 @@ project dashboard renders an end-of-project feedback survey once a project
 reaches its end date. It is worth being precise about where it lives, because
 it is **not** in either repository's merged history.
 
-It is one file — `src/project/ProjectDashboard.tsx` on the
-`end-project-form` branch of `isambard-sc/waldur-homeport` (`eed730330`,
-29 July 2026, "update to production formbricks link"). Frontend only: there is
-no backend code for it anywhere, in any branch of this repository.
+It lives on the `feature_airrportal` branch of `isambard-sc/waldur-homeport`,
+which is what the awards portal deploys. **That branch's entire delta over
+`devel` is one file** — `src/project/ProjectDashboard.tsx`, +92/-1 — so the
+survey is the only thing missing, and the check is complete: everything else
+`feature_airrportal` carries came in from `devel` and `feature_snags`, both of
+which the resync already has. (`devel` is an ancestor of it, and the two forks'
+`devel` are the same commit, `e3872e52f`.)
 
-What it does: shows an `<iframe>` of a hardcoded Formbricks survey when
-`project.end_date` has passed and the viewer holds
-`CREATE_PROJECT_PERMISSION` on the project or its customer (the PI or an
+Frontend only: there is no backend code for it anywhere, in any branch of this
+repository.
+
+What it does: shows an `<iframe>` of a hardcoded Formbricks survey
+(`forms-airr.isambard.ac.uk`) when `project.end_date` has passed and the viewer
+holds `CREATE_PROJECT_PERMISSION` on the project or its customer (the PI or an
 organisation owner). The survey URL carries the project name and slug, the
 user's name and email, and a call reference assembled from the proposal call's
 `reference_code` and the round's start date.
 
-Three consequences:
+**The tip of `feature_airrportal` is broken.** `proposalProposalsList` and
+`proposalProtectedCallsRetrieve` are called at lines 151 and 161 but imported
+nowhere: the last `feature_snags` merge (`ed573bcd9`, 19 August 2026) rewrote
+the `waldur-js-client` import line and dropped them, keeping the call sites.
+Every earlier commit on the branch has the import. What that costs depends on
+the build: a type-checking build fails outright, while a plain esbuild
+transform emits it and throws at runtime, where React Query swallows the error
+and the survey still renders — with `call_reference` silently degraded to the
+award's call id and no round start date. Worth checking against what is
+actually deployed before assuming the live survey is reporting what it looks
+like it reports.
 
-- **It has to be re-applied by hand** to the resynced HomePort, or it is lost
-  at the next deployment from a mainline branch. It is small — roughly forty
-  lines in one component — but `ProjectDashboard.tsx` moved a long way in the
-  resync, so this is a re-write against the new file, not a cherry-pick.
-- **Check what the awards portal actually deploys.** The survey is not on that
-  fork's `prod` branch, yet it is live; so either the awards site is deployed
-  from `end-project-form` directly, or `prod` is not its branch. Work that is
-  live only on a feature branch is one deployment away from disappearing, and
-  worth resolving regardless of this upgrade.
-- **The survey URL is hardcoded in the component.** Moving it to a setting
-  served to HomePort would let test and production point at different surveys,
-  which they cannot today.
+So, when re-applying:
+
+- **Take the pre-merge version of the logic** (`45e030eec` or earlier), not the
+  tip, or re-add the two imports.
+- **It is a re-write, not a cherry-pick.** `ProjectDashboard.tsx` moved a long
+  way in the resync.
+- **Re-check the proposal API dependency.** `proposalProposalsList`,
+  `proposalProtectedCallsRetrieve` and `round.start_time` all come from the
+  proposal app, which is exactly what this upgrade replaces. Upstream's
+  equivalents will not be the same endpoints.
+- **Move the survey URL out of the component.** It is hardcoded, so test and
+  production cannot point at different surveys.
+- **Mind the CSP if one is ever added.** A `Content-Security-Policy` meta tag
+  was added for the iframe in `4db811926` and removed again in `a8957ce8f`
+  ("remove unnecessary metadata") once the survey moved to its production host,
+  so there is nothing to carry across today — but any CSP introduced later
+  needs `frame-src https://forms-airr.isambard.ac.uk`.
 
 It also wants its own gate rather than sharing the application-forms one:
 `project.show_end_of_project_survey` in `ProjectSection` describes what it is
 and where it renders, and keeps the two Formbricks features independently
-switchable. Its dependency on `proposalCall.reference_code` and the round start
-time is worth re-checking against upstream's proposal API when it is re-applied
-— those fields come from the proposal app, which is exactly what changed.
+switchable.
 
 ### 7.2 Three gates, not one
 
@@ -426,5 +445,5 @@ are easy to skip:
 - **Retention**: is there a point at which archived proposals should be deleted
   outright — and does anything (funding body, institutional policy) require
   them to be kept for a set period?
-- **Which branch the awards portal's HomePort is deployed from** (§7.1): the
-  end-of-project survey is live but is not on that fork's `prod` branch.
+- **Whether the live survey is reporting a real call reference** (§7.1): the
+  tip of `feature_airrportal` calls two proposal endpoints it does not import.
