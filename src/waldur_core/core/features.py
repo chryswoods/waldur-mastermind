@@ -154,6 +154,10 @@ class UserSection(FeatureSection):
         "Show and allow editing of minimal set of user profile fields (e.g. just name and email)."
     )
 
+    show_openportal_identifier = Feature(
+        "Show the OpenPortal username on the user profile, and let a user choose it once if it has not been set."
+    )
+
     allow_user_creation = Feature(
         "Allow users to create new user accounts when adding team members to projects and proposals."
     )
