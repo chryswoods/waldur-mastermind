@@ -273,16 +273,54 @@ today — the branch carries
 `0054_call_formbricks_flow_key_formstepresponse`, the same number as the
 deployed `0054_round_fixed_review_end_date`.
 
-Two corrections to how this is usually described:
+Its configuration lives in the `WALDUR_PROPOSAL` extension settings
+(`FORMBRICKS_BASE_URL`, `FORMBRICKS_MANAGEMENT_API_URL`,
+`FORMBRICKS_WEBHOOK_SECRET`, `FORMBRICKS_API_KEY`), all placeholders at
+present. They move with the app.
 
-- **It is not behind a feature flag.** The gate is per call:
-  `formbricks_flow_key` null means "use the legacy Waldur-native form". That is
-  better for this upgrade than a portal-wide flag, because calls created after
-  the upgrade opt in one at a time.
-- Its configuration lives in the `WALDUR_PROPOSAL` extension settings
-  (`FORMBRICKS_BASE_URL`, `FORMBRICKS_MANAGEMENT_API_URL`,
-  `FORMBRICKS_WEBHOOK_SECRET`, `FORMBRICKS_API_KEY`), all placeholders at
-  present. They move with the app.
+### 7.1 Three gates, not one
+
+As written, formbricks has exactly one switch: `Call.formbricks_flow_key`, null
+meaning "use the legacy Waldur-native form". It is **not** behind a feature
+flag today, though it is often described as if it were.
+
+Per-call is the right granularity for choosing a form, but it is the wrong
+granularity for two other questions, so the port adds two more gates. The
+codebase already has the pattern for an integration — see
+`sram.integration` and `project.show_matrix_chat`, both of which say in their
+own description that backend access is gated separately:
+
+| Gate | Answers | Where |
+|---|---|---|
+| `proposal.application_forms` feature | Does this portal offer Formbricks forms at all? | `core/features.py`, new `ProposalSection` |
+| `FORMBRICKS_ENABLED` setting | May the backend talk to Formbricks and accept its webhooks? | the new app's extension settings |
+| `formbricks_flow_key` | Which survey chain does *this call* use? | per call, as now |
+
+The feature flag is presentational, as core features are: HomePort reads it
+through `isFeatureVisible` to decide whether to offer a Formbricks form when
+configuring a call, and whether to render the survey step in the applicant's
+flow. Its one backend consequence is the same as everywhere else — none.
+
+**The backend gate is the one that matters, and it is not the feature flag.**
+The integration exposes an inbound webhook that accepts survey responses and
+writes them against proposals. That is an ingress point, so it must be off by
+default and gated server-side, on a setting an operator controls, rather than
+on a feature entry that staff can flip from the UI. The precedent is exact:
+`invoices.utils.affiliates_feature_enabled()` reads the Constance setting and
+says in its docstring that the matching core feature "only controls homeport
+element visibility and is not consulted here". Formbricks should read the same
+way: views and tasks check the setting; nothing server-side reads the feature.
+
+With all three in place the rollout is stepwise — deploy dormant, enable the
+backend setting once the Formbricks instance and webhook secret are real, turn
+the feature on to expose it in HomePort, and then opt calls in one at a time.
+Any of the three turns it off again.
+
+Adding the flag means regenerating HomePort's `src/FeaturesEnums.ts` and
+`src/features/FeaturesDescription.ts` with `waldur print_features_enums` and
+`waldur print_features_description`; the descriptions must match HomePort's
+copy exactly or the next regeneration shows a spurious diff. Both generators
+sort alphabetically, so declaration order in `features.py` does not matter.
 
 Sequencing: formbricks lands **after** the upgrade. It has no bearing on the
 archive, and mixing the two means debugging a survey integration and a
@@ -344,6 +382,9 @@ are easy to skip:
 - **Dropping the renamed tables**: after how long, and on whose say-so?
 - **Archived call documents**: upstream serves the live ones publicly. Is
   anything lost by making the archived ones authenticated-only?
+- **The formbricks feature name**: `proposal.application_forms` reads well from
+  HomePort, `proposal.formbricks_forms` names the thing it actually is. The
+  flag is portal-wide either way; the name is the only decision.
 - **Retention**: is there a point at which archived proposals should be deleted
   outright — and does anything (funding body, institutional policy) require
   them to be kept for a set period?
