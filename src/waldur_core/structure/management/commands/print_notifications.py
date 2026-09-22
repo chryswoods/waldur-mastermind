@@ -9,7 +9,6 @@ from waldur_core.structure.notifications import NOTIFICATIONS
 TAB_OF_4 = " " * 4
 
 CUSTOM_LOADER_SETTING = (
-    "admin_tools.template_loaders.Loader",
     "django.template.loaders.filesystem.Loader",
     "django.template.loaders.app_directories.Loader",
 )
@@ -23,9 +22,18 @@ class Command(BaseCommand):
         # reset loaders to use only filesystem based
         file_engine[0].engine.loaders = CUSTOM_LOADER_SETTING
         # reset cached_property
-        del file_engine[0].engine.__dict__["template_loaders"]
+        file_engine[0].engine.__dict__.pop("template_loaders", None)
 
-        output = ["# Notifications\n"]
+        output = [
+            "# Notifications\n",
+            "When a notification is removed from a release, its database row is "
+            "not deleted automatically. Run `waldur load_notifications <file> "
+            "--prune` to report and remove notifications whose key is no longer "
+            "listed below, along with any of their templates that no other "
+            "notification declares and that have no operator-customised "
+            "content. Customised template content is never deleted "
+            "automatically.\n",
+        ]
 
         for key, section in NOTIFICATIONS.items():
             for app in settings.INSTALLED_APPS:

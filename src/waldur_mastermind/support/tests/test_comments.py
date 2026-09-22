@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from constance.test.unittest import override_config
 from ddt import data, ddt
 from django.conf import settings
@@ -55,6 +57,68 @@ class CommentCreateTest(base.BaseTest):
             models.Comment.objects.filter(
                 issue=issue, description=payload["description"]
             )
+        )
+
+    def test_caller_can_comment_on_their_own_project_scoped_issue(self):
+        # A plain project member holds neither of the roles this endpoint
+        # otherwise requires, so raising a ticket from their own project used to
+        # leave them unable to reply on their own thread, while the UI went on
+        # offering them the button.
+        member = self.fixture.member
+        self.client.force_authenticate(member)
+        issue = factories.IssueFactory(
+            caller=member,
+            customer=self.fixture.customer,
+            project=self.fixture.project,
+        )
+        payload = self._get_valid_payload()
+
+        response = self.client.post(self._get_url(issue), data=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            models.Comment.objects.filter(
+                issue=issue, description=payload["description"]
+            ).exists()
+        )
+
+    def test_caller_who_lost_the_project_can_neither_see_nor_comment(self):
+        # Scope governs: raising the ticket does not keep access alive after the
+        # role that gave it is gone.
+        member = self.fixture.member
+        issue = factories.IssueFactory(
+            caller=member,
+            customer=self.fixture.customer,
+            project=self.fixture.project,
+        )
+        self.fixture.project.remove_user(member)
+        self.client.force_authenticate(member)
+
+        response = self.client.post(
+            self._get_url(issue), data=self._get_valid_payload()
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(
+            self.client.get(factories.IssueFactory.get_url(issue)).status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_a_project_member_who_is_not_the_caller_still_cannot_comment(self):
+        # The counterpart: being in the project is not by itself enough.
+        self.client.force_authenticate(self.fixture.member)
+        issue = factories.IssueFactory(
+            customer=self.fixture.customer, project=self.fixture.project
+        )
+        payload = self._get_valid_payload()
+
+        response = self.client.post(self._get_url(issue), data=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(
+            models.Comment.objects.filter(
+                issue=issue, description=payload["description"]
+            ).exists()
         )
 
     @data("admin", "manager", "user")
@@ -180,9 +244,11 @@ class CommentDeleteTest(base.BaseTest):
         response = self.client.delete(self.url)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_user_can_delete_new_comment_if_zammad_is_used(self):
+    @patch("waldur_mastermind.support.backend.zammad.ZammadBackend")
+    def test_user_can_delete_new_comment_if_zammad_is_used(self, mock_zammad_backend):
+        zammad_backend = ZammadServiceBackend()
         self.mock_get_active_backend().comment_destroy_is_available = (
-            lambda x: ZammadServiceBackend.comment_destroy_is_available(None, x)
+            zammad_backend.comment_destroy_is_available
         )
         self.client.force_authenticate(self.fixture.staff)
 
@@ -197,9 +263,13 @@ class CommentDeleteTest(base.BaseTest):
                 response.status_code, status.HTTP_204_NO_CONTENT, response.data
             )
 
-    def test_user_can_not_delete_old_comment_if_zammad_is_used(self):
+    @patch("waldur_mastermind.support.backend.zammad.ZammadBackend")
+    def test_user_can_not_delete_old_comment_if_zammad_is_used(
+        self, mock_zammad_backend
+    ):
+        zammad_backend = ZammadServiceBackend()
         self.mock_get_active_backend().comment_destroy_is_available = (
-            lambda x: ZammadServiceBackend.comment_destroy_is_available(None, x)
+            zammad_backend.comment_destroy_is_available
         )
         self.client.force_authenticate(self.fixture.staff)
 

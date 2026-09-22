@@ -7,7 +7,6 @@ from django.db import transaction
 from django.utils import timezone
 
 from waldur_core.core.enums import CoreStates
-
 from waldur_openportal import models
 
 logger = logging.getLogger(__name__)
@@ -149,9 +148,10 @@ def get_or_create_remote_project(allocation, destination: str, remote_identifier
                (destination, current_project).
 
     Defaults applied on creation:
-        membership_control = LOCKED
+        membership_control = OPEN — the receiving portal manages membership
+                             until an organisation owner locks it down
+        allowed_domains    = None — no restriction
         earliest_approve   = allocation.created + 1 hour
-        allowed_domains    = institutional domains of current members
         link_award, link_call from proposal if attached
 
     On get (not created): syncs remote_allocation / current_project if
@@ -160,54 +160,28 @@ def get_or_create_remote_project(allocation, destination: str, remote_identifier
     """
     from datetime import timedelta
 
-    from waldur_openportal.utils import (
-        get_project_member_domains,
-        get_proposal_links_for_project,
-    )
+    from waldur_openportal.utils import get_proposal_links_for_project
 
     project = allocation.project
 
     # Compute defaults — used when a new record is created.
     link_award, link_call = get_proposal_links_for_project(project)
 
-    # Use round-level defaults when the project came from an accepted proposal.
-    from waldur_mastermind.proposal.models import Proposal
-
-    proposal = Proposal.objects.filter(project=project).select_related("round").first()
-    round_obj = proposal.round if proposal else None
-
-    default_membership_control = (
-        round_obj.default_membership_control
-        if round_obj and round_obj.default_membership_control
-        else models.MembershipControlChoices.OPEN
-    )
-
-    if round_obj and round_obj.default_allowed_domains:
-        allowed_domains = get_project_member_domains(project)
-        default_allowed_domains = sorted(
-            set(round_obj.default_allowed_domains) | set(allowed_domains)
-        )
-    else:
-        default_allowed_domains = None
-
-    if round_obj and round_obj.default_reapply_url:
-        link_renewal = {
-            "id": round_obj.default_reapply_text or "",
-            "url": round_obj.default_reapply_url,
-        }
-    else:
-        link_renewal = None
-
+    # There is no call- or round-level award policy here, so a new award starts
+    # unrestricted and an organisation owner narrows it per award through the
+    # RemoteProject actions. The fork seeds these from fields on its Round
+    # instead; that model carries scheduling only here, so the fields have no
+    # home and are deliberately not carried over.
     creation_defaults = {
         "remote_allocation": allocation,
         "current_project": project,
         "state": models.RemoteProjectState.PENDING,
-        "membership_control": default_membership_control,
+        "membership_control": models.MembershipControlChoices.OPEN,
         "earliest_approve": allocation.created + timedelta(hours=1),
-        "allowed_domains": default_allowed_domains,
+        "allowed_domains": None,
         "link_award": link_award,
         "link_call": link_call,
-        "link_renewal": link_renewal,
+        "link_renewal": None,
     }
 
     if remote_identifier is not None:

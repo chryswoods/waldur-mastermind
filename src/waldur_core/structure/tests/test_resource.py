@@ -6,7 +6,7 @@ from waldur_core.structure.tests import factories, fixtures
 from waldur_core.structure.tests import models as test_models
 
 
-class ResourceRemovalTest(test.APITransactionTestCase):
+class ResourceRemovalTest(test.APITestCase):
     def setUp(self):
         self.user = factories.UserFactory(is_staff=True)
         self.client.force_authenticate(user=self.user)
@@ -31,7 +31,7 @@ class ResourceRemovalTest(test.APITransactionTestCase):
         )
 
 
-class ResourceCreateTest(test.APITransactionTestCase):
+class ResourceCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ServiceFixture()
         self.url = factories.TestNewInstanceFactory.get_list_url()
@@ -54,7 +54,7 @@ class ResourceCreateTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
 
-class ResourceEventsTest(test.APITransactionTestCase):
+class ResourceEventsTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ServiceFixture()
         self.client.force_authenticate(user=self.fixture.staff)
