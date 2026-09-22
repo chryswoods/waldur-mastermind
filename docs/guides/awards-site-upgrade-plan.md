@@ -278,7 +278,48 @@ Its configuration lives in the `WALDUR_PROPOSAL` extension settings
 `FORMBRICKS_WEBHOOK_SECRET`, `FORMBRICKS_API_KEY`), all placeholders at
 present. They move with the app.
 
-### 7.1 Three gates, not one
+### 7.1 The end-of-project survey is separate, and is in neither merge
+
+There is a second piece of Formbricks work, unrelated to application forms: the
+project dashboard renders an end-of-project feedback survey once a project
+reaches its end date. It is worth being precise about where it lives, because
+it is **not** in either repository's merged history.
+
+It is one file — `src/project/ProjectDashboard.tsx` on the
+`end-project-form` branch of `isambard-sc/waldur-homeport` (`eed730330`,
+29 July 2026, "update to production formbricks link"). Frontend only: there is
+no backend code for it anywhere, in any branch of this repository.
+
+What it does: shows an `<iframe>` of a hardcoded Formbricks survey when
+`project.end_date` has passed and the viewer holds
+`CREATE_PROJECT_PERMISSION` on the project or its customer (the PI or an
+organisation owner). The survey URL carries the project name and slug, the
+user's name and email, and a call reference assembled from the proposal call's
+`reference_code` and the round's start date.
+
+Three consequences:
+
+- **It has to be re-applied by hand** to the resynced HomePort, or it is lost
+  at the next deployment from a mainline branch. It is small — roughly forty
+  lines in one component — but `ProjectDashboard.tsx` moved a long way in the
+  resync, so this is a re-write against the new file, not a cherry-pick.
+- **Check what the awards portal actually deploys.** The survey is not on that
+  fork's `prod` branch, yet it is live; so either the awards site is deployed
+  from `end-project-form` directly, or `prod` is not its branch. Work that is
+  live only on a feature branch is one deployment away from disappearing, and
+  worth resolving regardless of this upgrade.
+- **The survey URL is hardcoded in the component.** Moving it to a setting
+  served to HomePort would let test and production point at different surveys,
+  which they cannot today.
+
+It also wants its own gate rather than sharing the application-forms one:
+`project.show_end_of_project_survey` in `ProjectSection` describes what it is
+and where it renders, and keeps the two Formbricks features independently
+switchable. Its dependency on `proposalCall.reference_code` and the round start
+time is worth re-checking against upstream's proposal API when it is re-applied
+— those fields come from the proposal app, which is exactly what changed.
+
+### 7.2 Three gates, not one
 
 As written, formbricks has exactly one switch: `Call.formbricks_flow_key`, null
 meaning "use the legacy Waldur-native form". It is **not** behind a feature
@@ -292,7 +333,7 @@ own description that backend access is gated separately:
 
 | Gate | Answers | Where |
 |---|---|---|
-| `proposal.application_forms` feature | Does this portal offer Formbricks forms at all? | `core/features.py`, new `ProposalSection` |
+| `proposal.formbricks_forms` feature | Does this portal offer Formbricks forms at all? | `core/features.py`, new `ProposalSection` |
 | `FORMBRICKS_ENABLED` setting | May the backend talk to Formbricks and accept its webhooks? | the new app's extension settings |
 | `formbricks_flow_key` | Which survey chain does *this call* use? | per call, as now |
 
@@ -382,9 +423,8 @@ are easy to skip:
 - **Dropping the renamed tables**: after how long, and on whose say-so?
 - **Archived call documents**: upstream serves the live ones publicly. Is
   anything lost by making the archived ones authenticated-only?
-- **The formbricks feature name**: `proposal.application_forms` reads well from
-  HomePort, `proposal.formbricks_forms` names the thing it actually is. The
-  flag is portal-wide either way; the name is the only decision.
 - **Retention**: is there a point at which archived proposals should be deleted
   outright — and does anything (funding body, institutional policy) require
   them to be kept for a set period?
+- **Which branch the awards portal's HomePort is deployed from** (§7.1): the
+  end-of-project survey is live but is not on that fork's `prod` branch.
