@@ -2136,6 +2136,110 @@ def compare_historical_remote_usage_with_cache():
     return results
 
 
+def sync_user_slugs():
+    """
+    Make every User.slug match the user's OpenPortal username.
+
+    The slug is a copy: waldur_openportal UserInfo.shortname is where a user's
+    OpenPortal username actually lives, and set_shortname() writes both at the
+    moment it is chosen. This reconciles the copy for everything that write
+    cannot see - a shortname set before the copying existed, a slug generated
+    from the account name by SlugMixin, a row repaired by hand.
+
+    A user who has not chosen a username gets a NULL slug rather than a
+    generated one, because homeport shows the slug *as* the OpenPortal
+    username: a plausible-looking slug there is not a missing answer, it is a
+    wrong one.
+
+    Gated on the portal-wide user.show_openportal_identifier feature. With it
+    off the slug means what it means everywhere else in Waldur, and this does
+    nothing at all.
+
+    Projects are deliberately not touched. For them the dependency runs the
+    other way - set_default_project_shortname() derives ProjectInfo.shortname
+    *from* Project.slug, and raises without one - so nulling a project slug
+    would break the shortname it is supposed to feed.
+
+    Returns:
+        dict: {"updated": int, "cleared": int, "unchanged": int,
+               "errors": list[str], "skipped": bool}
+    """
+    if not core_models.is_feature_enabled(core_models.OPENPORTAL_IDENTIFIER_FEATURE):
+        logger.debug(
+            "%s is off, leaving user slugs alone",
+            core_models.OPENPORTAL_IDENTIFIER_FEATURE,
+        )
+        return {
+            "updated": 0,
+            "cleared": 0,
+            "unchanged": 0,
+            "errors": [],
+            "skipped": True,
+        }
+
+    shortnames = dict(
+        models.UserInfo.objects.exclude(shortname=None)
+        .exclude(shortname="")
+        .values_list("user_id", "shortname")
+    )
+
+    updated = 0
+    cleared = 0
+    unchanged = 0
+    errors = []
+
+    for user in core_models.User.objects.all().only("id", "slug", "username"):
+        shortname = shortnames.get(user.id)
+        wanted = shortname.strip() if shortname else None
+
+        if user.slug == wanted:
+            unchanged += 1
+            continue
+
+        old_slug = user.slug
+        try:
+            # The flag marks this as a sanctioned write: core.User.save()
+            # refuses a slug change that comes from a user renaming
+            # themselves, which is the whole point of the copy being fixed.
+            user._syncing_to_userinfo = True
+            try:
+                user.slug = wanted
+                user.save(update_fields=["slug"])
+            finally:
+                user._syncing_to_userinfo = False
+        except Exception as e:
+            error = f"Failed to sync slug for user {user.username} ({user.uuid}): {e}"
+            errors.append(error)
+            logger.error(error, exc_info=True)
+            continue
+
+        if wanted is None:
+            cleared += 1
+            logger.info(
+                f"Cleared slug '{old_slug}' for user {user.username} ({user.uuid}): "
+                f"no OpenPortal username set"
+            )
+        else:
+            updated += 1
+            logger.info(
+                f"Updated user {user.username} ({user.uuid}) slug: "
+                f"'{old_slug}' -> '{wanted}'"
+            )
+
+    logger.info(
+        f"User slug sync complete. {updated} updated, {cleared} cleared, "
+        f"{unchanged} unchanged, {len(errors)} errors."
+    )
+
+    return {
+        "updated": updated,
+        "cleared": cleared,
+        "unchanged": unchanged,
+        "errors": errors,
+        "skipped": False,
+    }
+
+
 def sync_openportal_shortnames_to_slugs():
     """
     Synchronize shortnames from ProjectInfo and UserInfo to their respective

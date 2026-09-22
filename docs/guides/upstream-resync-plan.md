@@ -621,6 +621,34 @@ portal is not this one. Around 400 rows needed rewriting on the sanitised copy,
 which is the same number production carries. Dry run first; it refuses a
 rewrite that would collide with another `ManagedProject`.
 
+**`waldur-openportal-sync-user-slugs` clears slugs on its first run, and it
+is scheduled.** 02:20 daily, no-op unless `user.show_openportal_identifier`
+is on. With the feature on it makes every `User.slug` equal the user's
+OpenPortal username (`UserInfo.shortname`) and sets it to NULL for everyone
+who has not chosen one -- including the username-derived slugs the old fork
+generated, which is the point: homeport shows the slug *as* the OpenPortal
+username, so a plausible-looking wrong value is worse than none. Turning the
+feature on and letting beat run is the deployment action. Count what it will
+change first:
+
+```bash
+DJANGO_SETTINGS_MODULE=waldur_core.server.my_test_settings uv run waldur shell -c "
+from waldur_core.core.models import User
+from waldur_openportal.models import UserInfo
+shortnames = dict(UserInfo.objects.exclude(shortname=None).exclude(shortname='').values_list('user_id', 'shortname'))
+rows = list(User.objects.values_list('id', 'slug'))
+print('users', len(rows))
+print('slug will be set or corrected', sum(1 for i, s in rows if shortnames.get(i) and s != shortnames[i]))
+print('slug will be cleared', sum(1 for i, s in rows if not shortnames.get(i) and s))
+print('unchanged', sum(1 for i, s in rows if s == shortnames.get(i)))
+"
+```
+
+It only ever writes `User.slug`. Projects are deliberately untouched: for them
+`set_default_project_shortname()` derives `ProjectInfo.shortname` *from*
+`Project.slug` and raises without one, so the dependency runs the other way
+and clearing a project slug would break the shortname it feeds.
+
 **`marketplace/0270` -- measured, negligible.** It scrubs plaintext
 `secret_options` from Offering versions in the reversion history, and the
 sanitiser empties `reversion_version`, so every rehearsal ran it against an

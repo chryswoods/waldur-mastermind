@@ -59,6 +59,11 @@ NAME_LENGTH = 150
 
 USERNAME_REGEX = r"^[a-zA-Z0-9_.][a-zA-Z0-9_.-]*[a-zA-Z0-9_.$-]?$"
 
+# Portal-wide switch: the user slug holds the OpenPortal username rather than
+# a slug generated from the account name. Declared in core.features under
+# UserSection; read here and by waldur_openportal.utils.sync_user_slugs().
+OPENPORTAL_IDENTIFIER_FEATURE = "user.show_openportal_identifier"
+
 GENDER_CHOICES = [(code, _(label)) for code, label in _GENDER_CHOICES_RAW]
 
 
@@ -109,10 +114,21 @@ class SlugMixin(models.Model):
         abstract = True
 
     def save(self, *args, **kwargs):
-        if not self.slug:
+        if not self.slug and self.should_generate_slug():
             self.slug = self.generate_slug()
 
         super().save(*args, **kwargs)
+
+    def should_generate_slug(self) -> bool:
+        """
+        Whether an empty slug should be filled in from the source field.
+
+        True for every model whose slug is its own to invent. A model whose
+        slug is a copy of a value authored elsewhere overrides this, so that
+        "empty" keeps meaning "not set yet" instead of being replaced by a
+        guess - see User.
+        """
+        return True
 
     def generate_slug(self):
         slug_source = getattr(self, self.get_slug_source_field())
@@ -303,6 +319,13 @@ class User(
     """
 
     id: int
+
+    # Overrides SlugMixin.slug to allow NULL. With
+    # OPENPORTAL_IDENTIFIER_FEATURE on, the slug holds the user's OpenPortal
+    # username and NULL is the meaningful state "not chosen yet" - distinct
+    # from a generated slug that only looks like one. Overriding a field
+    # inherited from an abstract base is sanctioned by Django.
+    slug = models.SlugField(blank=True, null=True, default=None)
 
     username = models.CharField(
         _("username"),
@@ -725,6 +748,20 @@ class User(
     def get_slug_source_field(cls):
         return "username"
 
+    def should_generate_slug(self) -> bool:
+        """
+        With OPENPORTAL_IDENTIFIER_FEATURE on, an unset slug stays unset.
+
+        The slug is then a copy of the user's OpenPortal username
+        (waldur_openportal UserInfo.shortname), which the user chooses once
+        and which nothing else can supply. Inventing one from the username -
+        SlugMixin's default - would put a value in front of the people who
+        read the slug as that identifier, and it would be the wrong one.
+        With the feature off, the slug is an ordinary generated slug and this
+        model behaves as it always has.
+        """
+        return not is_feature_enabled(OPENPORTAL_IDENTIFIER_FEATURE)
+
 
 class ImpersonatedUser(User):
     """
@@ -1070,6 +1107,18 @@ class Feature(models.Model):
 
     key = models.TextField(max_length=255, unique=True)
     value = models.BooleanField(default=False)
+
+
+def is_feature_enabled(key: str) -> bool:
+    """
+    Whether a core feature flag is on.
+
+    Features are almost always read by homeport to decide what to render;
+    this is for the rare flag that also decides what the backend stores. One
+    indexed lookup on a table of a few dozen rows, read at the point of use
+    so that flipping the flag takes effect immediately.
+    """
+    return Feature.objects.filter(key=key, value=True).exists()
 
 
 @reversion.register()

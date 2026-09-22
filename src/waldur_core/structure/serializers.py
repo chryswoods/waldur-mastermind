@@ -2317,6 +2317,19 @@ class UserSerializer(
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
 ):
+    # Redeclares SlugSerializerMixin.slug to allow null. With
+    # user.show_openportal_identifier on, a user who has not chosen an
+    # OpenPortal username has no slug at all, and a schema that says the
+    # field is always a string makes the generated SDK crash on the null.
+    # Only this model's slug is nullable, so the mixin stays as it is.
+    slug = serializers.SlugField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=50,
+        help_text="URL-friendly identifier. Only editable by staff users.",
+    )
+
     nationalities = serializers.ListField(child=serializers.CharField(), required=False)
     managed_isds = serializers.ListField(child=serializers.CharField(), required=False)
     active_isds = serializers.ListField(child=serializers.CharField(), required=False)

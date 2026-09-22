@@ -466,7 +466,12 @@ class UserRoleDetailsSerializer(serializers.ModelSerializer):
     user_email = serializers.ReadOnlyField(source="user.email")
     user_full_name = serializers.ReadOnlyField(source="user.full_name")
     user_username = serializers.ReadOnlyField(source="user.username")
-    user_slug = serializers.CharField(read_only=True, source="user.slug")
+    # allow_null: the slug is NULL for a user who has not chosen an
+    # OpenPortal username, and the generated SDK crashes on a null it was
+    # told could not happen.
+    user_slug = serializers.CharField(
+        read_only=True, source="user.slug", allow_null=True
+    )
     user_image = serializers.ImageField(source="user.image", read_only=True)
     created_by_full_name = serializers.ReadOnlyField(source="created_by.full_name")
     created_by_uuid = serializers.UUIDField(read_only=True, source="created_by.uuid")
@@ -497,7 +502,12 @@ class PermissionSerializer(serializers.ModelSerializer):
     uuid = serializers.UUIDField(read_only=True)
     user_uuid = serializers.UUIDField(read_only=True, source="user.uuid")
     user_name = serializers.CharField(read_only=True, source="user.full_name")
-    user_slug = serializers.CharField(read_only=True, source="user.slug")
+    # allow_null: the slug is NULL for a user who has not chosen an
+    # OpenPortal username, and the generated SDK crashes on a null it was
+    # told could not happen.
+    user_slug = serializers.CharField(
+        read_only=True, source="user.slug", allow_null=True
+    )
     user_username = serializers.CharField(read_only=True, source="user.username")
     user_email = serializers.CharField(read_only=True, source="user.email")
     created_by_full_name = serializers.CharField(

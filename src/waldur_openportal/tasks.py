@@ -1055,6 +1055,21 @@ def sync_remote_for_destination(service_settings_id):
                 break
 
 
+@shared_task(name="waldur_openportal.sync_user_slugs")
+@run_once_task(takeover_timeout=60 * 60)
+def sync_user_slugs():
+    """
+    Daily reconciliation of User.slug against the OpenPortal username.
+
+    Copies UserInfo.shortname onto the slug, and clears the slug of anyone
+    who has not chosen a username. See utils.sync_user_slugs() for why, and
+    for why projects are left alone. Does nothing unless the portal-wide
+    user.show_openportal_identifier feature is on.
+    """
+    logger.info("OpenPortal task.sync_user_slugs")
+    return utils.sync_user_slugs()
+
+
 @shared_task(name="waldur_openportal.sync_local_users")
 @run_once_task(takeover_timeout=60 * 60)
 def sync_local_users():
