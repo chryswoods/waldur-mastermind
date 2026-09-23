@@ -114,22 +114,49 @@ verified — and dropping is a separate decision that can wait months.
 1. **Close all open calls** and let any in-flight work settle.
 2. **Take a dump.** This is the archive's backstop: every later step is
    recoverable from it.
-3. **Rename** all 16 `proposal_*` tables to `old_proposal_*` (including the
-   `proposal_call_documents` and `proposal_call_offerings` through-tables).
-4. **Delete every `proposal` row** from `django_migrations` — all 56, not just
-   the fork's `0047`–`0054`.
-5. **Deploy the new code and migrate.** With no tables and no history,
+3. **Rename** all 16 `proposal_*` tables to `old_proposal_*`, and **delete
+   every `proposal` row** from `django_migrations` — all 56, not just the
+   fork's `0047`–`0054`. Both are `scripts/awards_reconcile_db.sql`, in one
+   transaction; see §3.1.
+4. **Deploy the new code and migrate.** With no tables and no history,
    upstream's `0001_squashed_0074` applies as a single unit against a clean
    slate. This is the easiest case for the squash, not the hardest.
-6. **Migrate the archive app**, which creates its own tables.
-7. **Run the copy script** against the renamed tables. Re-runnable; verifies
+5. **Migrate the archive app**, which creates its own tables.
+6. **Run the copy script** against the renamed tables. Re-runnable; verifies
    counts per model against the source and refuses to report success on a
    mismatch.
-8. **Move the documents' media rows** to the archive's prefix — see §5.
-9. **Leave the renamed tables in place** until the archive has been exercised
+7. **Move the documents' media rows** to the archive's prefix — see §5.
+8. **Leave the renamed tables in place** until the archive has been exercised
    in anger. Dropping them is a later, separate change.
 
-Steps 3–5 are the only ones inside the maintenance window.
+Steps 3 and 4 are the only ones inside the maintenance window.
+
+### 3.1 The reconciliation script
+
+`scripts/awards_reconcile_db.sql` does the rename and the history delete in one
+transaction. Three things in it are worth knowing.
+
+**It refuses to run on the wrong database.** The fork's proposal app has
+columns upstream's does not, so the script requires `proposal_proposal.notes`
+and `proposal_round.fixed_review_end_date` to be present and stops otherwise,
+naming `resync_reconcile_db.sql` as the portal's script instead. It also stops
+if `old_proposal_*` tables already exist, rather than burying a first archive
+under a second rename.
+
+**It renames the indexes, constraints and sequences too.** This is the part
+that is easy to miss and expensive to find: index and sequence names are unique
+per schema, so `proposal_call_pkey` and `proposal_call_id_seq` left attached to
+the renamed table collide with the `CREATE TABLE` that upstream's migrations run
+next — and the failure reads as "relation already exists" with nothing to
+connect it to the rename. Verified by recreating the original tables afterwards
+and watching them succeed.
+
+**It handles PostgreSQL's 63-byte identifier limit.** Several of Django's
+generated constraint names are already at it, so `old_` + name would be
+silently truncated, and two long names differing only at the end would truncate
+onto each other. Past 59 characters the script keeps a readable prefix and
+makes it unique with a hash:
+`old_proposal_proposalprojectrolemapping_call_id_pr_412a0ecc`.
 
 ## 4. The archive app
 
