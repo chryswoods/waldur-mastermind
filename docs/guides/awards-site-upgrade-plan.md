@@ -260,6 +260,57 @@ upstream's proposal series as running "against empty tables". Here the tables
 are not empty but *absent*, and the history is gone with them, so the whole app
 is created from scratch. Same outcome, shorter route.
 
+### 3.5 Proposal roles block the replay, and their assignments are archive material
+
+The first full run of `resync_migrate.sh` reached the proposal squash and died
+inside `0040_migrate_default_project_role`:
+
+```
+Role.objects.get(name="PROPOSAL.MANAGER", content_type=proposal_ct)
+MultipleObjectsReturned: get() returned more than one Role -- it returned 2!
+```
+
+**Roles are not proposal tables.** They live in `permissions_role`, which the
+reconciliation does not touch, so this site's `PROPOSAL.MANAGER` and
+`PROPOSAL.MEMBER` survive from its previous life. The replay then creates its
+own inside the squash's transaction, `0040` finds two, and the whole squash
+rolls back — which is why the database afterwards shows only one of each, and
+why nothing is damaged. On the portal this cannot happen: no proposals, no
+proposal roles, virgin ground. It is the same shape as the pre-flight aborting:
+the replay assumes a clean slate, and the slate is clean only for the proposal
+app.
+
+The roles therefore have to go before the replay can succeed. What makes that a
+decision rather than a fix is what hangs off them (September 2026):
+
+| Role | System | Assignments |
+|---|---|---|
+| `PROPOSAL.MANAGER` | yes | 3576 |
+| `PROPOSAL.MEMBER` | yes | 2334 |
+| `PROPOSAL.COLEAD` | no | 1214 |
+| `CALL.REVIEWER` | yes | 269 |
+| `CALL.MANAGER` | yes | 30 |
+| `CUSTOMER.CALL_ORGANIZER` | yes | 6 |
+| `Call Reader` | no | 5 |
+
+Deleting a role cascades its `UserRole` rows away, so that is 7,434 records of
+**who managed, co-led, reviewed and belonged to each proposal and call** — and
+they are exactly the kind of thing an archive is for. They are also already
+half-detached: `UserRole` scopes through a generic foreign key, so those rows
+now point at object ids that exist only in `old_proposal_*`.
+
+So the archive gains a model, and the sequence gains a step: **capture the
+memberships before the roles are deleted.** `ArchivedMembership` — the archived
+call or proposal, the user's uuid and username, the role name, whether it was
+active, and when it was granted and revoked — denormalised like everything else
+in §4.1, so it survives the roles it came from. Two of the seven roles are
+custom rather than system (`PROPOSAL.COLEAD`, `Call Reader`), so the role name
+has to be carried as text rather than assumed from an enum.
+
+Only then does the awards path of the reconciliation delete the proposal-scoped
+roles, and only then does the replay have a clean slate in the sense it
+assumes.
+
 ## 4. The archive app
 
 A new app, `waldur_mastermind.proposal_archive`, holding what the old app held,
@@ -273,6 +324,7 @@ flattened:
 | `ArchivedRequestedResource` | `RequestedResource`, `RequestedOffering`, `CallResourceTemplate` | offering and plan denormalised to uuid + name |
 | `ArchivedReview` | `Review`, `ReviewComment` | staff-only, see §4.2 |
 | `ArchivedDocument` | `CallDocument`, `ProposalDocumentation` | one model, `kind` discriminates |
+| `ArchivedMembership` | `permissions.UserRole` scoped to a call or proposal | who held which role, and when — see §3.5 |
 
 `ProposalIDGenerator` (2 rows, a counter) and `ProposalResourceAdjustment` (223
 rows) are judgement calls — the generator is certainly not worth archiving; the
