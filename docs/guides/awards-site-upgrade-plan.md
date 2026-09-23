@@ -117,9 +117,13 @@ verified — and dropping is a separate decision that can wait months.
 3. **Reconcile the database**: `scripts/resync_preflight_check.sql` first,
    then `scripts/resync_reconcile_db.sql`. The same two scripts the portal
    uses — see §3.1 for what they do differently here.
-4. **Deploy the new code and migrate.** With no tables and no history,
-   upstream's `0001_squashed_0074` applies as a single unit against a clean
-   slate. This is the easiest case for the squash, not the hardest.
+4. **Migrate with `scripts/resync_migrate.sh`, application down**, not by
+   bringing the new code up and letting it migrate at startup. Five upstream
+   `waldur_openportal` migrations have to be faked at a point where Django's
+   dependency graph is satisfied, which only Django can do — see §3.4. With no
+   proposal tables and no proposal history, upstream's `0001_squashed_0074`
+   then applies as a single unit against a clean slate, which is the easiest
+   case for the squash rather than the hardest.
 5. **Migrate the archive app**, which creates its own tables.
 6. **Run the copy script** against the renamed tables. Re-runnable; verifies
    counts per model against the source and refuses to report success on a
@@ -225,6 +229,36 @@ they are there, reporting `PASS | N archived`. Before that it named the tables
 directly, and a missing relation failed at parse time — which aborted the
 read-only transaction and took every later check with it, including the gate
 above.
+
+### 3.4 The migration itself
+
+`scripts/resync_migrate.sh` replaces a plain `migrate`, and all six of its
+steps apply to this site unchanged:
+
+| | |
+|---|---|
+| 1 | `structure` forward, which brings in openportal `0036`'s dependency |
+| 2 | openportal `0034` for real — it adds `can_be_managed`, which this fork never had |
+| 3 | openportal `0035`–`0039` faked, their objects already existing |
+| 4 | everything else |
+| 5 | the 30-day grace-period backfill |
+| 6 | `makemigrations --check`, which catches a fake whose objects did not match |
+
+Run it with the **application down and the database only**. Waldur migrates at
+startup, so an API container that is up has already migrated — or failed to —
+and the workers would be reading a schema changing underneath them:
+
+```bash
+docker compose up -d waldur-db
+scripts/resync_migrate.sh --manage \
+    'docker compose run --rm --no-deps -T --entrypoint waldur waldur-mastermind-api'
+docker compose up -d
+```
+
+One difference from the portal worth expecting: the script's step 4 describes
+upstream's proposal series as running "against empty tables". Here the tables
+are not empty but *absent*, and the history is gone with them, so the whole app
+is created from scratch. Same outcome, shorter route.
 
 ## 4. The archive app
 
