@@ -207,6 +207,18 @@ class ArchiveCopyTest(OldProposalData, TestCase):
         self.assertEqual(proposal.notes[0]["text"], "noted")
         self.assertTrue(proposal.project_is_confidential)
 
+    def test_text_longer_than_the_live_model_allowed_is_copied_whole(self):
+        """The live models cap a description at 2,000 characters. Production
+        proposals exceed it, and the first real run of the copy died on exactly
+        that. An archive that truncates -- or refuses -- is not an archive."""
+        long_text = "x" * 8000
+        sql(
+            "UPDATE old_proposal_proposal SET description = %s WHERE id = %s",
+            [long_text, self.proposal_id],
+        )
+        self.copy()
+        self.assertEqual(models.ArchivedProposal.objects.get().description, long_text)
+
     def test_resource_adjustments_are_folded_into_the_proposal_payload(self):
         sql(
             "INSERT INTO old_proposal_proposalresourceadjustment "

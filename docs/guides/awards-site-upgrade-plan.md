@@ -383,6 +383,16 @@ explicitly refuses to derive a prefix from.
 proposals that will never be issued again. `ProposalResourceAdjustment` (223
 rows) is, folded into `ArchivedProposal.payload["resource_adjustments"]`.
 
+Every field holding copied text is a `TextField`, even where the source column
+was a bounded `CharField`. This is not tidiness: the first real run of the copy
+died on `value too long for type character varying(2000)` at proposal 12 of
+2,258, because the fork's `DescribableMixin` capped descriptions at 2,000
+characters and production proposals exceed it. An archive that inherits the
+live schema's limits will refuse the very rows most worth keeping. The only
+bounded fields left are `scope_kind`, which the archive invents rather than
+copies, and the two `FileField`s, which cannot be text and are capped at 255 to
+match `media_file.name`.
+
 The app's migration has **`dependencies = []`**. That is not an accident of
 having no foreign keys — it is the requirement that lets `migrate
 proposal_archive` run on the awards site while the proposal app is absent from
