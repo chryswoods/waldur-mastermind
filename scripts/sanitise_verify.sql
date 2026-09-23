@@ -95,6 +95,7 @@ DECLARE
     r record;
     spec text;
     present boolean;
+    col_type text;
     n bigint;
     pass int := 0;
     fail int := 0;
@@ -448,16 +449,24 @@ BEGIN
         'openstack_volume.metadata',
         'waldur_openstack_replication_migration.mappings'
     ] LOOP
-        SELECT to_regclass('public.' || quote_ident(split_part(spec, '.', 1)))
-                   IS NOT NULL
-               AND EXISTS (
-                   SELECT 1 FROM information_schema.columns ic
-                   WHERE ic.table_schema = 'public'
-                     AND ic.table_name = split_part(spec, '.', 1)
-                     AND ic.column_name = split_part(spec, '.', 2))
-        INTO present;
+        SELECT ic.udt_name INTO col_type
+        FROM information_schema.columns ic
+        WHERE ic.table_schema = 'public'
+          AND ic.table_name = split_part(spec, '.', 1)
+          AND ic.column_name = split_part(spec, '.', 2);
 
-        IF NOT present OR current_setting('server_version_num')::int < 160000
+        -- Skip when the column is absent on this release, when the server is
+        -- too old for IS JSON, or when this deployment declares the field as
+        -- native json/jsonb rather than text. The last one is not just
+        -- unnecessary - the database already guarantees such a value parses -
+        -- but actively breaks the check: nullif(col, '') casts the empty
+        -- string to the column's type, and ''::jsonb raises
+        -- `invalid input syntax for type json`. The same field is text on one
+        -- deployment and jsonb on another; logging_emailhook.event_groups is
+        -- text on the portal and jsonb on the awards site.
+        IF col_type IS NULL
+           OR col_type NOT IN ('text', 'varchar', 'bpchar')
+           OR current_setting('server_version_num')::int < 160000
         THEN
             skip := skip + 1;
             RAISE NOTICE '| SKIP   | % | % |',
