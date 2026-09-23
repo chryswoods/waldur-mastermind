@@ -1335,7 +1335,7 @@ class ProjectInfo(models.Model):
                 # application_portal_only mode (i.e., we're in Project Management mode)
                 try:
                     application_portal_only = core_models.Feature.objects.get(
-                        key="deployment.application_portal_only"
+                        key=core_models.APPLICATION_PORTAL_FEATURE
                     ).value
                 except core_models.Feature.DoesNotExist:
                     # Default to False if feature flag doesn't exist

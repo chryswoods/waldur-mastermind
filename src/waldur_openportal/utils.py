@@ -2270,8 +2270,29 @@ def sync_openportal_shortnames_to_slugs():
 
     logger.info("Starting sync of OpenPortal shortnames to slugs...")
 
-    # Sync ProjectInfo shortnames to Project slugs
+    # Sync ProjectInfo shortnames to Project slugs.
+    #
+    # Refused outright on an application portal. There, Project.slug holds the
+    # award identifier (0251-4064-4677-1) and has nothing to do with OpenPortal
+    # shortnames, so overwriting it would destroy the identifier every link and
+    # every award refers to. ProjectInfo.set_shortname() has always made this
+    # distinction; this function did not, and it is the more dangerous of the
+    # two because it acts on every project at once.
+    application_portal_only = core_models.is_feature_enabled(
+        core_models.APPLICATION_PORTAL_FEATURE
+    )
+    if application_portal_only:
+        logger.info(
+            "%s is on, so Project.slug is an award identifier rather than a "
+            "copy of the shortname: leaving project slugs alone",
+            core_models.APPLICATION_PORTAL_FEATURE,
+        )
+
     for project_info in models.ProjectInfo.objects.all().select_related("project"):
+        if application_portal_only:
+            projects_skipped += 1
+            continue
+
         try:
             # Skip if no shortname or project doesn't exist
             if not project_info.shortname or not project_info.project:

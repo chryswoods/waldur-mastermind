@@ -178,11 +178,46 @@ openportal rows and `7 of 7` core/structure rows to delete.
 
 **The `short_name` gate fails here where it passed on the portal.** The
 pre-flight reported `projects_losing_short_name: FAIL 21`: of 1,079 projects
-with a `short_name`, 1,058 have it preserved as a `ProjectInfo.shortname` and
-none via the slug, leaving 21 whose value would be destroyed by the §3 drop.
-That must be resolved before reconciling — the column is not recoverable
-afterwards. `users_losing_unix_username` passes trivially: this site never used
-the field at all (`users_with_unix_username: 0`).
+with a `short_name`, 1,058 have it preserved as a `ProjectInfo.shortname`,
+leaving 21 whose value would be destroyed by the §3 drop. That must be resolved
+before reconciling — the column is not recoverable afterwards.
+`users_losing_unix_username` passes trivially: this site never used the field at
+all (`users_with_unix_username: 0`).
+
+The gate allows two homes for the value, the `ProjectInfo.shortname` or the
+slug. **On this site only the first one counts**, which is why
+`projects_preserved_via_slug_only` reads 0 and always will — see §3.3.
+
+### 3.3 Project.slug here is the award identifier
+
+On the awards site `Project.slug` holds the award ID — `0251-4064-4677-1` —
+and has nothing to do with OpenPortal shortnames. That is what the
+`deployment.application_portal_only` feature is for ("Configure Waldur to
+function as an application and awards portal only"), and
+`ProjectInfo.set_shortname()` reads it before deciding whether to copy a
+shortname into the slug:
+
+```python
+if not application_portal_only:
+    self.project.slug = shortname
+    self.project.save(update_fields=["slug"])
+```
+
+**Confirm that feature is on before anything writes a project shortname here.**
+It defaults to False when the row is missing, and with it off, setting a
+shortname silently overwrites the award identifier that every link and every
+award refers to.
+
+`utils.sync_openportal_shortnames_to_slugs()` had no such guard — it wrote
+`project.slug = shortname` for every project at once. It has never been called
+(nothing in the tree calls it), but it is the more dangerous of the two
+precisely because it acts on everything, and an upgrade like this one is when
+somebody goes looking for a function with that name. It now refuses on an
+application portal, and says so.
+
+The same reasoning does not apply to `User.slug`: this site has no
+`unix_username` values at all, and `sync_user_slugs()` is gated on
+`user.show_openportal_identifier`, which an awards portal would leave off.
 
 The pre-flight itself now survives being run after the rename: its proposal
 section counts through dynamic SQL and reads the `old_proposal_*` tables when
