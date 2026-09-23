@@ -299,6 +299,28 @@ they are exactly the kind of thing an archive is for. They are also already
 half-detached: `UserRole` scopes through a generic foreign key, so those rows
 now point at object ids that exist only in `old_proposal_*`.
 
+They divide by scope like this:
+
+| Scope | Role | Total | Active |
+|---|---|---|---|
+| proposal | `PROPOSAL.MANAGER` | 3576 | 3378 |
+| proposal | `PROPOSAL.MEMBER` | 2334 | 2052 |
+| proposal | `PROPOSAL.COLEAD` | 1214 | 1034 |
+| call | `CALL.REVIEWER` | 269 | 260 |
+| call | `CALL.MANAGER` | 30 | 27 |
+| callmanagingorganisation | `CUSTOMER.CALL_ORGANIZER` | 6 | 6 |
+| callmanagingorganisation | `Call Reader` | 5 | 5 |
+
+**1,537 of the 7,124 proposal-scoped rows do not resolve at all** — their
+`object_id` matches no row in `old_proposal_proposal`. Only 660 assignments are
+inactive in total, so most of those orphans are *active* permission rows
+pointing at proposals that were deleted at some point and took no permissions
+with them. That is pre-existing cruft in the live system rather than anything
+this upgrade does, but it decides a design question: `ArchivedMembership`
+attaches the **5,587 resolvable** rows to their archived proposal and reports
+the orphans as a count. Archiving a reference to a proposal that no longer
+exists anywhere would be storing a number, not a record.
+
 So the archive gains a model, and the sequence gains a step: **capture the
 memberships before the roles are deleted.** `ArchivedMembership` — the archived
 call or proposal, the user's uuid and username, the role name, whether it was
