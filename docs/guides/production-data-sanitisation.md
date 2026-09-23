@@ -507,6 +507,28 @@ Every one of the leaks listed above was found by layer 3, not by reading the
 schema. If you extend the script, keep that order: add the column, then check
 that the scan agrees.
 
+### The same field is not the same type everywhere
+
+Stage 7c walks a hardcoded inventory of columns that are `text` in the database
+and JSON to the ORM, and asserts each one still parses. It now skips any of
+them that this deployment declares as native `json`/`jsonb`, because the
+database already guarantees those parse -- and because `sanitise.is_json()`
+takes `text`, so reaching one raised
+
+```
+ERROR:  function sanitise.is_json(jsonb) does not exist
+```
+
+three hours into a run, with everything rolled back. `logging_emailhook.
+event_groups` is the field that did it: `text` on the portal, `jsonb` on the
+awards site. Waldur's own releases move fields between the two, so an
+inventory keyed on the column name alone is keyed on half the story. Guard on
+`udt_name`, not just on the column existing.
+
+After a failure like that, `--reuse-server` picks the cluster back up and skips
+the restore: the sanitiser is one transaction, so the restored copy is still
+pristine and the re-run takes seconds.
+
 ## Rehearsed against
 
 A full run against a real dump: 188 JSON columns sized and the 27 non-empty

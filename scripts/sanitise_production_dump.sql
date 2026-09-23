@@ -2126,9 +2126,11 @@ DO $$
 DECLARE
     spec record;
     nullable text;
+    udt text;
     empty text;
     n bigint;
     bad_total bigint := 0;
+    skipped_native int := 0;
 BEGIN
     FOR spec IN
         SELECT * FROM (VALUES
@@ -2179,11 +2181,22 @@ BEGIN
     LOOP
         CONTINUE WHEN to_regclass('public.' || quote_ident(spec.tbl)) IS NULL;
 
-        SELECT is_nullable INTO nullable
+        SELECT is_nullable, udt_name INTO nullable, udt
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = spec.tbl
           AND column_name = spec.col;
         CONTINUE WHEN nullable IS NULL;
+
+        -- Only text-backed columns. The same field is a native json/jsonb
+        -- column on some releases and on some deployments - the awards site
+        -- has logging_emailhook.event_groups as jsonb where the portal has it
+        -- as text - and there is nothing to check when the database itself
+        -- guarantees the value parses. Without this the run dies here on
+        -- `function sanitise.is_json(jsonb) does not exist`, hours in.
+        IF udt NOT IN ('text', 'varchar', 'bpchar') THEN
+            skipped_native := skipped_native + 1;
+            CONTINUE;
+        END IF;
 
         EXECUTE format(
             'SELECT count(*) FROM public.%I WHERE NOT sanitise.is_json(%I)',
@@ -2202,6 +2215,12 @@ BEGIN
             '  %s.%s: %s rows did not parse, emptied', spec.tbl, spec.col,
             sanitise.commas(n)));
     END LOOP;
+
+    IF skipped_native > 0 THEN
+        PERFORM sanitise.say(format(
+            '  %s of them are native json columns on this release, so the'
+            || ' database already guarantees they parse', skipped_native));
+    END IF;
 
     IF bad_total = 0 THEN
         PERFORM sanitise.say('  all of them parse');
