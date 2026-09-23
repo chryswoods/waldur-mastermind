@@ -745,12 +745,62 @@ valid in every format the real value was.
 
 ## 9. Rehearsal
 
-The whole sequence in §3 should be rehearsed end to end on the sanitised copy
-before it is run anywhere else, and the rehearsal should include the parts that
-are easy to skip:
+### 9.1 First clean run, September 2026
 
-- the count verification in step 7, with a deliberate mismatch introduced once
-  to prove it fails;
+`resync_migrate.sh` completed all nine steps against the sanitised copy of the
+awards database, in four minutes, ending on `No changes detected` — the schema
+matches the models, so nothing that was faked in steps 2–3 was faked wrongly.
+The grace period backfilled. **Upstream's `proposal.0001_squashed_0074` applied
+against the empty tables**, which is what the whole archive detour exists to
+make possible.
+
+What the archive captured:
+
+| | Copied | Source (Sept measurement) |
+|---|---|---|
+| Calls | 7 | 7 |
+| Rounds | 11 | 11 |
+| Proposals | 2263 | 2258 |
+| Requested resources | 2274 | 2271 |
+| Reviews | 1783 | 1780 |
+| Call documents | 22 | 22 |
+| Proposal documents | 3412 | 3403 |
+| Memberships | 5897 | — |
+| Memberships on a missing proposal | 1537 | 1537 |
+
+The membership figures reconcile exactly: 5,897 + 1,537 = 7,434, every
+assignment the seven roles carried. The 5,897 is §3.5's 5,587 resolvable
+proposal-scoped rows plus the 310 call- and organisation-scoped ones. The small
+excesses elsewhere are the dump being newer than the measurement.
+
+It took four attempts to get there, each failing on the same underlying
+mistake in a different guise: **code written against the schema as it will be,
+running against the schema as it is mid-upgrade.** A field width inherited
+from the live model (§4), Django's delete collector querying tables that do not
+exist yet (§3.5), a table that exists without its newest column (§3.5), and
+foreign keys that a rename preserved (§3.6). Anything reading or writing during
+this window has to treat the database, not the model graph, as the authority.
+
+### 9.2 Not yet proved
+
+Two things the sanitised copy cannot establish, both of which matter on
+production:
+
+- **The media rename.** It reported `media paths moved: 0`, because the
+  sanitiser blanks document paths. On production it should move roughly 3,425
+  rows; if it reports 0 there, every archived document will 403. This is the
+  one number to check in the production run.
+- **The 2,468 invitations.** `users_invitation` rows referencing the fork's
+  proposal roles are deleted by the cascade — as Django's own `CASCADE` would
+  have done — and are **not** archived. Harmless if invitations to closed calls
+  are of no interest; if they are, `ArchivedInvitation` has to exist before the
+  production run, not after.
+
+### 9.3 Still to rehearse
+
+The rest of §3 should be rehearsed on the sanitised copy before it is run
+anywhere else, including the parts that are easy to skip:
+
 - a document download through `/api/media/<uuid>/` as each class of user in
   §4.2 — this is where the prefix collision of §5 shows up if it has been got
   wrong;
