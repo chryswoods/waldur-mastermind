@@ -391,28 +391,52 @@ migration at the same time.
 The rehearsal needs a sanitised copy, the same way the portal's did — see
 `production-data-sanitisation.md` for the method and the lessons.
 
-`scripts/sanitise_production_dump.sql` is written for the portal and does not
-know about the proposal tables. The awards site needs its own script, or a
-proposal stage added to that one. What it has to cover:
+`scripts/sanitise_production_dump.sql` now carries a proposal stage, so there
+is one sanitiser for both sites rather than two to keep in step. Every
+statement in it is guarded by `sanitise.exec_if`, which skips a missing table
+or column with a notice, so on a portal database the stage is a no-op:
+verified by running both scripts against a fork-shaped fixture and an
+upstream-shaped one, where the latter logs 15 skips and exits 0.
+
+What it covers:
 
 - **Free text written by people** — `proposal_proposal.project_summary`,
-  `.allocation_comment`, `proposal_review.summary_public_comment`,
-  `.summary_private_comment` and the nine `comment_*` columns,
-  `proposal_reviewcomment.message`. These go in the stage-5 filler list, which
-  replaces prose with same-length filler rather than trying to rewrite names
-  out of it.
-- **`proposal_proposal.notes`** is a JSONB column and will be walked by the
-  stage-7b JSON sweep, but the sweep scrubs emails rather than prose: the notes
-  need explicit treatment.
-- **Documents are blanked.** `sanitise.blank('proposal_calldocument', 'file')`
-  and the same for `proposal_proposaldocumentation`, which empty the path
-  columns; `media_file.content` is already blanked by the existing script. The
-  sanitised copy therefore has document *rows* with no document behind them,
-  which is the right trade — it exercises the listing and the permission rules
-  without carrying 3,425 real uploads around.
+  `.description`, `.allocation_comment`, all eleven `proposal_review` comment
+  columns, `proposal_reviewcomment.message` and
+  `proposal_proposalresourceadjustment.comment`. These go in the stage-5 filler
+  list, which replaces prose with same-length filler rather than trying to
+  rewrite names out of it. This is the most sensitive text in any Waldur
+  database: unpublished research plans, and candid assessments of them written
+  by named reviewers.
+- **`proposal_proposal.notes`** is a JSONB list of `{timestamp, author, text}`
+  — the same shape as OpenPortal's remote-project notes — so it gets the same
+  bespoke treatment: the timestamps and the number of notes survive so the
+  audit trail still looks like one, the author is mapped through the name map,
+  and the text is filled. The stage-7b sweep would have rewritten addresses
+  inside it and left the prose.
+- **Documents are blanked.** `media_file.content` and `media_file.name` are
+  already emptied by the existing script, so what is left is the path column,
+  which applicants write their own names into ("Jane-Smith-CV.pdf"). The rows
+  stay, so the listings and the media access rules are still exercised;
+  only the path goes.
 - **Names and emails** are handled by the existing identity map and the
   stage-7b sweep, as long as the script is run against this database with those
   stages intact.
+- **Titles are deliberately kept.** `proposal_proposal.name` is the project
+  title, and the sanitiser already keeps `structure_project.name`; filling one
+  and not the other would be inconsistent without being safer, since the
+  project is created from the proposal. One line in the stage-5 list changes
+  that if you disagree.
+
+`scripts/sanitise_verify.sql` gained nine matching checks, which assert on
+shape rather than on a list: a prose column fails unless its value is exactly
+what `filler()` would have written for its length, so **a column the sanitiser
+does not know about fails the run** rather than passing silently. Each was
+tested by introducing a leak of its own and confirming it turns red. The
+checks are split where the two schemas differ — upstream's `Review` lacks
+`comment_project_is_confidential` and `comment_project_has_civilian_purpose`,
+and a check skips entirely when one of its columns is absent, so keeping them
+together would have quietly stopped verifying the other nine on the portal.
 
 Two lessons from the portal's sanitiser apply directly and are worth
 re-reading before writing this one: anything blanked because it is a
