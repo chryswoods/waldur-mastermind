@@ -821,18 +821,19 @@ this window has to treat the database, not the model graph, as the authority.
 
 ### 9.2 Not yet proved
 
-Two things the sanitised copy cannot establish, both of which matter on
-production:
+One thing the sanitised copy cannot establish, and it matters on production:
 
 - **The media rename.** It reported `media paths moved: 0`, because the
   sanitiser blanks document paths. On production it should move roughly 3,425
   rows; if it reports 0 there, every archived document will 403. This is the
   one number to check in the production run.
-- **The 2,468 invitations.** `users_invitation` rows referencing the fork's
-  proposal roles are deleted by the cascade — as Django's own `CASCADE` would
-  have done — and are **not** archived. Harmless if invitations to closed calls
-  are of no interest; if they are, `ArchivedInvitation` has to exist before the
-  production run, not after.
+
+A second was an open question and is now settled. The cascade deletes 2,468
+`users_invitation` rows referencing the fork's proposal roles — as Django's own
+`CASCADE` would have done — and does **not** archive them. Confirmed September
+2026 that this is wanted: the invitations are to calls that are closed, so they
+carry nothing worth keeping. No `ArchivedInvitation` model, and the count in the
+command's output is informational rather than a warning.
 
 ### 9.3 Still to rehearse
 
@@ -848,11 +849,22 @@ anywhere else, including the parts that are easy to skip:
 
 ## 10. Open questions
 
-- **`ProposalResourceAdjustment`** (223 rows): archived as its own model, folded
-  into `ArchivedProposal.payload`, or dropped? Folding is the default.
+Settled during the build, kept here because the reasoning is easy to lose:
+
+- **`ProposalResourceAdjustment`** (223 rows) is folded into
+  `ArchivedProposal.payload["resource_adjustments"]` rather than given a model.
+  `ProposalIDGenerator` is not archived at all — it is a counter for proposals
+  that will never be issued again.
+- **Invitations to the fork's proposal roles** are deleted with the roles, not
+  archived (§9.2).
+
+Still open:
+
 - **Dropping the renamed tables**: after how long, and on whose say-so?
-- **Archived call documents**: upstream serves the live ones publicly. Is
-  anything lost by making the archived ones authenticated-only?
+- **Archived call documents**: upstream serves the live ones publicly. The
+  archive serves them under the §4.2 rule instead. Is anything lost by that?
+  Nobody has asked for them to be public, so it stays as it is until someone
+  does.
 - **Retention**: is there a point at which archived proposals should be deleted
   outright — and does anything (funding body, institutional policy) require
   them to be kept for a set period?
