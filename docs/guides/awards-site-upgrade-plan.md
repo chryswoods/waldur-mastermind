@@ -124,12 +124,14 @@ verified — and dropping is a separate decision that can wait months.
    proposal tables and no proposal history, upstream's `0001_squashed_0074`
    then applies as a single unit against a clean slate, which is the easiest
    case for the squash rather than the hardest.
-5. **Migrate the archive app**, which creates its own tables.
-6. **Run the copy script** against the renamed tables. Re-runnable; verifies
-   counts per model against the source and refuses to report success on a
-   mismatch.
-7. **Move the documents' media rows** to the archive's prefix — see §5.
-8. **Leave the renamed tables in place** until the archive has been exercised
+
+   The archive is not a separate pass afterwards: it is *steps 4–6 of that
+   script*, and it has to be, because the roles it captures are deleted before
+   the replay can run at all (§3.5). The script creates the archive tables,
+   runs the copy, deletes the fork's proposal roles, and only then migrates
+   everything else. All three steps no-op on the portal, so it stays one
+   script for both sites.
+5. **Leave the renamed tables in place** until the archive has been exercised
    in anger. Dropping them is a later, separate change.
 
 Steps 3 and 4 are the only ones inside the maintenance window.
@@ -329,9 +331,31 @@ in §4.1, so it survives the roles it came from. Two of the seven roles are
 custom rather than system (`PROPOSAL.COLEAD`, `Call Reader`), so the role name
 has to be carried as text rather than assumed from an enum.
 
-Only then does the awards path of the reconciliation delete the proposal-scoped
-roles, and only then does the replay have a clean slate in the sense it
-assumes.
+Only then are the proposal-scoped roles deleted, and only then does the replay
+have a clean slate in the sense it assumes.
+
+Both halves are management commands rather than more SQL, because both need the
+live tables the ORM already knows — `structure_customer`, `core_user`,
+`marketplace_offering` — alongside the renamed ones:
+
+```bash
+waldur archive_old_proposals          # copies everything, memberships included
+waldur delete_old_proposal_roles      # refuses until the above has run
+```
+
+`delete_old_proposal_roles` **will not run while the archive is empty**. It
+counts what it is about to cascade away, counts what has been captured, and
+stops rather than making an irreversible deletion on the strength of a copy
+that may have copied nothing. `--force` exists for a site that genuinely never
+had any assignments; `--dry-run` prints the roles and the assignment counts and
+touches nothing.
+
+`resync_migrate.sh` runs both, between the openportal fakes and the main
+`migrate`. It skips them where there is nothing to archive — which is the
+portal — and skips them again once the proposal app *is* migrated, because from
+that point on the roles in `permissions_role` are upstream's, and deleting
+those on a careless re-run would take the new site's own assignments with
+them.
 
 ## 4. The archive app
 
@@ -345,12 +369,26 @@ flattened:
 | `ArchivedProposal` | `Proposal` | the fork's `notes`, `submitted_at`, `allocation_comment` all preserved |
 | `ArchivedRequestedResource` | `RequestedResource`, `RequestedOffering`, `CallResourceTemplate` | offering and plan denormalised to uuid + name |
 | `ArchivedReview` | `Review`, `ReviewComment` | staff-only, see §4.2 |
-| `ArchivedDocument` | `CallDocument`, `ProposalDocumentation` | one model, `kind` discriminates |
+| `ArchivedCallDocument` | `CallDocument` | |
+| `ArchivedProposalDocument` | `ProposalDocumentation` | |
 | `ArchivedMembership` | `permissions.UserRole` scoped to a call or proposal | who held which role, and when — see §3.5 |
 
-`ProposalIDGenerator` (2 rows, a counter) and `ProposalResourceAdjustment` (223
-rows) are judgement calls — the generator is certainly not worth archiving; the
-adjustments probably are, folded into `ArchivedProposal.payload`.
+Documents ended up as two models rather than the one with a `kind` column this
+section first proposed. A `FileField` has a single `upload_to`, and §5 needs the
+two kinds on *different* prefixes so their access rules can differ; one model
+would have meant a callable `upload_to`, which `access.upload_prefix()`
+explicitly refuses to derive a prefix from.
+
+`ProposalIDGenerator` (2 rows, a counter) is not archived: it is a counter for
+proposals that will never be issued again. `ProposalResourceAdjustment` (223
+rows) is, folded into `ArchivedProposal.payload["resource_adjustments"]`.
+
+The app's migration has **`dependencies = []`**. That is not an accident of
+having no foreign keys — it is the requirement that lets `migrate
+proposal_archive` run on the awards site while the proposal app is absent from
+the history and upstream's squash has not yet replayed. A dependency on
+`structure` or `permissions` would have been harmless; one on `proposal` would
+have made the archive unbuildable at the only moment it can be built.
 
 ### 4.1 No foreign keys to live data
 
