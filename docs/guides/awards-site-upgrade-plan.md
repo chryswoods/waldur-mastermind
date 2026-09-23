@@ -343,6 +343,22 @@ waldur archive_old_proposals          # copies everything, memberships included
 waldur delete_old_proposal_roles      # refuses until the above has run
 ```
 
+`delete_old_proposal_roles` detaches the roles' references in **SQL rather than
+through the ORM**, which is not a style choice. `queryset.delete()` makes
+Django's collector query every model with a foreign key to `Role`, and this
+command runs on a database part-way through the resync: the proposal app's own
+tables have been renamed to `old_proposal_*`, and apps whose migrations have not
+been applied yet have no tables at all. The first production run died on
+
+```
+relation "waldur_sram_sramprojectrule" does not exist
+```
+
+having deleted nothing, and `proposal_proposalprojectrolemapping` would have
+been next. So the model graph decides the policy — `CASCADE` or `SET_NULL`,
+exactly what Django would have done — while PostgreSQL's catalog decides which
+tables are really there.
+
 `delete_old_proposal_roles` **will not run while the archive is empty**. It
 counts what it is about to cascade away, counts what has been captured, and
 stops rather than making an irreversible deletion on the strength of a copy

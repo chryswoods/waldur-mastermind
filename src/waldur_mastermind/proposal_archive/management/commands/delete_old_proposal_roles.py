@@ -13,7 +13,8 @@ refuses to run until ``archive_old_proposals`` has captured them.
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.management.base import BaseCommand, CommandError
-from django.db import transaction
+from django.db import connection, transaction
+from django.db.models import SET_NULL
 
 from waldur_core.permissions import models as permission_models
 from waldur_mastermind.proposal_archive import models
@@ -74,14 +75,64 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING("\nDry run: nothing deleted."))
             return
 
+        role_ids = list(roles.values_list("id", flat=True))
         with transaction.atomic():
-            assignments.delete()
-            deleted, _ = roles.delete()
+            self.clear_references(role_ids)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM permissions_role WHERE id = ANY(%s)", [role_ids]
+                )
+                deleted = cursor.rowcount
         # The manager caches roles by name; a stale entry would hand the replay
         # a deleted row.
         permission_models.Role.objects.clear_cache()
-        self.stdout.write(
-            self.style.SUCCESS(
-                f"\nDeleted {total} assignments and {deleted} role records."
-            )
-        )
+        self.stdout.write(self.style.SUCCESS(f"\nDeleted {deleted} roles."))
+
+    def clear_references(self, role_ids):
+        """Detach everything pointing at these roles, in SQL rather than the ORM.
+
+        ``queryset.delete()`` cannot be used here. Django's collector walks
+        every model with a foreign key to ``Role`` and queries each one, and
+        this command runs on a database part-way through the resync: the
+        proposal app's own tables have been renamed to ``old_proposal_*``, and
+        apps whose migrations have not been applied yet have no tables at all.
+        The collector hits the first of those and dies with
+
+            relation "waldur_sram_sramprojectrule" does not exist
+
+        having deleted nothing. So the model graph decides the *policy* -- which
+        is exactly what Django would have done, CASCADE or SET_NULL -- while
+        PostgreSQL's own catalog decides which tables are really there.
+        """
+        for relation in permission_models.Role._meta.related_objects:
+            if relation.many_to_many:
+                model = relation.through
+                table = model._meta.db_table
+                column = relation.field.m2m_reverse_name()
+                on_delete = None
+            else:
+                table = relation.related_model._meta.db_table
+                column = relation.field.column
+                on_delete = relation.field.remote_field.on_delete
+
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT to_regclass(%s)", [table])
+                if cursor.fetchone()[0] is None:
+                    self.stdout.write(f"  {table}.{column}: no such table, skipped")
+                    continue
+
+                if on_delete is SET_NULL:
+                    cursor.execute(
+                        f'UPDATE "{table}" SET "{column}" = NULL '
+                        f'WHERE "{column}" = ANY(%s)',
+                        [role_ids],
+                    )
+                    verb = "cleared"
+                else:
+                    cursor.execute(
+                        f'DELETE FROM "{table}" WHERE "{column}" = ANY(%s)',
+                        [role_ids],
+                    )
+                    verb = "deleted"
+                if cursor.rowcount:
+                    self.stdout.write(f"  {table}.{column}: {verb} {cursor.rowcount}")

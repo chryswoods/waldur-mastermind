@@ -9,6 +9,7 @@ refuses to perform.
 from django.contrib.contenttypes.models import ContentType
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.db import connection
 from django.test import TestCase
 
 from waldur_core.permissions import models as permission_models
@@ -78,3 +79,54 @@ class DeleteOldProposalRolesTest(TestCase):
     def test_a_second_run_is_a_no_op(self):
         self.run_command(force=True)
         self.run_command()
+
+
+class MidMigrationDatabaseTest(TestCase):
+    """The command runs on a database part-way through the resync.
+
+    Some tables with a foreign key to Role are not there: the proposal app's own
+    have been renamed to ``old_proposal_*`` by the reconciliation, and apps
+    whose migrations have not been applied yet have none at all. Django's
+    collector queries every one of them and dies on the first that is missing,
+    having deleted nothing -- which is how the first production run failed, on
+    ``waldur_sram_sramprojectrule``.
+    """
+
+    def setUp(self):
+        self.proposal_ct, _ = ContentType.objects.get_or_create(
+            app_label="proposal", model="proposal"
+        )
+        self.role = permission_models.Role.objects.create(
+            name="PROPOSAL.MANAGER", is_system_role=True, content_type=self.proposal_ct
+        )
+        permission_models.UserRole.objects.create(
+            user=structure_factories.UserFactory(),
+            role=self.role,
+            content_type=self.proposal_ct,
+            object_id=1,
+        )
+
+    def test_a_missing_referencing_table_does_not_stop_the_delete(self):
+        # DDL is transactional in PostgreSQL, so the test's own rollback puts
+        # this back.
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TABLE users_invitation CASCADE")
+        call_command("delete_old_proposal_roles", verbosity=0, force=True)
+        self.assertFalse(
+            permission_models.Role.objects.filter(pk=self.role.pk).exists()
+        )
+        self.assertEqual(
+            permission_models.UserRole.objects.filter(role_id=self.role.pk).count(), 0
+        )
+
+    def test_a_set_null_reference_is_cleared_rather_than_deleted(self):
+        clone = permission_models.Role.objects.create(
+            name="PROPOSAL.MANAGER.CLONE",
+            content_type=ContentType.objects.get(
+                app_label="structure", model="customer"
+            ),
+            template=self.role,
+        )
+        call_command("delete_old_proposal_roles", verbosity=0, force=True)
+        clone.refresh_from_db()
+        self.assertIsNone(clone.template_id)
