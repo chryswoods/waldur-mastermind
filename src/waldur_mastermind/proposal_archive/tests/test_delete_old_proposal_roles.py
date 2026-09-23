@@ -6,6 +6,8 @@ reviewed each proposal. So the command's most important behaviour is the one it
 refuses to perform.
 """
 
+from io import StringIO
+
 from django.contrib.contenttypes.models import ContentType
 from django.core.management import call_command
 from django.core.management.base import CommandError
@@ -66,6 +68,15 @@ class DeleteOldProposalRolesTest(TestCase):
         self.run_command(dry_run=True, force=True)
         self.assertTrue(permission_models.Role.objects.filter(pk=self.role.pk).exists())
 
+    def test_dry_run_counts_the_wider_cascade(self):
+        """The assignments are not the whole of it -- invitations go too."""
+        out = StringIO()
+        call_command("delete_old_proposal_roles", dry_run=True, stdout=out)
+        printed = out.getvalue()
+        self.assertIn("permissions_userrole.role_id: would delete 1", printed)
+        self.assertIn("nothing deleted", printed)
+        self.assertTrue(permission_models.Role.objects.filter(pk=self.role.pk).exists())
+
     def test_roles_outside_the_proposal_app_are_left_alone(self):
         customer_ct = ContentType.objects.get(app_label="structure", model="customer")
         survivor = permission_models.Role.objects.create(
@@ -117,6 +128,17 @@ class MidMigrationDatabaseTest(TestCase):
         )
         self.assertEqual(
             permission_models.UserRole.objects.filter(role_id=self.role.pk).count(), 0
+        )
+
+    def test_a_missing_column_does_not_stop_the_delete_either(self):
+        """A table can predate the migration that added its role column."""
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE waldur_autoprovisioning_rule DROP COLUMN customer_role_id"
+            )
+        call_command("delete_old_proposal_roles", verbosity=0, force=True)
+        self.assertFalse(
+            permission_models.Role.objects.filter(pk=self.role.pk).exists()
         )
 
     def test_a_set_null_reference_is_cleared_rather_than_deleted(self):

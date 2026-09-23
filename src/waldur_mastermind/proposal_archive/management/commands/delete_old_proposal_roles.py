@@ -17,7 +17,7 @@ from django.db import connection, transaction
 from django.db.models import SET_NULL
 
 from waldur_core.permissions import models as permission_models
-from waldur_mastermind.proposal_archive import models
+from waldur_mastermind.proposal_archive import models, utils
 
 
 class Command(BaseCommand):
@@ -64,6 +64,17 @@ class Command(BaseCommand):
         self.stdout.write(f"\nAssignments that would be cascaded away: {total}")
         self.stdout.write(f"Memberships already archived:             {archived}")
 
+        role_ids = list(roles.values_list("id", flat=True))
+
+        if options["dry_run"]:
+            # Counted, not guessed: the cascade reaches further than the
+            # assignments -- invitations to these roles go too, and that number
+            # is worth seeing before a production run rather than after.
+            self.stdout.write("\nWhat the delete would touch:")
+            self.clear_references(role_ids, dry_run=True)
+            self.stdout.write(self.style.WARNING("\nDry run: nothing deleted."))
+            return
+
         if total and not archived and not options["force"]:
             raise CommandError(
                 "Refusing to delete: these roles carry assignments and the "
@@ -71,13 +82,15 @@ class Command(BaseCommand):
                 "pass --force if losing them is intended."
             )
 
-        if options["dry_run"]:
-            self.stdout.write(self.style.WARNING("\nDry run: nothing deleted."))
-            return
-
-        role_ids = list(roles.values_list("id", flat=True))
         with transaction.atomic():
+            # The archived tables still hold foreign keys into permissions_role
+            # unless the copy has already cut them loose. Eighteen of them are
+            # NOT NULL, so the delete below fails outright without this.
+            dropped = utils.detach_old_tables()
+            if dropped:
+                self.stdout.write(f"  dropped {dropped} foreign keys on old tables")
             self.clear_references(role_ids)
+            self.check_nothing_still_points_at(role_ids)
             with connection.cursor() as cursor:
                 cursor.execute(
                     "DELETE FROM permissions_role WHERE id = ANY(%s)", [role_ids]
@@ -88,7 +101,7 @@ class Command(BaseCommand):
         permission_models.Role.objects.clear_cache()
         self.stdout.write(self.style.SUCCESS(f"\nDeleted {deleted} roles."))
 
-    def clear_references(self, role_ids):
+    def clear_references(self, role_ids, dry_run=False):
         """Detach everything pointing at these roles, in SQL rather than the ORM.
 
         ``queryset.delete()`` cannot be used here. Django's collector walks
@@ -102,7 +115,15 @@ class Command(BaseCommand):
 
         having deleted nothing. So the model graph decides the *policy* -- which
         is exactly what Django would have done, CASCADE or SET_NULL -- while
-        PostgreSQL's own catalog decides which tables are really there.
+        PostgreSQL's own catalog decides what is really there.
+
+        The table existing is not enough: a table can predate the migration that
+        added its role column, which is how the second attempt failed --
+
+            column "customer_role_id" does not exist
+
+        on a ``waldur_autoprovisioning_rule`` that was there but older. Both are
+        checked.
         """
         for relation in permission_models.Role._meta.related_objects:
             if relation.many_to_many:
@@ -120,19 +141,63 @@ class Command(BaseCommand):
                 if cursor.fetchone()[0] is None:
                     self.stdout.write(f"  {table}.{column}: no such table, skipped")
                     continue
+                cursor.execute(
+                    """
+                    SELECT 1 FROM pg_attribute
+                    WHERE attrelid = to_regclass(%s) AND attname = %s
+                      AND attnum > 0 AND NOT attisdropped
+                    """,
+                    [table, column],
+                )
+                if cursor.fetchone() is None:
+                    self.stdout.write(f"  {table}.{column}: no such column, skipped")
+                    continue
 
-                if on_delete is SET_NULL:
+                clears = on_delete is SET_NULL
+                if dry_run:
+                    cursor.execute(
+                        f'SELECT count(*) FROM "{table}" WHERE "{column}" = ANY(%s)',
+                        [role_ids],
+                    )
+                    affected = cursor.fetchone()[0]
+                    verb = "would clear" if clears else "would delete"
+                elif clears:
                     cursor.execute(
                         f'UPDATE "{table}" SET "{column}" = NULL '
                         f'WHERE "{column}" = ANY(%s)',
                         [role_ids],
                     )
-                    verb = "cleared"
+                    affected, verb = cursor.rowcount, "cleared"
                 else:
                     cursor.execute(
                         f'DELETE FROM "{table}" WHERE "{column}" = ANY(%s)',
                         [role_ids],
                     )
-                    verb = "deleted"
-                if cursor.rowcount:
-                    self.stdout.write(f"  {table}.{column}: {verb} {cursor.rowcount}")
+                    affected, verb = cursor.rowcount, "deleted"
+                if affected:
+                    self.stdout.write(f"  {table}.{column}: {verb} {affected}")
+
+    def check_nothing_still_points_at(self, role_ids):
+        """Fail with an explanation rather than a raw constraint violation.
+
+        ``clear_references`` works from Django's model graph, which cannot see a
+        table left behind by an app this deployment no longer installs. Asking
+        PostgreSQL directly is the only way to know, and a named table beats
+        ``ForeignKeyViolation`` on a constraint nobody recognises.
+        """
+        blockers = []
+        for table, column in utils.unmanaged_references("permissions_role"):
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f'SELECT count(*) FROM "{table}" WHERE "{column}" = ANY(%s)',
+                    [role_ids],
+                )
+                count = cursor.fetchone()[0]
+            if count:
+                blockers.append(f"{table}.{column} ({count} rows)")
+        if blockers:
+            raise CommandError(
+                "Rows still reference these roles, so deleting them would "
+                "violate a foreign key: " + ", ".join(blockers) + ". Nothing "
+                "has been deleted."
+            )

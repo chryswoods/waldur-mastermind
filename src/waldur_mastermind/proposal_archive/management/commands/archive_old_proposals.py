@@ -19,7 +19,7 @@ import uuid as uuid_module
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection, transaction
 
-from waldur_mastermind.proposal_archive import models
+from waldur_mastermind.proposal_archive import models, utils
 
 CALL_DOCUMENT_PREFIX = "call_documents/"
 PROPOSAL_DOCUMENT_PREFIX = "proposal_project_supporting_documentation/"
@@ -149,6 +149,9 @@ class Command(BaseCommand):
                 self.copy_memberships(calls, proposals)
                 if not options["skip_media"]:
                     self.move_media_paths()
+                self.report(
+                    "foreign keys dropped from old tables", utils.detach_old_tables()
+                )
                 if self.dry_run:
                     raise _Rollback
         except _Rollback:

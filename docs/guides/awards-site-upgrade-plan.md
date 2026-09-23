@@ -359,6 +359,38 @@ been next. So the model graph decides the policy — `CASCADE` or `SET_NULL`,
 exactly what Django would have done — while PostgreSQL's catalog decides which
 tables are really there.
 
+The table existing is not enough either: a table can predate the migration that
+added its role column, which is how the second attempt failed —
+`column "customer_role_id" does not exist` on a `waldur_autoprovisioning_rule`
+that was there but older. Both are checked, and a relation whose table or
+column is absent is reported and skipped, which is always correct: a reference
+cannot exist in a column that does not.
+
+### 3.6 Renaming the tables aside did not detach them
+
+`ALTER TABLE ... RENAME` preserves constraints. So after the reconciliation the
+`old_proposal_*` tables still hold live foreign keys — into `permissions_role`,
+`core_user`, `structure_customer`, `marketplace_offering`, and each other.
+
+`old_proposal_proposalprojectrolemapping.proposal_role_id` is `NOT NULL` and
+points at the fork's proposal roles for eighteen rows, so the role deletion
+fails on a foreign-key violation until it is gone. But the wider problem
+outlasts the upgrade: every one of those constraints is a trap set for some
+future deletion. A customer removed years from now would either be blocked by
+an archived proposal or cascade into what is supposed to be an immutable
+record — which is precisely what §4.1 was written to prevent, undone by the
+tables the archive was copied *from*.
+
+So `archive_old_proposals` drops every foreign key on an `old_proposal_*` table
+once the copy is done, and `delete_old_proposal_roles` does the same before it
+deletes, in case it is run alone. Idempotent, and the rows are untouched.
+
+One PostgreSQL detail: dropping a foreign key locks the *referenced* table too,
+and PostgreSQL refuses to `ALTER` a table with pending trigger events. A
+transaction that writes to `permissions_role` and then detaches a table
+referencing it dies with `ObjectInUse`, so the detach issues
+`SET CONSTRAINTS ALL IMMEDIATE` first to flush the queue.
+
 `delete_old_proposal_roles` **will not run while the archive is empty**. It
 counts what it is about to cascade away, counts what has been captured, and
 stops rather than making an irreversible deletion on the strength of a copy
