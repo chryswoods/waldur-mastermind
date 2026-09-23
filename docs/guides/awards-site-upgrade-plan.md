@@ -490,6 +490,44 @@ This is the one place a read-only archive still needs real access control, and
 it is why §4.1's denormalised `created_by_uuid` and the call's organisation
 uuid have to be captured during the copy rather than inferred later.
 
+### 4.3 The endpoints
+
+| Route | Holds |
+|---|---|
+| `proposal-archive-calls` | calls; detail adds rounds, documents, proposal count |
+| `proposal-archive-rounds` | rounds |
+| `proposal-archive-proposals` | proposals; detail adds resources, documents, memberships |
+| `proposal-archive-reviews` | reviews — the narrow audience of §4.2 |
+| `proposal-archive-memberships` | who held which role |
+| `proposal-archive-resolve` | an original uuid → what the archive now holds |
+
+Access is by **queryset filter rather than `permission_factory`**: there are no
+actions to authorise, only rows to hide, and the rules are per-row. Each
+viewset narrows through the matching function in `permissions.py` — the same
+functions `media_access.py` uses, so a document can never be downloadable by
+someone who cannot see the record it hangs off.
+
+Two decisions worth recording:
+
+- **`notes` are not a field on the proposal.** The applicant can read their own
+  proposal; `notes` were only ever visible to call managers and staff. They get
+  a separate action behind the review-level check, so the wider proposal
+  audience cannot pick them up by accident.
+- **`resolve` answers 404 for "you may not see it"** as well as for "unknown".
+  Distinguishing them would make it an existence oracle for confidential
+  proposals, which is a poor trade for a marginally better error message.
+
+`ArchivedMembership` gets a top-level endpoint rather than only a nested field,
+because the question actually asked of it — "what did this person have access
+to?" — is a query across proposals, not within one.
+
+One schema requirement to know about: every UUID query parameter must declare
+which endpoint its value refers to, via `core_filters.RelatedUUIDFilter`, or
+`spectacular --validate` fails. Note what that declaration does *not* claim:
+`created_by_uuid` really is a user uuid, so `user-detail` is the right kind,
+but the archive still makes no promise the user exists. Naming the kind costs
+nothing; resolving it is the caller's problem, by design.
+
 ## 5. Documents, and a collision to avoid
 
 Uploaded files in Waldur live **in the database** — `media_file.content` is a

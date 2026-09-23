@@ -64,6 +64,22 @@ def filter_rounds(queryset, user):
     return queryset.filter(call__customer_uuid__in=visible_customer_uuids(user))
 
 
+def filter_reviews_scope(queryset, user):
+    """Narrow a queryset of *proposals* to the review audience.
+
+    Reviews and call-manager notes are visible to a narrower set of people than
+    the proposal they belong to: the applicant can read their own proposal but
+    must not read what was said about it. Both endpoints share this so the two
+    cannot drift apart -- the filter is on ``call__customer_uuid``, so it works
+    for any model that reaches a call that way.
+    """
+    if not user.is_authenticated:
+        return queryset.none()
+    if is_administrator(user):
+        return queryset
+    return queryset.filter(call__customer_uuid__in=visible_customer_uuids(user))
+
+
 def filter_reviews(queryset, user):
     """Administrators and call managers only -- never the applicant."""
     if not user.is_authenticated:
