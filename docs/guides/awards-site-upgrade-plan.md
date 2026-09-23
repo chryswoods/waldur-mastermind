@@ -114,10 +114,9 @@ verified — and dropping is a separate decision that can wait months.
 1. **Close all open calls** and let any in-flight work settle.
 2. **Take a dump.** This is the archive's backstop: every later step is
    recoverable from it.
-3. **Rename** all 16 `proposal_*` tables to `old_proposal_*`, and **delete
-   every `proposal` row** from `django_migrations` — all 56, not just the
-   fork's `0047`–`0054`. Both are `scripts/awards_reconcile_db.sql`, in one
-   transaction; see §3.1.
+3. **Reconcile the database**: `scripts/resync_preflight_check.sql` first,
+   then `scripts/resync_reconcile_db.sql`. The same two scripts the portal
+   uses — see §3.1 for what they do differently here.
 4. **Deploy the new code and migrate.** With no tables and no history,
    upstream's `0001_squashed_0074` applies as a single unit against a clean
    slate. This is the easiest case for the squash, not the hardest.
@@ -133,30 +132,64 @@ Steps 3 and 4 are the only ones inside the maintenance window.
 
 ### 3.1 The reconciliation script
 
-`scripts/awards_reconcile_db.sql` does the rename and the history delete in one
-transaction. Three things in it are worth knowing.
+**One script for both sites.** `scripts/resync_reconcile_db.sql` is the
+portal's script and the awards site's; §2 picks its path from the data rather
+than from a flag, so there is nothing to keep in step and nothing to point at
+the wrong database:
 
-**It refuses to run on the wrong database.** The fork's proposal app has
-columns upstream's does not, so the script requires `proposal_proposal.notes`
-and `proposal_round.fixed_review_end_date` to be present and stops otherwise,
-naming `resync_reconcile_db.sql` as the portal's script instead. It also stops
-if `old_proposal_*` tables already exist, rather than burying a first archive
-under a second rename.
+| `proposal_proposal` | Path |
+|---|---|
+| absent, or `old_proposal_*` already present | nothing to do |
+| present, 0 rows (the portal) | undo the local `0047`–`0054` series in place; upstream's replays over the same tables |
+| present, with rows (the awards site) | rename the whole app aside to `old_proposal_*` and delete the entire proposal history |
 
-**It renames the indexes, constraints and sequences too.** This is the part
-that is easy to miss and expensive to find: index and sequence names are unique
-per schema, so `proposal_call_pkey` and `proposal_call_id_seq` left attached to
-the renamed table collide with the `CREATE TABLE` that upstream's migrations run
-next — and the failure reads as "relation already exists" with nothing to
-connect it to the rename. Verified by recreating the original tables afterwards
-and watching them succeed.
+A proposal table carrying rows is never stripped of its columns, which is the
+property that matters: the portal's reset would have destroyed exactly the data
+this plan exists to preserve. All four paths are tested, including re-running
+each.
+
+The awards path has three details worth knowing.
+
+**It renames the indexes, constraints and sequences too.** Easy to miss and
+expensive to find: index and sequence names are unique per schema, so
+`proposal_call_pkey` and `proposal_call_id_seq` left attached to the renamed
+table collide with the `CREATE TABLE` that upstream's migrations run next — and
+the failure reads as "relation already exists" with nothing to connect it to the
+rename. Verified by recreating the original tables afterwards.
 
 **It handles PostgreSQL's 63-byte identifier limit.** Several of Django's
 generated constraint names are already at it, so `old_` + name would be
 silently truncated, and two long names differing only at the end would truncate
-onto each other. Past 59 characters the script keeps a readable prefix and
-makes it unique with a hash:
-`old_proposal_proposalprojectrolemapping_call_id_pr_412a0ecc`.
+onto each other. Past 59 characters the script keeps a readable prefix and adds
+a hash: `old_proposal_proposalprojectrolemapping_call_id_pr_412a0ecc`.
+
+**It deletes the whole proposal history, not just the fork's `0047`–`0054`.**
+The awards site's history is not linear (§1.1), and with the tables renamed
+there is nothing left for any of it to describe.
+
+### 3.2 The rest of the reconciliation applies here too
+
+The awards site was deployed from the same fork, so everything else in
+`resync_reconcile_db.sql` applies unchanged: the `waldur_openportal`
+`0034`–`0043` bookkeeping (§1), the vestigial `core.User.unix_username` and
+`structure.Project.short_name` columns (§3), and the broadcast attachment table
+(§4). The pre-flight run of September 2026 confirms it — `10 of 10` local
+openportal rows and `7 of 7` core/structure rows to delete.
+
+**The `short_name` gate fails here where it passed on the portal.** The
+pre-flight reported `projects_losing_short_name: FAIL 21`: of 1,079 projects
+with a `short_name`, 1,058 have it preserved as a `ProjectInfo.shortname` and
+none via the slug, leaving 21 whose value would be destroyed by the §3 drop.
+That must be resolved before reconciling — the column is not recoverable
+afterwards. `users_losing_unix_username` passes trivially: this site never used
+the field at all (`users_with_unix_username: 0`).
+
+The pre-flight itself now survives being run after the rename: its proposal
+section counts through dynamic SQL and reads the `old_proposal_*` tables when
+they are there, reporting `PASS | N archived`. Before that it named the tables
+directly, and a missing relation failed at parse time — which aborted the
+read-only transaction and took every later check with it, including the gate
+above.
 
 ## 4. The archive app
 
