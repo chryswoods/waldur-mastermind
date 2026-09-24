@@ -11,6 +11,7 @@ from rest_framework import status, test
 
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
+from waldur_mastermind.proposal_archive import models
 
 from . import factories
 
@@ -167,6 +168,60 @@ class ArchiveAccessTest(test.APITransactionTestCase):
         self.assertEqual(
             self.listed(self.stranger, "proposal-archive-membership"), set()
         )
+
+
+class DocumentWithoutAFileTest(test.APITransactionTestCase):
+    """A document row whose file never arrived must still serialize.
+
+    Every document on a sanitised copy has a blank path, and in production any
+    row whose file was removed behaves the same. ``FieldFile.size`` raises on
+    an empty file, and DRF does not catch it, so one such row 500s the whole
+    response. The archive is a record of what was there; a row without bytes
+    is still part of it.
+    """
+
+    def setUp(self):
+        self.staff = structure_factories.UserFactory(is_staff=True)
+        self.call = factories.ArchivedCallFactory()
+        self.proposal = factories.ArchivedProposalFactory(
+            round=factories.ArchivedRoundFactory(call=self.call), call=self.call
+        )
+        models.ArchivedCallDocument.objects.create(
+            call=self.call, description="terms", file=""
+        )
+        models.ArchivedProposalDocument.objects.create(proposal=self.proposal, file="")
+        self.client.force_authenticate(self.staff)
+
+    def test_a_call_detail_renders_with_a_fileless_document(self):
+        response = self.client.get(url_for("proposal-archive-call", self.call))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        document = response.data["documents"][0]
+        self.assertIsNone(document["file_name"])
+        self.assertIsNone(document["file_size"])
+        self.assertEqual(document["description"], "terms")
+
+    def test_a_proposal_detail_renders_with_a_fileless_document(self):
+        response = self.client.get(url_for("proposal-archive-proposal", self.proposal))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.data["documents"][0]["file_size"])
+
+    def test_a_document_whose_stored_file_has_gone_still_serializes(self):
+        """The path is recorded but no bytes are behind it.
+
+        DatabaseStorage answers 0 rather than raising here, so this is not the
+        crash the empty-path case is -- but it is the other half of the same
+        question, and worth pinning: the row renders, with the path it has.
+        """
+        document = models.ArchivedCallDocument.objects.create(
+            call=self.call, file="archived_call_documents/vanished.pdf"
+        )
+        response = self.client.get(url_for("proposal-archive-call", self.call))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        rendered = next(
+            d for d in response.data["documents"] if d["uuid"] == document.uuid.hex
+        )
+        self.assertEqual(rendered["file_name"], "archived_call_documents/vanished.pdf")
+        self.assertEqual(rendered["file_size"], 0)
 
 
 class ResolveTest(test.APITransactionTestCase):

@@ -12,9 +12,14 @@ Reviews are a separate serializer rather than a nested field on the proposal:
 nested field would have to re-apply that check on every parent.
 """
 
+import logging
+
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from . import models
+
+logger = logging.getLogger(__name__)
 
 
 class ArchivedDocumentSerializer(serializers.ModelSerializer):
@@ -22,13 +27,47 @@ class ArchivedDocumentSerializer(serializers.ModelSerializer):
 
     ``file`` is the storage path; the bytes are served by ``/api/media/<uuid>/``
     under the rules in ``media_access.py``.
+
+    Both derived fields are methods rather than ``source="file.name"`` /
+    ``source="file.size"``, because an archived document may legitimately have
+    no file. ``FieldFile.size`` calls ``_require_file()`` and raises
+
+        ValueError: The 'file' attribute has no file associated with it.
+
+    which DRF does not catch -- so one document with a blank path 500s the
+    whole response rather than rendering as a row without a download. The
+    archive is a record of what was there; a document row whose bytes never
+    made it, or were removed, is still part of that record and has to
+    serialize.
     """
 
-    file_name = serializers.CharField(source="file.name", read_only=True)
-    file_size = serializers.IntegerField(source="file.size", read_only=True)
+    file_name = serializers.SerializerMethodField()
+    file_size = serializers.SerializerMethodField()
 
     class Meta:
         fields = ["uuid", "file", "file_name", "file_size", "created"]
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_file_name(self, document):
+        return document.file.name or None
+
+    @extend_schema_field(serializers.IntegerField(allow_null=True))
+    def get_file_size(self, document):
+        if not document.file:
+            return None
+        try:
+            return document.file.size
+        except (OSError, ValueError):
+            # DatabaseStorage answers 0 for a path with no bytes behind it
+            # rather than raising, so this is defence for storages that do
+            # raise -- not the empty-path case above, which is the one that
+            # actually bites.
+            logger.warning(
+                "Archived document %s points at missing storage: %s",
+                document.uuid,
+                document.file.name,
+            )
+            return None
 
 
 class ArchivedCallDocumentSerializer(ArchivedDocumentSerializer):
