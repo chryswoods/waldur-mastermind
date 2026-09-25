@@ -3465,6 +3465,14 @@ class RemoteProjectAttachment(models.Model):
 
     The open attachment (detached_at=None) always matches
     RemoteProject.current_project.
+
+    Also records the key the award's usage was filed under while attached.
+    That key is the local project identifier - "{shortname}.{portal}" - so it
+    belongs to the *project*, not the award: move an award from X to Y and its
+    usage from then on is fetched and cached under Y's identifier. One award's
+    history is therefore spread across one key per project it has been
+    attached to, and only the attachment knows which key covers which days.
+    See utils.get_remote_project_windows().
     """
 
     remote_project = models.ForeignKey(
@@ -3482,8 +3490,13 @@ class RemoteProjectAttachment(models.Model):
         verbose_name=_("project"),
     )
 
+    # A plain default rather than auto_now_add, so that reconstructed rows can
+    # be backdated to when the award was really attached - as
+    # ManagedProjectAttachment does. With auto_now_add every reconstructed
+    # attachment would claim to start today, and clipping usage to it would
+    # throw away the award's entire history.
     attached_at = models.DateTimeField(
-        auto_now_add=True,
+        default=timezone.now,
         verbose_name=_("attached at"),
     )
 
@@ -3492,6 +3505,18 @@ class RemoteProjectAttachment(models.Model):
         null=True,
         verbose_name=_("detached at"),
         help_text=_("Null while this is the current attachment."),
+    )
+
+    project_identifier = models.CharField(
+        max_length=MAX_PROJECTIDENTIFIER_LENGTH,
+        blank=True,
+        null=True,
+        verbose_name=_("project identifier"),
+        help_text=_(
+            "The local project identifier ({shortname}.{portal}) that this "
+            "award's usage was fetched and cached under while attached. Null "
+            "until recorded or backfilled."
+        ),
     )
 
     note = models.TextField(

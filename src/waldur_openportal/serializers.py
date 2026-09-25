@@ -1082,6 +1082,55 @@ class SetLinksSerializer(rf_serializers.Serializer):
         return value
 
 
+class RemoteProjectUsageWindowSerializer(rf_serializers.Serializer):
+    """One period the award was attached to a project, and where its usage lives."""
+
+    project_uuid = rf_serializers.UUIDField(format="hex", allow_null=True)
+    project_name = rf_serializers.CharField(allow_null=True)
+    start = rf_serializers.DateField()
+    end = rf_serializers.DateField(
+        allow_null=True, help_text="Inclusive. Null while still attached."
+    )
+    project_identifier = rf_serializers.CharField(
+        allow_null=True,
+        help_text="The key this window's usage is cached under.",
+    )
+
+
+class RemoteProjectUsageReportQuerySerializer(rf_serializers.Serializer):
+    start = rf_serializers.DateField(
+        required=False,
+        help_text="First day to include. Defaults to when the award was first attached.",
+    )
+    end = rf_serializers.DateField(
+        required=False, help_text="Last day to include. Defaults to today."
+    )
+
+    def validate(self, attrs):
+        start, end = attrs.get("start"), attrs.get("end")
+        if start and end and start > end:
+            raise rf_serializers.ValidationError("start must not be after end.")
+        return attrs
+
+
+class RemoteProjectUsageReportSerializer(rf_serializers.Serializer):
+    """An award's usage, across every project it has been attached to.
+
+    Each window's usage is read from the key it was cached under and filtered
+    to exactly that window's days, so a day is never counted twice: on a day
+    the award moved, the project it moved to claims the whole day.
+    """
+
+    start = rf_serializers.DateField(allow_null=True)
+    end = rf_serializers.DateField(allow_null=True)
+    total_hours = rf_serializers.FloatField()
+    report = rf_serializers.JSONField(
+        allow_null=True,
+        help_text="The combined OpenPortal ProjectUsageReport, as JSON.",
+    )
+    windows = RemoteProjectUsageWindowSerializer(many=True)
+
+
 class RemoteProjectSerializer(rf_serializers.ModelSerializer):
     """
     Serializer for RemoteProject.
