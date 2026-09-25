@@ -6,7 +6,7 @@ import logging
 import re
 from typing import NamedTuple
 
-from constance import config
+from constance import config as constance_config
 from django.utils import timezone
 
 from waldur_core.core import models as core_models
@@ -27,7 +27,7 @@ from waldur_core.users.utils import get_invitation_duplicates
 from waldur_mastermind.invoices import ledger as invoice_ledger
 from waldur_mastermind.invoices import models as invoice_models
 
-from . import exceptions, models, utils
+from . import config, exceptions, models, utils
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ def get_openportal_robot():
             ),
             "first_name": "OpenPortal",
             "last_name": "Robot",
-            "email": config.SITE_EMAIL,
+            "email": constance_config.SITE_EMAIL,
         },
     )
     if created:

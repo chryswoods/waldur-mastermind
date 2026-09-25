@@ -18,6 +18,7 @@ from rest_framework import status, test
 
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
+from waldur_openportal import config as openportal_config
 from waldur_openportal import models, remote_project_service, utils
 
 DEST = "airr.brics.isambard-ai"
@@ -275,15 +276,63 @@ class RecordKeyTest(AwardTestMixin, TestCase):
         )
 
 
+def openportal_configured():
+    """Stub only the boundary: whether OpenPortal is configured, and this
+    portal's name ("awards"). Everything between - get_local_project_identifier
+    and the shortname lookup - runs for real.
+
+    The first version of these tests replaced get_local_project_identifier
+    whole, and so never noticed that the real one could not run: in utils.py,
+    `config` was constance's config rather than waldur_openportal.config, so
+    config.ensure_config_loaded() raised AttributeError on every call.
+    """
+    return (
+        mock.patch("waldur_openportal.config.ensure_config_loaded"),
+        mock.patch("openportal.get_portal", return_value="awards"),
+    )
+
+
+class LocalIdentifierTest(AwardTestMixin, TestCase):
+    """The real get_local_project_identifier, not a stand-in for it."""
+
+    def test_it_is_the_project_shortname_at_this_portal(self):
+        models.ProjectInfo.objects.create(project=self.x, shortname="xshort")
+        loaded, portal = openportal_configured()
+        with loaded as ensure_config_loaded, portal:
+            ensure_config_loaded.return_value = True
+            self.assertEqual(str(utils.get_local_project_identifier(self.x)), X_KEY)
+
+    def test_the_openportal_config_is_the_one_consulted(self):
+        """Not constance's, which raised AttributeError on every call."""
+        self.assertIs(utils.config, openportal_config)
+
+    def test_an_unconfigured_portal_is_reported_not_crashed_on(self):
+        models.ProjectInfo.objects.create(project=self.x, shortname="xshort")
+        loaded, _portal = openportal_configured()
+        with loaded as ensure_config_loaded:
+            ensure_config_loaded.return_value = False
+            with self.assertRaises(RuntimeError):
+                utils.get_local_project_identifier(self.x)
+
+    def test_refresh_remote_project_gets_past_the_config_check(self):
+        """It shared the bug: every award in the periodic refresh sweep
+        failed here, and the sweep gave up after 25 of them."""
+        loaded, _portal = openportal_configured()
+        with loaded as ensure_config_loaded:
+            ensure_config_loaded.return_value = False
+            self.assertIsNone(utils.refresh_remote_project(self.award))
+
+
 class BackfillTest(RecordKeyTest):
+    def setUp(self):
+        super().setUp()
+        models.ProjectInfo.objects.create(project=self.x, shortname="xshort")
+        models.ProjectInfo.objects.create(project=self.y, shortname="yshort")
+
     def backfill(self, **kwargs):
-        with mock.patch.object(
-            utils,
-            "get_local_project_identifier",
-            side_effect=lambda project: {self.x.pk: X_KEY, self.y.pk: Y_KEY}[
-                project.pk
-            ],
-        ):
+        loaded, portal = openportal_configured()
+        with loaded as ensure_config_loaded, portal:
+            ensure_config_loaded.return_value = True
             return utils.backfill_remote_project_attachments(**kwargs)
 
     def test_an_award_with_no_attachment_gets_one(self):
