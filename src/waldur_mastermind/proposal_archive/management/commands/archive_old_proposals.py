@@ -44,12 +44,6 @@ def jsonable(value):
     return value
 
 
-def table_exists(name):
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT to_regclass(%s)", [name])
-        return cursor.fetchone()[0] is not None
-
-
 # Django installs a pass-through jsonb loader so that ``JSONField`` can do its
 # own decoding, which means a raw cursor hands back the JSON *text*. Reading
 # these tables without the ORM, we have to decode it ourselves -- otherwise a
@@ -129,7 +123,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         self.dry_run = options["dry_run"]
-        if not table_exists("old_proposal_call"):
+        if not utils.table_exists("old_proposal_call"):
             raise CommandError(
                 "old_proposal_call does not exist. Run "
                 "scripts/resync_reconcile_db.sql first -- it is what renames the "
@@ -334,7 +328,7 @@ class Command(BaseCommand):
         223 rows of "the call manager changed this request before allocating",
         interesting as a record but not worth a model of their own.
         """
-        if not table_exists("old_proposal_proposalresourceadjustment"):
+        if not utils.table_exists("old_proposal_proposalresourceadjustment"):
             return {}
         grouped = {}
         for row in fetch("old_proposal_proposalresourceadjustment"):
@@ -417,7 +411,7 @@ class Command(BaseCommand):
             USER_COLUMNS,
         )
         comments = {}
-        if table_exists("old_proposal_reviewcomment"):
+        if utils.table_exists("old_proposal_reviewcomment"):
             for comment in fetch("old_proposal_reviewcomment"):
                 comments.setdefault(comment.get("review_id"), []).append(
                     jsonable(comment)

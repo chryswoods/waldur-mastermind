@@ -5,6 +5,12 @@ from django.db import connection
 OLD_TABLE_PREFIX = "old_proposal_"
 
 
+def table_exists(name):
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT to_regclass(%s)", [name])
+        return cursor.fetchone()[0] is not None
+
+
 def detach_old_tables():
     """Drop every foreign key still held by the renamed ``old_proposal_*`` tables.
 
