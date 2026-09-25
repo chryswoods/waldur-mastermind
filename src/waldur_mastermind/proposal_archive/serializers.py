@@ -14,6 +14,7 @@ nested field would have to re-apply that check on every parent.
 
 import logging
 
+from django.db import models as django_models
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
@@ -22,7 +23,52 @@ from . import models
 logger = logging.getLogger(__name__)
 
 
-class ArchivedDocumentSerializer(serializers.ModelSerializer):
+class HexUUIDField(serializers.UUIDField):
+    """A UUID rendered as bare hex, the way the rest of the Waldur API spells it.
+
+    Everywhere else, UUIDs come out as ``807149e93cea4859a0aa7a60418c498c``.
+    That is not a serializer setting: ``waldur_core.core.fields.UUIDField``
+    loads a ``StringUUID``, whose ``str()`` is ``.hex``, and DRF renders with
+    ``str()``. The archive's denormalised references are plain
+    ``models.UUIDField``s instead, which load a stdlib ``uuid.UUID`` -- whose
+    ``str()`` is hyphenated. So the archive said
+    ``807149e9-3cea-4859-a0aa-7a60418c498c`` for a value the rest of the API
+    spells without hyphens, and HomePort's comparison of an archived
+    ``project_uuid`` with ``Project.uuid`` silently never matched.
+
+    ``format="hex"`` renders via ``.hex``, which a stdlib ``UUID`` and a
+    ``StringUUID`` both have, so the output no longer depends on which one the
+    field happens to be handed. Parsing is unaffected: DRF accepts either
+    spelling on the way in whatever ``format`` says.
+
+    Fixed here rather than on the models: ``core_fields.UUIDField`` forces
+    ``unique=True`` and a default, both wrong for nullable references, and a
+    different field class would mean a migration on an app whose migrations
+    must keep ``dependencies = []``.
+    """
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("format", "hex")
+        super().__init__(**kwargs)
+
+
+class ArchiveModelSerializer(serializers.ModelSerializer):
+    """Base for every archive serializer.
+
+    Maps ``models.UUIDField`` to ``HexUUIDField`` rather than declaring each
+    field, so a UUID field added to the archive later is covered without anyone
+    having to remember. ``payload`` is a ``JSONField`` and untouched: it holds
+    the original row verbatim by design (§4.1), and whatever spelling of UUIDs
+    it contains is part of the record.
+    """
+
+    serializer_field_mapping = {
+        **serializers.ModelSerializer.serializer_field_mapping,
+        django_models.UUIDField: HexUUIDField,
+    }
+
+
+class ArchivedDocumentSerializer(ArchiveModelSerializer):
     """Shared shape for both kinds of archived document.
 
     ``file`` is the storage path; the bytes are served by ``/api/media/<uuid>/``
@@ -81,8 +127,8 @@ class ArchivedProposalDocumentSerializer(ArchivedDocumentSerializer):
         model = models.ArchivedProposalDocument
 
 
-class ArchivedRoundSerializer(serializers.ModelSerializer):
-    call_uuid = serializers.UUIDField(source="call.uuid", read_only=True)
+class ArchivedRoundSerializer(ArchiveModelSerializer):
+    call_uuid = HexUUIDField(source="call.uuid", read_only=True)
     call_name = serializers.CharField(source="call.name", read_only=True)
 
     class Meta:
@@ -107,7 +153,7 @@ class ArchivedRoundSerializer(serializers.ModelSerializer):
         ]
 
 
-class ArchivedCallSerializer(serializers.ModelSerializer):
+class ArchivedCallSerializer(ArchiveModelSerializer):
     class Meta:
         model = models.ArchivedCall
         fields = [
@@ -143,7 +189,7 @@ class ArchivedCallDetailSerializer(ArchivedCallSerializer):
         ]
 
 
-class ArchivedRequestedResourceSerializer(serializers.ModelSerializer):
+class ArchivedRequestedResourceSerializer(ArchiveModelSerializer):
     class Meta:
         model = models.ArchivedRequestedResource
         fields = [
@@ -161,11 +207,9 @@ class ArchivedRequestedResourceSerializer(serializers.ModelSerializer):
         ]
 
 
-class ArchivedMembershipSerializer(serializers.ModelSerializer):
-    call_uuid = serializers.UUIDField(
-        source="call.uuid", read_only=True, allow_null=True
-    )
-    proposal_uuid = serializers.UUIDField(
+class ArchivedMembershipSerializer(ArchiveModelSerializer):
+    call_uuid = HexUUIDField(source="call.uuid", read_only=True, allow_null=True)
+    proposal_uuid = HexUUIDField(
         source="proposal.uuid", read_only=True, allow_null=True
     )
 
@@ -192,10 +236,10 @@ class ArchivedMembershipSerializer(serializers.ModelSerializer):
         ]
 
 
-class ArchivedProposalSerializer(serializers.ModelSerializer):
-    call_uuid = serializers.UUIDField(source="call.uuid", read_only=True)
+class ArchivedProposalSerializer(ArchiveModelSerializer):
+    call_uuid = HexUUIDField(source="call.uuid", read_only=True)
     call_name = serializers.CharField(source="call.name", read_only=True)
-    round_uuid = serializers.UUIDField(source="round.uuid", read_only=True)
+    round_uuid = HexUUIDField(source="round.uuid", read_only=True)
 
     class Meta:
         model = models.ArchivedProposal
@@ -241,7 +285,7 @@ class ArchivedProposalDetailSerializer(ArchivedProposalSerializer):
         ]
 
 
-class ArchivedProposalNotesSerializer(serializers.ModelSerializer):
+class ArchivedProposalNotesSerializer(ArchiveModelSerializer):
     """Call-manager notes, kept off the proposal serializer on purpose.
 
     ``notes`` were only ever visible to call managers and staff, so they get
@@ -254,8 +298,8 @@ class ArchivedProposalNotesSerializer(serializers.ModelSerializer):
         fields = ["uuid", "notes"]
 
 
-class ArchivedReviewSerializer(serializers.ModelSerializer):
-    proposal_uuid = serializers.UUIDField(source="proposal.uuid", read_only=True)
+class ArchivedReviewSerializer(ArchiveModelSerializer):
+    proposal_uuid = HexUUIDField(source="proposal.uuid", read_only=True)
     proposal_name = serializers.CharField(source="proposal.name", read_only=True)
 
     class Meta:
@@ -294,5 +338,5 @@ class ArchiveResolveSerializer(serializers.Serializer):
     """
 
     kind = serializers.ChoiceField(choices=["call", "round", "proposal"])
-    uuid = serializers.UUIDField()
+    uuid = HexUUIDField()
     name = serializers.CharField()
