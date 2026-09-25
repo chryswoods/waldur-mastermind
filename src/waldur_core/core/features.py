@@ -155,7 +155,7 @@ class UserSection(FeatureSection):
     )
 
     show_openportal_identifier = Feature(
-        "Show the OpenPortal username on the user profile, and let a user choose it once if it has not been set."
+        "Identify users by their OpenPortal username: show it in place of the username in user lists, show it on the user profile, and let a user choose it once if it has not been set."
     )
 
     allow_user_creation = Feature(
