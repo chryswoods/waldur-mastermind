@@ -392,6 +392,16 @@ class WaldurDeploymentSection(FeatureSection):
     enable_disclaimer_area = Feature("Enable disclaimer area below the footer.")
 
 
+class ProposalSection(FeatureSection):
+    class Meta:
+        key = "proposal"
+        description = "Proposals and calls"
+
+    auto_assign_award_id = Feature(
+        "Give each new proposal an award ID (for example 0261-4064-4676-1) as its slug, and carry it onto the project created when the proposal is accepted. Only takes effect together with application_portal_only, which stops the OpenPortal shortname from overwriting the project slug."
+    )
+
+
 class ResellerSection(FeatureSection):
     class Meta:
         key = "reseller"

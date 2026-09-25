@@ -7,7 +7,7 @@ from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import MinValueValidator
-from django.db import models
+from django.db import models, transaction
 from django.db.models import Q
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -31,7 +31,7 @@ from waldur_mastermind.marketplace.models import (
     SafeAttributesMixin,
     UserAttributeConfigBase,
 )
-from waldur_mastermind.proposal import enums
+from waldur_mastermind.proposal import award_ids, enums
 from waldur_mastermind.proposal.enums import (
     PROPOSAL_CONFIGURABLE_FIELDS,
     AssignmentBatchStatuses,
@@ -915,6 +915,96 @@ class ProposalDocumentation(
     )
 
 
+class ProposalIDGenerator(models.Model):
+    """A counter per year, from which award IDs are issued.
+
+    Only used when ``proposal.auto_assign_award_id`` is effective -- see
+    ``award_ids``. One row per year, so the sequence restarts each January
+    and the year in the ID stays meaningful.
+
+    ``SlugField`` has no unique constraint, so uniqueness of award IDs rests
+    entirely here: an atomic counter, plus ``issue_award_id`` refusing any
+    candidate already in use.
+    """
+
+    year = models.PositiveIntegerField(unique=True)
+    count = models.PositiveIntegerField(
+        default=0,
+        help_text=_("The last sequence number issued for this year."),
+    )
+
+    class Meta:
+        verbose_name = _("Proposal ID generator")
+        ordering = ["-year"]
+
+    def __str__(self):
+        return f"{self.year}: {self.count}"
+
+    @classmethod
+    def next_sequence(cls, year: int) -> int:
+        """Take the next sequence number for ``year``. Atomic.
+
+        The row is locked for the rest of the transaction, so two proposals
+        created at once cannot take the same number. The lock is held until
+        the outermost transaction commits, which serialises proposal creation
+        per year -- acceptable, since it is rare. And if that transaction rolls
+        back, so does the increment, so a number is only consumed by a
+        proposal that actually exists.
+
+        Raises rather than wrapping when the year is exhausted. The fork's
+        original wrapped to zero, which would have quietly re-issued the
+        year's first award IDs -- the one failure this counter exists to
+        prevent. Ten million proposals in a year is not going to happen; if it
+        does, failing is the right answer.
+        """
+        with transaction.atomic():
+            generator, _created = cls.objects.select_for_update().get_or_create(
+                year=year
+            )
+            if generator.count >= award_ids.MAX_SEQUENCE:
+                raise RuntimeError(f"Award IDs for {year} are exhausted.")
+            generator.count = models.F("count") + 1
+            generator.save(update_fields=["count"])
+            generator.refresh_from_db(fields=["count"])
+            return generator.count
+
+    @classmethod
+    def issue_award_id(cls, year: int | None = None) -> str:
+        """Issue the next unused award ID for ``year`` (default: this year).
+
+        The counter alone cannot promise an ID is unused. One that was never
+        seeded from the awards issued before it existed starts at zero, and
+        would hand out IDs that real awards already carry. So each candidate
+        is checked against every proposal and every project, and skipped if
+        taken.
+
+        Skipping is logged, because it means the counter is behind the awards
+        already issued -- worth knowing, and fixing with
+        ``seed_award_id_generator``, rather than papering over indefinitely.
+        """
+        year = year or timezone.now().year
+        for _attempt in range(1000):
+            candidate = award_ids.format_award_id(cls.next_sequence(year), year)
+            # Project.objects rather than available_objects: a soft-deleted
+            # project's award ID was issued, and must never be issued again.
+            taken = (
+                Proposal.objects.filter(slug=candidate).exists()
+                or structure_models.Project.objects.filter(slug=candidate).exists()
+            )
+            if not taken:
+                return candidate
+            logger.warning(
+                "Award ID %s is already in use; the %s counter is behind the "
+                "awards already issued. Skipping it.",
+                candidate,
+                year,
+            )
+        raise RuntimeError(
+            f"No unused award ID for {year} in 1000 attempts: the counter has "
+            "not been seeded. Run seed_award_id_generator."
+        )
+
+
 def filter_proposals(user):
     return (
         Q(created_by=user)
@@ -1124,7 +1214,19 @@ class Proposal(
 
     def save(self, *args, **kwargs):
         if not self.slug:
-            self.slug = self._generate_slug()
+            # An award ID is assigned as-is, never passed through
+            # _generate_slug(): that upper-cases and cleans hyphens, and
+            # nothing may reshape an identifier people will quote. It also
+            # takes precedence over the call's proposal_slug_template, since
+            # it is a deployment-wide policy rather than a per-call choice.
+            #
+            # Only when the slug is empty, so an existing proposal keeps its
+            # slug if the flag is turned on later, and staff can still set
+            # one explicitly.
+            if award_ids.is_enabled():
+                self.slug = ProposalIDGenerator.issue_award_id()
+            else:
+                self.slug = self._generate_slug()
         super().save(*args, **kwargs)
 
     def _generate_slug(self):

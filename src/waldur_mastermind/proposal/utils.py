@@ -18,6 +18,7 @@ from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.enums import OrderStates
+from waldur_mastermind.proposal import award_ids
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal.enums import (
     AllocationTimes,
@@ -338,12 +339,28 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
     today = datetime.date.today()
     end_date = project_end_date(proposal, start_date or today)
 
-    project = structure_models.Project.objects.create(
+    project_fields = dict(
         customer=proposal_round.call.manager.customer,
         name=project_name,
         start_date=start_date,
         end_date=end_date,
     )
+    # The project carries the proposal's award ID as its slug, set explicitly.
+    # Left empty, SlugMixin would fill it via generate_slug(), which
+    # de-duplicates by appending "-N" -- the same syntax as an award's
+    # follow-on version. A collision suffix and a genuine follow-on award would
+    # then be indistinguishable: 0261-7825-6844-4 could mean "fourth award in
+    # this sequence" or "the generator hit a clash". An explicit slug bypasses
+    # generate_slug() entirely, and the award ID is already unique because
+    # issue_award_id() checked it against every project.
+    #
+    # Only a slug that really is an award ID is carried over: a proposal
+    # created before the flag was turned on has an upstream-style slug, and
+    # its project should get the ordinary one rather than a copy of that.
+    if award_ids.is_enabled() and award_ids.is_award_id(proposal.slug):
+        project_fields["slug"] = proposal.slug
+
+    project = structure_models.Project.objects.create(**project_fields)
     project = cast(structure_models.Project, project)
 
     if start_date:
