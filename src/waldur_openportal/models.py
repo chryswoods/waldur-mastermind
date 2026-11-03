@@ -2141,6 +2141,30 @@ class ManagedProject(ReviewMixin, models.Model):
         help_text=_("The local project identifier in this portal."),
     )
 
+    # The credits of an allocation increase waiting for a local admin. Set
+    # only while the award is pending because of that increase, so a pending
+    # award with this set is still live: every other change is applied.
+    pending_allocation = models.DecimalField(
+        max_digits=22,
+        decimal_places=7,
+        verbose_name=_("pending allocation"),
+        help_text=_("Credits of an allocation increase awaiting approval."),
+        blank=True,
+        null=True,
+    )
+
+    # The credits last approved by a local admin, or within the project
+    # class's approval limit. Small increases are measured against this, so
+    # a series of them cannot add up to an unreviewed large one.
+    approved_credits = models.DecimalField(
+        max_digits=22,
+        decimal_places=7,
+        verbose_name=_("approved credits"),
+        help_text=_("Credits last approved, by a local admin or by policy."),
+        blank=True,
+        null=True,
+    )
+
     def get_destination(self) -> openportal.Destination:
         """
         Get the destination for this project.
