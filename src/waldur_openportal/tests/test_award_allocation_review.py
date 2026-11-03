@@ -261,3 +261,54 @@ class RejectEndedWaitingAwardsTest(TestCase):
                 event_type=models.ManagedProjectAuditEventType.REJECTED,
             ).exists()
         )
+
+
+class AuditNoteRepeatTest(TestCase):
+    def setUp(self):
+        self.managed_project = models.ManagedProject.objects.create(
+            destination=DESTINATION, identifier=IDENTIFIER, details={}
+        )
+
+    def record(self, note, event_type=None, **kwargs):
+        return models.ManagedProjectAuditEntry.record(
+            self.managed_project,
+            event_type or models.ManagedProjectAuditEventType.DETAILS_UPDATED,
+            note=note,
+            **kwargs,
+        )
+
+    def notes(self):
+        return list(
+            models.ManagedProjectAuditEntry.objects.order_by(
+                "timestamp", "id"
+            ).values_list("note", flat=True)
+        )
+
+    def test_repeated_note_is_recorded_once(self):
+        self.record("not applied: grace period")
+        self.assertIsNone(self.record("not applied: grace period"))
+
+        self.assertEqual(self.notes(), ["not applied: grace period"])
+
+    def test_note_repeated_after_another_entry_is_recorded(self):
+        self.record("not applied: grace period")
+        self.record("something else")
+        self.record("not applied: grace period")
+
+        self.assertEqual(len(self.notes()), 3)
+
+    def test_same_note_as_a_different_event_is_recorded(self):
+        self.record("x")
+        self.record("x", event_type=models.ManagedProjectAuditEventType.NOTE_ADDED)
+
+        self.assertEqual(len(self.notes()), 2)
+
+    def test_same_note_by_another_user_is_recorded(self):
+        self.record("x", event_type=models.ManagedProjectAuditEventType.NOTE_ADDED)
+        self.record(
+            "x",
+            event_type=models.ManagedProjectAuditEventType.NOTE_ADDED,
+            performed_by=structure_factories.UserFactory(),
+        )
+
+        self.assertEqual(len(self.notes()), 2)

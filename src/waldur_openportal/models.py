@@ -2989,8 +2989,30 @@ class ManagedProjectAuditEntry(models.Model):
         For events that carry new_details, the entry is skipped if new_details
         is identical to the most recent entry for this project, preventing
         duplicate records when the remote portal repeatedly sends the same
-        unchanged request.
+        unchanged request. Likewise a note-only entry (no details) is skipped
+        if the most recent entry for this project is the same event with the
+        same note by the same user, e.g. "not applied: project is in its
+        grace period" on every resend.
         """
+        if note and new_details is None and previous_details is None:
+            last = (
+                cls.objects.filter(
+                    identifier=managed_project.identifier,
+                    destination=managed_project.destination,
+                )
+                .order_by("-timestamp", "-id")
+                .first()
+            )
+            if (
+                last is not None
+                and last.event_type == event_type
+                and last.note == note
+                and last.new_details is None
+                and last.previous_details is None
+                and last.performed_by_id == getattr(performed_by, "pk", None)
+            ):
+                return None
+
         if new_details is not None and event_type in (
             ManagedProjectAuditEventType.CREATED,
             ManagedProjectAuditEventType.DETAILS_UPDATED,
