@@ -63,3 +63,56 @@ class SubmittedAtInApiTest(test.APITransactionTestCase):
 
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data["submitted_at"], when)
+
+
+class SubmittedAtOrderingTest(test.APITransactionTestCase):
+    url = "/api/proposal-proposals/"
+
+    def setUp(self):
+        call_round = factories.RoundFactory()
+        self.proposals = {}
+        for name, submitted in (
+            ("middle", datetime.datetime(2026, 5, 1, tzinfo=datetime.UTC)),
+            ("draft", None),
+            ("oldest", datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)),
+            ("newest", datetime.datetime(2026, 9, 1, tzinfo=datetime.UTC)),
+        ):
+            proposal = factories.ProposalFactory(
+                round=call_round,
+                name=name,
+                state=(
+                    models.Proposal.States.DRAFT
+                    if submitted is None
+                    else models.Proposal.States.SUBMITTED
+                ),
+            )
+            models.Proposal.objects.filter(pk=proposal.pk).update(
+                submitted_at=submitted
+            )
+            self.proposals[name] = proposal
+        self.client.force_authenticate(structure_factories.UserFactory(is_staff=True))
+
+    def names(self, ordering):
+        response = self.client.get(self.url, {"o": ordering})
+        self.assertEqual(response.status_code, 200, response.data)
+        return [row["name"] for row in response.data]
+
+    def test_oldest_submitted_first_then_drafts(self):
+        self.assertEqual(
+            self.names("submitted_at"), ["oldest", "middle", "newest", "draft"]
+        )
+
+    def test_newest_submitted_first_then_drafts(self):
+        self.assertEqual(
+            self.names("-submitted_at"), ["newest", "middle", "oldest", "draft"]
+        )
+
+    def test_other_orderings_unchanged(self):
+        self.assertEqual(
+            self.names("slug"),
+            [p.name for p in sorted(self.proposals.values(), key=lambda p: p.slug)],
+        )
+
+    def test_unknown_ordering_value_behaves_as_before(self):
+        response = self.client.get(self.url, {"o": "not_a_field"})
+        self.assertEqual(response.status_code, 400)
