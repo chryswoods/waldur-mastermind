@@ -3198,6 +3198,7 @@ def backfill_remote_projects(dry_run: bool = False):
                 # Explicitly set Open so that the remote portal retains
                 # full control of its own membership during migration.
                 remote_project.membership_control = models.MembershipControlChoices.OPEN
+                remote_project.allowed_domains = None
                 if allocation.is_added:
                     remote_project.state = models.RemoteProjectState.ACTIVE
                     alloc_value, _ = allocation._get_requested_allocation()
