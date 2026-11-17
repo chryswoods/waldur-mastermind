@@ -13,7 +13,11 @@ from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.permissions.models import Role
 from waldur_core.permissions.utils import add_user as grant_role
-from waldur_core.permissions.utils import get_permissions, validate_role_grant
+from waldur_core.permissions.utils import (
+    get_permissions,
+    validate_only_one_project_manager,
+    validate_role_grant,
+)
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import (
     get_connected_customers,
@@ -1651,6 +1655,9 @@ def set_project_member_role(project, email, role, is_existing_member: bool = Fal
     user = get_or_create_user_by_email(email)
 
     if is_existing_member:
+        # Checked before anything is revoked: a refused role must not leave
+        # the member with none (e.g. a second project manager).
+        validate_only_one_project_manager(project, role)
         for perm in get_permissions(project, user):
             perm.revoke(current_user=robot)
 

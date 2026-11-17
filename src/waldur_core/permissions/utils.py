@@ -306,12 +306,54 @@ def permission_factory(permission, sources=None):
     return permission_function
 
 
+def project_manager_role_names() -> list[str]:
+    """The roles that count as a project's manager: PROJECT.MANAGER and any
+    the site names in PROJECT_MANAGER_ROLES (e.g. a custom "Project Lead"),
+    so a site can use its own role in its place. Copies of these (roles whose
+    template they are) count too, as for any role."""
+    names = [enums.RoleEnum.PROJECT_MANAGER]
+    for name in config.PROJECT_MANAGER_ROLES or []:
+        name = str(name).strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def expand_role_names(names) -> list[str]:
+    """Role names as matched: PROJECT.MANAGER stands for every role the site
+    counts as the project manager."""
+    names = list(names)
+    if enums.RoleEnum.PROJECT_MANAGER in names:
+        names += [n for n in project_manager_role_names() if n not in names]
+    return names
+
+
+def role_names_q(names) -> Q:
+    """UserRoles holding one of these roles, a copy of one, or (for
+    PROJECT.MANAGER) a role the site counts as the project manager."""
+    names = expand_role_names(names)
+    return Q(role__name__in=names) | Q(role__template__name__in=names)
+
+
+def role_q(role) -> Q:
+    """UserRoles holding this role or a copy of it, and, when it is
+    PROJECT.MANAGER, a role the site counts as the project manager."""
+    q = Q(role=role) | Q(role__template=role)
+    if role.name == enums.RoleEnum.PROJECT_MANAGER:
+        aliases = project_manager_role_names()[1:]
+        if aliases:
+            q |= Q(role__name__in=aliases, role__content_type=role.content_type)
+            q |= Q(
+                role__template__name__in=aliases,
+                role__content_type=role.content_type,
+            )
+    return q
+
+
 def get_users(scope, role_name=None):
     users = models.UserRole.objects.filter(is_active=True, scope=scope)
     if role_name:
-        users = users.filter(
-            Q(role__name=role_name) | Q(role__template__name=role_name)
-        )
+        users = users.filter(role_names_q([role_name]))
     user_ids = users.values_list("user_id", flat=True)
     return User.objects.filter(id__in=user_ids)
 
@@ -345,9 +387,7 @@ def get_scope_ids(user, content_type, role=None, permission=None) -> QuerySet[in
             else:
                 # This is a string (like RoleEnum) - use directly
                 role_names.append(r)
-        qs = qs.filter(
-            Q(role__name__in=role_names) | Q(role__template__name__in=role_names)
-        )
+        qs = qs.filter(role_names_q(role_names))
     if permission:
         qs = qs.filter(role__permissions__permission=permission)
     return qs.order_by().values_list("object_id", flat=True).distinct()
@@ -361,11 +401,11 @@ def get_user_ids(content_type, scope_ids, role=None):
     )
     if role:
         if isinstance(role, models.Role):
-            qs = qs.filter(Q(role=role) | Q(role__template=role))
+            qs = qs.filter(role_q(role))
         else:
             if not isinstance(role, list | tuple):
                 role = [role]
-            qs = qs.filter(Q(role__name__in=role) | Q(role__template__name__in=role))
+            qs = qs.filter(role_names_q(role))
     return qs.values_list("user_id", flat=True)
 
 
@@ -393,7 +433,7 @@ def has_user(scope, user, role=None, expiration_time=False, *, match_clones=True
     qs = models.UserRole.objects.filter(is_active=True, user=user, scope=scope)
     if role:
         if match_clones:
-            qs = qs.filter(Q(role=role) | Q(role__template=role))
+            qs = qs.filter(role_q(role))
         else:
             qs = qs.filter(role=role)
     if expiration_time is None:
@@ -492,10 +532,7 @@ def count_active_project_managers(project):
             is_active=True,
             user__is_active=True,
         )
-        .filter(
-            Q(role__name=enums.RoleEnum.PROJECT_MANAGER)
-            | Q(role__template__name=enums.RoleEnum.PROJECT_MANAGER)
-        )
+        .filter(role_names_q([enums.RoleEnum.PROJECT_MANAGER]))
         .filter(Q(expiration_time=None) | Q(expiration_time__gte=now))
         .count()
     )
@@ -508,9 +545,9 @@ def validate_only_one_project_manager(scope, role):
     if scope._meta.model_name != "project":
         return
 
-    is_manager_role = role.name == enums.RoleEnum.PROJECT_MANAGER or (
-        role.template_id is not None
-        and role.template.name == enums.RoleEnum.PROJECT_MANAGER
+    manager_roles = project_manager_role_names()
+    is_manager_role = role.name in manager_roles or (
+        role.template_id is not None and role.template.name in manager_roles
     )
     if not is_manager_role:
         return
