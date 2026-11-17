@@ -3019,6 +3019,7 @@ class ProposalSerializer(
             "science_domain_name",
             "allocation_comment",
             "created",
+            "submitted_at",
             "compliance_status",
             "can_submit",
             "awaiting_manual_advance",
