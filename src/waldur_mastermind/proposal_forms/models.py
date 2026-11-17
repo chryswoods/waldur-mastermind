@@ -132,7 +132,9 @@ class FormFlow(core_models.UuidMixin, TimeStampedModel):
         blank=True,
         help_text=_(
             "What each step's survey asks, as read from Formbricks at the last "
-            "sync: {survey_id: {name, questions: [{id, type, label, choices}]}}."
+            "sync (or when a response answered a question it did not know): "
+            "{survey_id: {name, questions: [{id, type, label, choices}], "
+            "hidden_fields: [id]}}."
         ),
     )
 
@@ -318,8 +320,9 @@ class FormStepResponse(core_models.UuidMixin, TimeStampedModel):
 
     Written from the webhook or a fetch, and updated when Formbricks changes
     (it is the source of truth). The question labels are captured at the same
-    moment, so the answers always read as the questions were worded when the
-    applicant saw them, whatever happens to the survey afterwards.
+    moment, from the flow's copy of the survey, and kept with the answers, so
+    they still read right after a question is removed. A Sync relabels them
+    with the survey's current wording.
     """
 
     class Permissions:

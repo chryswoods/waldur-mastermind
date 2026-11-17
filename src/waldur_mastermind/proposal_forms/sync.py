@@ -23,7 +23,10 @@ Formbricks version has it. Sync leaves it alone: Formbricks 4.9 reports the
 setting but does not keep it, so it could never be in sync there.)
 
 plan() works out what is missing, without changing anything; apply() makes
-those changes. Formbricks merges an update into the stored survey, so only
+those changes. Syncing also keeps a copy of what each survey asks on the
+flow, which labels the answers, and relabels the answers already stored
+with it, so a survey edited after it went live reads right once synced.
+Formbricks merges an update into the stored survey, so only
 these settings are ever sent: questions, logic, styling and everything else
 are never written. Only surveys that are a step of a flow are touched.
 """
@@ -250,7 +253,20 @@ def sync_flow(flow, api_base_url, user=None) -> list:
         synced[survey_id] = {
             "name": survey.get("name") or "",
             "questions": client.survey_questions(survey),
+            "hidden_fields": sorted(client.survey_hidden_fields(survey)),
         }
     flow.survey_schemas = synced
     flow.save(update_fields=["survey_schemas", "modified"])
+    # The answers already stored take the survey's current wording too, so
+    # a survey edited after it went live reads right once synced.
+    for survey_id, schema in synced.items():
+        count = responses.relabel_survey_responses(
+            survey_id, {q["id"]: q["label"] for q in schema["questions"]}
+        )
+        if count:
+            logger.info(
+                "Relabelled %s stored response(s) to Formbricks survey %s.",
+                count,
+                survey_id,
+            )
     return check_flow(flow, api_base_url)

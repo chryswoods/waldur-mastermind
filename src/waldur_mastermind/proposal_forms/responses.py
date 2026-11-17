@@ -262,16 +262,84 @@ def issue_link(subject, step, user) -> models.FormLink:
 # --- taking in responses ------------------------------------------------------
 
 
-def _labels_for(flow, survey_id):
-    schema = (flow.survey_schemas or {}).get(survey_id) or {}
-    if schema.get("questions"):
-        return {q["id"]: q["label"] for q in schema["questions"]}
+def _saved_survey(flow, survey_id) -> dict:
+    return (flow.survey_schemas or {}).get(survey_id) or {}
+
+
+def _labels(questions) -> dict:
+    return {q["id"]: q["label"] for q in questions or []}
+
+
+def refresh_saved_survey(flow, survey_id) -> dict | None:
+    """Read a survey from Formbricks and keep it as the flow's copy, as Sync
+    does. Returns its labels, or None if it cannot be read: unreachable, or
+    a 200 with a survey of an unexpected shape (KeyError, TypeError)."""
     try:
-        return client.get_survey(survey_id)
-    except client.FormbricksError as e:
+        survey = client.get_survey_definition(survey_id)
+        questions = client.survey_questions(survey)
+        hidden = sorted(client.survey_hidden_fields(survey))
+    except (client.FormbricksError, KeyError, TypeError, AttributeError) as e:
         # The answers matter more than their labels.
-        logger.warning("Formbricks question labels not fetched: %s", e)
-        return {}
+        logger.warning("Formbricks survey %s not read for labels: %s", survey_id, e)
+        return None
+    schemas = dict(flow.survey_schemas or {})
+    schemas[survey_id] = {
+        "name": survey.get("name") or "",
+        "questions": questions,
+        "hidden_fields": hidden,
+    }
+    flow.survey_schemas = schemas
+    flow.save(update_fields=["survey_schemas", "modified"])
+    return _labels(questions)
+
+
+def labels_for(flow, survey_id, answer_ids) -> dict:
+    """The labels for a response's answers, {question_id: label}, in the
+    order the survey asks them.
+
+    From the flow's copy of the survey (kept by Sync), without asking
+    Formbricks. Only when an answer is to a question that copy does not know
+    (one added since the last Sync) is the survey read again, and the copy
+    replaced, so the next response needs no read either. Labels the live
+    survey no longer has (a question since removed) are kept, after it. A
+    reworded question takes its new wording at the next Sync, which also
+    relabels the answers already stored (relabel_survey_responses).
+    """
+    saved_survey = _saved_survey(flow, survey_id)
+    saved = _labels(saved_survey.get("questions"))
+    known = set(saved) | set(saved_survey.get("hidden_fields") or [])
+    if saved and set(answer_ids) <= known:
+        return saved
+    live = refresh_saved_survey(flow, survey_id)
+    if live is None:
+        return saved
+    return {**live, **{k: v for k, v in saved.items() if k not in live}}
+
+
+def relabelled(response, labels) -> dict | None:
+    """A stored response's labels and order with the given labels laid over
+    them (the wording they give wins; labels they lack are kept), or None if
+    nothing would change."""
+    question_labels = {**(response.question_labels or {}), **labels}
+    old_order = list(response.question_order or [])
+    question_order = list(labels) + [q for q in old_order if q not in labels]
+    if question_labels == response.question_labels and question_order == old_order:
+        return None
+    return {"question_labels": question_labels, "question_order": question_order}
+
+
+def relabel_survey_responses(survey_id, labels) -> int:
+    """Give the stored answers to a survey its current labels (after Sync
+    has read it). Only the labels and their order change: not the answers,
+    nor when they were given (modified), which stands for that. Returns how
+    many were relabelled."""
+    count = 0
+    for response in models.FormStepResponse.objects.filter(survey_id=survey_id):
+        changes = relabelled(response, labels)
+        if changes:
+            models.FormStepResponse.objects.filter(pk=response.pk).update(**changes)
+            count += 1
+    return count
 
 
 def _answers(data) -> dict:
@@ -294,6 +362,21 @@ def apply_response(record: dict) -> str:
     response_id = record.get("id") or ""
     if not su_id or not response_id:
         return "unknown-link"
+
+    # The labels, worked out before anything is locked: reading the survey
+    # from Formbricks, when it is needed at all, must not hold the rows.
+    labels = {}
+    unlocked = (
+        models.FormLink.objects.select_related("proposal__round__call", "project")
+        .filter(single_use_id=su_id, survey_id=record.get("surveyId"))
+        .first()
+    )
+    if unlocked is not None:
+        label_flow = flow_for(unlocked.subject)
+        if label_flow is not None:
+            labels = labels_for(
+                label_flow, unlocked.survey_id, _answers(record.get("data"))
+            )
 
     with transaction.atomic():
         link = (
@@ -365,9 +448,13 @@ def apply_response(record: dict) -> str:
 
         answers = _answers(record.get("data"))
         if is_current and current.raw_response == answers:
+            # The answers stand, but their labels may have been missing (a
+            # question added before the last Sync): give them those now.
+            changes = relabelled(current, labels)
+            if changes:
+                models.FormStepResponse.objects.filter(pk=current.pk).update(**changes)
             return "unchanged"
 
-        labels = _labels_for(flow, link.survey_id)
         previous_response_id = current.response_id if current else ""
         if respondent is not None:
             own_defaults = {

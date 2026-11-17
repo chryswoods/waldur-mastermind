@@ -97,7 +97,15 @@ then report `form_flow: null` and are submitted with Waldur's form alone.
 
    Formbricks merges an update into the survey, so nothing else is written.
    Only surveys that are a step of a flow are ever changed. Sync also stores
-   each survey's questions on the flow.
+   each survey's questions on the flow, which label the answers.
+
+   **Editing a live survey.** Answers are labelled from that stored copy,
+   without asking Formbricks. A response answering a question the copy does
+   not know (one added since the last sync) makes Waldur read the survey
+   once, outside any lock, and keep the new copy. A reworded question takes
+   its new wording at the next sync. Sync relabels the answers already
+   stored, too (their answers and dates are untouched), so after editing a
+   survey that is in use, **check and sync** its flow.
 
 5. **Switch on** the feature and the connection's `enabled`.
 
