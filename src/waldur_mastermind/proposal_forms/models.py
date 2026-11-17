@@ -139,7 +139,7 @@ class FormFlow(core_models.UuidMixin, TimeStampedModel):
     )
 
     class Meta:
-        ordering = ("name",)
+        ordering = ("name", "id")
 
     def __str__(self):
         return self.name
