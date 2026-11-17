@@ -7,7 +7,9 @@ For each survey a flow uses, Waldur needs:
 - the hidden fields `proposal_uuid`, `call_uuid` and `round_uuid` (and, for
   an end-of-project flow, `project_uuid`), so staff browsing Formbricks can
   see whose response is whose, and filter by call and round (Waldur itself
-  trusts only the link);
+  trusts only the link); an end-of-project survey also needs `user_name`,
+  `user_email` and `project_name`, which Waldur writes into each response
+  (never the link);
 - every ending redirecting back to the proposal in Waldur (for an
   end-of-project flow, the project).
 
@@ -32,7 +34,7 @@ import string
 
 from django.urls import reverse
 
-from . import client, models
+from . import client, models, responses
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +42,9 @@ PROPOSAL_HIDDEN_FIELD = "proposal_uuid"
 PROJECT_HIDDEN_FIELD = "project_uuid"
 Purposes = models.FormFlow.Purposes
 
-# Set on every link Waldur issues, by what the flow is for. Labels only: the
-# person filling in can edit them in the link, so Waldur never reads them back.
+# The hidden fields a flow's surveys need, by what the flow is for. The IDs
+# are set on every link Waldur issues: labels only, as the person filling in
+# can edit them in the link, so Waldur never reads them back.
 HIDDEN_FIELDS = {
     Purposes.APPLICATION: (PROPOSAL_HIDDEN_FIELD, "call_uuid", "round_uuid"),
     Purposes.CLOSING: (
@@ -49,6 +52,10 @@ HIDDEN_FIELDS = {
         PROPOSAL_HIDDEN_FIELD,
         "call_uuid",
         "round_uuid",
+        # Not on the link: Waldur writes these into each response once it
+        # arrives (responses.write_identity), and Formbricks keeps only the
+        # survey's own fields.
+        *responses.IDENTITY_FIELDS,
     ),
 }
 # The hidden field naming the page an ending returns to.

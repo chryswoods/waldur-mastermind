@@ -5,10 +5,17 @@ A form belongs to a *subject*: a proposal (its application forms, from the
 call's flow) or a project (its end-of-project forms, from the closing flow
 of the call that granted it). Formbricks holds the answers (the source of
 truth); Waldur keeps one copy per subject and form (FormStepResponse), for
-showing them. A response is matched to its subject and form only by its
+showing them - for a project, one per person who fills the form in, since
+each of them answers for themselves. A response is matched to its subject and form only by its
 single-use link id, which Waldur recorded when it issued the link
 (FormLink): a webhook and a fetch go through the same apply_response, so
 they cannot disagree, and application and end-of-project answers never mix.
+
+An end-of-project response also gets the name and email of whoever filled
+it in, and the project's name, written into its hidden fields through the
+Management API once it arrives (write_identity), for those reading the
+answers in Formbricks. They are never put in the link: a link's address
+ends up in browser histories and server logs, and could be edited.
 """
 
 import datetime
@@ -54,6 +61,44 @@ def subject_links(subject):
 
 def subject_responses(subject):
     return models.FormStepResponse.objects.filter(**_subject_filter(subject))
+
+
+def _own(subject, user) -> dict:
+    """Narrows a subject's links or responses to one person's. A project's
+    end-of-project forms are each person's own; a proposal's forms belong
+    to its whole team."""
+    return {"respondent": user} if is_project(subject) else {}
+
+
+def _own_links(subject, user) -> dict:
+    return {"issued_to": user} if is_project(subject) else {}
+
+
+# The hidden fields of an end-of-project survey Waldur fills in once a
+# response arrives (see write_identity).
+IDENTITY_FIELDS = ("user_name", "user_email", "project_name")
+
+
+def identity_values(user, project) -> dict:
+    return {
+        "user_name": user.full_name or user.username,
+        "user_email": user.email or "",
+        "project_name": project.name,
+    }
+
+
+def write_identity(response_id, values: dict):
+    """Write the respondent's name and email and the project's name into a
+    response's hidden fields. Formbricks merges them into the answers it
+    has. A failure is only logged: the next fetch or webhook tries again."""
+    try:
+        client.update_response_data(response_id, values)
+    except client.FormbricksError as e:
+        logger.warning(
+            "Name and email not written to Formbricks response %s: %s",
+            response_id,
+            e,
+        )
 
 
 def project_proposal(project):
@@ -161,12 +206,15 @@ def issue_link(subject, step, user) -> models.FormLink:
     Otherwise a new single-use link is minted; if the form was answered
     before, it is prefilled with the current answers (an edit).
     """
+    # Only the person's own open link: an end-of-project form opened by
+    # someone else (an organisation owner, say) is theirs, not the PI's.
     open_link = (
         subject_links(subject)
         .filter(
             step_key=step["key"],
             survey_id=step["survey_id"],
             state=models.FormLink.States.ISSUED,
+            **_own_links(subject, user),
         )
         .order_by("-created")
         .first()
@@ -175,7 +223,11 @@ def issue_link(subject, step, user) -> models.FormLink:
         return open_link
 
     params = {}
-    current = subject_responses(subject).filter(step_key=step["key"]).first()
+    current = (
+        subject_responses(subject)
+        .filter(step_key=step["key"], **_own(subject, user))
+        .first()
+    )
     if current is not None:
         answers = current.raw_response
         if current.response_id:
@@ -272,10 +324,12 @@ def apply_response(record: dict) -> str:
             )
             return "step-removed"
 
+        respondent = link.issued_to if is_project(subject) else None
+        own = {"respondent": respondent} if is_project(subject) else {}
         current = (
             subject_responses(subject)
             .select_for_update()
-            .filter(step_key=link.step_key)
+            .filter(step_key=link.step_key, **own)
             .first()
         )
         is_current = current is not None and current.response_id == response_id
@@ -300,16 +354,34 @@ def apply_response(record: dict) -> str:
             )
             return "late"
 
+        if respondent is not None:
+            # Also when the answers are unchanged, so a write that failed is
+            # tried again; once the values are there it is not repeated, so
+            # the webhook the write itself sets off ends here.
+            identity = identity_values(respondent, subject)
+            data = record.get("data") or {}
+            if any(data.get(k) != v for k, v in identity.items()):
+                transaction.on_commit(lambda: write_identity(response_id, identity))
+
         answers = _answers(record.get("data"))
         if is_current and current.raw_response == answers:
             return "unchanged"
 
         labels = _labels_for(flow, link.survey_id)
         previous_response_id = current.response_id if current else ""
+        if respondent is not None:
+            own_defaults = {
+                "respondent_name": respondent.full_name or respondent.username,
+                "respondent_email": respondent.email or "",
+            }
+        else:
+            own_defaults = {}
         models.FormStepResponse.objects.update_or_create(
             **_subject_filter(subject),
+            **own,
             step_key=link.step_key,
             defaults={
+                **own_defaults,
                 "survey_id": link.survey_id,
                 "response_id": response_id,
                 "link": link,
@@ -419,28 +491,41 @@ def process_deletions():
 # --- reading answers ----------------------------------------------------------
 
 
-def missing_steps(subject, flow) -> list:
-    """The labels of the forms not yet answered."""
-    answered = set(subject_responses(subject).values_list("step_key", flat=True))
+def missing_steps(subject, flow, user=None) -> list:
+    """The labels of the forms not yet answered (for a project, by user)."""
+    answered = set(
+        subject_responses(subject)
+        .filter(**(_own(subject, user) if user is not None else {}))
+        .values_list("step_key", flat=True)
+    )
     return [step["label"] for step in flow.steps if step["key"] not in answered]
 
 
-def serialize_form_responses(subject, steps, step_keys=None) -> list:
+def serialize_form_responses(subject, steps, step_keys=None, respondent=None) -> list:
     """Each stored form's answers as labelled questions, in the order the
     flow asks them, for reading in the proposal.
 
     step_keys, if given, limits which forms are included (reviewers see only
     the reviewer-visible ones). A form no longer in the flow is listed last,
-    under its key.
+    under its key. respondent, if given, limits them to that person's (a
+    project's end-of-project answers, each person's own); each is listed
+    with who gave it.
     """
     stored = subject_responses(subject)
     if step_keys is not None:
         stored = stored.filter(step_key__in=step_keys)
+    if respondent is not None:
+        stored = stored.filter(respondent=respondent)
 
     position = {step["key"]: index for index, step in enumerate(steps)}
     labels = {step["key"]: step["label"] for step in steps}
     stored = sorted(
-        stored, key=lambda r: (position.get(r.step_key, len(steps)), r.step_key)
+        stored,
+        key=lambda r: (
+            position.get(r.step_key, len(steps)),
+            r.step_key,
+            r.respondent_name.lower(),
+        ),
     )
 
     result = []
@@ -457,6 +542,8 @@ def serialize_form_responses(subject, steps, step_keys=None) -> list:
                 "step_key": response.step_key,
                 "step_label": labels.get(response.step_key, response.step_key),
                 "submitted_at": response.modified,
+                "respondent_name": response.respondent_name or None,
+                "respondent_email": response.respondent_email or None,
                 "questions": [
                     {
                         "question_id": question_id,
