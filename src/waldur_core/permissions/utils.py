@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from constance import config
 from django.contrib.contenttypes.models import ContentType
+from django.db import transaction
 from django.db.models import Q
 from django.db.models.query import QuerySet
 from django.utils import timezone
@@ -524,21 +525,25 @@ def get_scope_ancestors(scope):
     return [ancestor for ancestor in ancestors if ancestor is not None]
 
 
-def count_active_project_managers(project):
+def count_active_project_managers(project, exclude=None):
+    """Active project managers of ``project``; ``exclude`` (a UserRole) is
+    left out, for a role change that replaces it."""
     now = timezone.now()
+    qs = models.UserRole.objects.filter(
+        scope=project,
+        is_active=True,
+        user__is_active=True,
+    )
+    if exclude is not None:
+        qs = qs.exclude(pk=exclude.pk)
     return (
-        models.UserRole.objects.filter(
-            scope=project,
-            is_active=True,
-            user__is_active=True,
-        )
-        .filter(role_names_q([enums.RoleEnum.PROJECT_MANAGER]))
+        qs.filter(role_names_q([enums.RoleEnum.PROJECT_MANAGER]))
         .filter(Q(expiration_time=None) | Q(expiration_time__gte=now))
         .count()
     )
 
 
-def validate_only_one_project_manager(scope, role):
+def validate_only_one_project_manager(scope, role, replacing=None):
     if not config.ONLY_ONE_PROJECT_MANAGER:
         return
 
@@ -552,20 +557,24 @@ def validate_only_one_project_manager(scope, role):
     if not is_manager_role:
         return
 
-    if count_active_project_managers(scope) >= 1:
+    if count_active_project_managers(scope, exclude=replacing) >= 1:
         raise ValidationError("Project already has an active project manager.")
 
 
-def validate_single_role_per_scope(scope, user):
+def validate_single_role_per_scope(scope, user, replacing=None):
     """Reject a second role in one scope when INVITATION_DISABLE_MULTIPLE_ROLES is on.
 
     Unlike the duplicate-grant guard in ``validate_role_grant``, this counts any
     active role the user holds in ``scope``, not only the one being granted.
+    ``replacing`` (a UserRole) is left out, for a role change that replaces it.
     """
     if not config.INVITATION_DISABLE_MULTIPLE_ROLES:
         return
 
-    if has_user(scope, user):
+    others = models.UserRole.objects.filter(is_active=True, user=user, scope=scope)
+    if replacing is not None:
+        others = others.exclude(pk=replacing.pk)
+    if others.exists():
         raise ValidationError("User already has role within this scope.")
 
 
@@ -629,7 +638,7 @@ def validate_scope_available(scope):
         raise ValidationError("Offering is not available.")
 
 
-def validate_role_grant(scope, user, role):
+def validate_role_grant(scope, user, role, replacing=None):
     """Validate a role can be granted to a user on scope.
 
     Mirrors the role/scope checks in UserRoleCreateSerializer.validate so
@@ -641,6 +650,10 @@ def validate_role_grant(scope, user, role):
     however soon it expires. A second active row for the same (user, role, scope)
     would break update_user and delete_user, which expect exactly one; changing
     how long a role lasts goes through update_user instead.
+
+    ``replacing`` is the UserRole a role change replaces (change_user_role):
+    the rules that allow one role per user, or one manager per project, leave
+    it out, as it goes in the same step.
     """
     if has_user(scope, user, role, match_clones=False):
         raise ValidationError("User has already the same role in this scope.")
@@ -655,8 +668,8 @@ def validate_role_grant(scope, user, role):
 
     check_grant_policy(scope, role)
 
-    validate_single_role_per_scope(scope, user)
-    validate_only_one_project_manager(scope, role)
+    validate_single_role_per_scope(scope, user, replacing=replacing)
+    validate_only_one_project_manager(scope, role, replacing=replacing)
     validate_user_restrictions(scope, user)
 
 
@@ -764,6 +777,46 @@ def is_quiet_grant_source(source: str) -> bool:
     return bool(source) and any(
         source.startswith(prefix) for prefix in QUIET_GRANT_SOURCE_PREFIXES
     )
+
+
+# A role change keeps the expiry the previous role had unless given one.
+KEEP_EXPIRATION = object()
+
+
+@transaction.atomic()
+def change_user_role(
+    scope,
+    user,
+    previous,
+    role,
+    changed_by=None,
+    expiration_time=KEEP_EXPIRATION,
+):
+    """Change ``user``'s role on ``scope`` from ``previous`` (their active
+    UserRole there) to ``role``, as one step.
+
+    The new role is checked as a grant first (validate_role_grant, leaving
+    out the role it replaces), then the previous role is revoked and the new
+    one granted in the same transaction: if anything fails, nothing changes
+    and the user keeps the role they had. The user is never without a role
+    on the scope, so nothing that reacts to someone *losing* access (deleting
+    their accounts on a cluster, say) runs when their role only changes:
+    side effects queued on commit see the new role in place.
+
+    ``expiration_time``: the previous role's unless given (None: permanent).
+    Returns the new UserRole.
+    """
+    previous = models.UserRole.objects.select_for_update().get(pk=previous.pk)
+    if not previous.is_active or previous.user_id != user.id:
+        raise ValidationError("The user no longer has that role.")
+    if previous.role_id == role.id:
+        raise ValidationError("The user already has this role.")
+    validate_role_grant(scope, user, role, replacing=previous)
+    if expiration_time is KEEP_EXPIRATION:
+        expiration_time = previous.expiration_time
+    reason = f"Role changed from {previous.role.name} to {role.name}."
+    previous.revoke(changed_by, reason=reason)
+    return add_user(scope, user, role, changed_by, expiration_time, reason=reason)
 
 
 def add_user(
