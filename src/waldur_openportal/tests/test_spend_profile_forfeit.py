@@ -167,6 +167,18 @@ class ForfeitTest(TestCase):
             ).exists()
         )
 
+    def test_a_forfeit_does_not_settle_a_day_the_cluster_has_not(self):
+        self.sync_april_to(6)
+        june = _month(2027, 6)
+
+        report = self.sync(
+            june, datetime.date(2027, 7, 1), report=_cluster_report(june, False)
+        )
+
+        self.assertEqual(models.AwardForfeit.objects.count(), 1)
+        self.assertFalse(report.get_report(datetime.date(2027, 6, 30)).is_complete)
+        self.assertFalse(report.is_complete)
+
     def test_every_later_report_of_the_month_carries_the_same_forfeit(self):
         self.sync_april_to(6)
         june = _month(2027, 6)

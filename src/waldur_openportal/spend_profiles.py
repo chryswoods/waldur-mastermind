@@ -507,17 +507,10 @@ def _add_forfeit_day(report, forfeit, group):
     day = openportal.DailyProjectUsageReport()
     day.add_usage(FORFEIT_USER, usage)
     day.add_component_usage(FORFEIT_COMPONENT, FORFEIT_USER, usage)
-    # The day stays as complete as the cluster says it is. Merging into a
-    # day already there leaves it incomplete even when both are complete,
-    # so its completeness is put back.
-    was_complete = (
-        forfeit.date in report.dates and report.get_report(forfeit.date).is_complete
-    )
-    if forfeit.date not in report.dates:
-        day.set_complete()
+    # Complete, so the day stays as complete as the cluster says it is: a
+    # summed day is complete when both parts are.
+    day.set_complete()
     report.add_report(forfeit.date, day)
-    if was_complete:
-        report.set_day_complete(forfeit.date)
     report.add_mapping(
         openportal.UserMapping(
             f"{FORFEIT_USER}.{report.project}:{FORFEIT_USER}:{group}"
