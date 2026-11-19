@@ -1019,6 +1019,13 @@ class UserInfo(models.Model):
                 inverse_match=True,
                 message=_("Cannot contain 'admin' or 'root'."),
             ),
+            # The user a spend-profile forfeit is billed to in usage reports
+            # (spend_profiles.FORFEIT_USER): no person may have that name.
+            validators.RegexValidator(
+                regex=r"^forfeit$",
+                inverse_match=True,
+                message=_("'forfeit' is reserved."),
+            ),
             validators.MinLengthValidator(4),
             validators.MaxLengthValidator(MAX_USER_SHORTNAME_LENGTH),
         ],
@@ -2875,6 +2882,7 @@ class ManagedProjectAuditEventType(models.TextChoices):
     DETAILS_UPDATED = "details_updated", _("Award details updated")
     PROJECT_ATTACHED = "project_attached", _("Waldur project attached")
     PROJECT_DETACHED = "project_detached", _("Waldur project detached")
+    FORFEIT_CHARGED = "forfeit_charged", _("Spend profile forfeit charged")
 
 
 class ManagedProjectAuditEntry(models.Model):
@@ -3966,3 +3974,70 @@ class RemoteProjectAuditEntry(models.Model):
 
     def __repr__(self) -> str:
         return self.__str__()
+
+
+class AwardForfeit(models.Model):
+    """A spend-profile forfeit charged to an award (ManagedProject).
+
+    When a period of an award's spend profile ends, the site charges the sum
+    of the minimums so far less everything charged so far, if positive, as
+    usage by the user "forfeit" on the period's last day. The charge is made
+    by adding it to the usage report as it arrives from the cluster
+    (spend_profiles.add_forfeits), so it is billed, credited and reported to
+    the awarding portal like any other usage.
+
+    The report is fetched afresh on every sync, so this record is what puts
+    the same forfeit back into it each time: worked out once, when the period
+    ended, and kept with its working. A forfeit of 0 is recorded too, so the
+    period is not worked out again.
+    """
+
+    managed_project = models.ForeignKey(
+        ManagedProject,
+        on_delete=models.CASCADE,
+        related_name="forfeits",
+    )
+    project = models.ForeignKey(
+        structure_models.Project,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text=_("The project the award was on when the forfeit was charged."),
+    )
+    project_identifier = models.CharField(
+        max_length=MAX_PROJECTIDENTIFIER_LENGTH,
+        help_text=_(
+            "The usage report (OpenPortal project identifier) the forfeit is added to."
+        ),
+    )
+    period_from = models.DateField(help_text=_("The first day of the period."))
+    date = models.DateField(
+        help_text=_("The period's last day: the day the forfeit is charged on.")
+    )
+    amount = models.DecimalField(
+        max_digits=20,
+        decimal_places=4,
+        help_text=_("The forfeit, in the award's allocation units."),
+    )
+    units = models.CharField(max_length=32, blank=True)
+    hours = models.DecimalField(
+        max_digits=20,
+        decimal_places=4,
+        help_text=_("The forfeit as node-hours of usage, as added to the report."),
+    )
+    working = models.JSONField(
+        default=dict,
+        help_text=_("How the forfeit was worked out."),
+    )
+    created = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("managed_project", "period_from")
+        ordering = ["managed_project", "date"]
+        verbose_name = _("Award forfeit")
+
+    def __str__(self) -> str:
+        return (
+            f"{self.managed_project} forfeit {self.amount} {self.units} on {self.date}"
+        )

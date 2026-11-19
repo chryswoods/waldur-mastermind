@@ -22,21 +22,33 @@ one a profile cannot be set or read.
 """
 
 import datetime
+import decimal
+import logging
 
 import openportal
 from django.utils import timezone
 
-from . import utils
+from . import models, utils
+
+logger = logging.getLogger(__name__)
 
 # Feature names a site portal reports through get_supported_features.
 AWARD_SPEND_MINIMUMS = "award_spend_minimums"
 AWARD_SPEND_MAXIMUMS = "award_spend_maximums"
 
+# The user and component a forfeit is billed to in a usage report: a
+# convention between portals (OpenPortal site-portal-api.md, "Reporting a
+# forfeit"). No person may have this name (UserInfo.shortname refuses it).
+FORFEIT_USER = "forfeit"
+FORFEIT_COMPONENT = "forfeit"
+
 # What this portal, as a site, does with an award's spend profile: a feature
 # is added here only once it is enforced. Answered to is_feature_supported
 # and get_supported_features. Maximums are enforced through the limit sync
-# (withheld_credits); minimums are not yet.
-SUPPORTED_FEATURES: frozenset[str] = frozenset({AWARD_SPEND_MAXIMUMS})
+# (withheld_credits), minimums by charging forfeits (add_forfeits).
+SUPPORTED_FEATURES: frozenset[str] = frozenset(
+    {AWARD_SPEND_MAXIMUMS, AWARD_SPEND_MINIMUMS}
+)
 
 
 def today() -> datetime.date:
@@ -236,8 +248,8 @@ def progress(managed_project, today: datetime.date) -> dict | None:
       that had no maximum, and the days before the first, counted at what
       they charged; the whole award if the period has no maximum;
     - "headroom": cap less cumulative_spend, for a period begun;
-    - "forfeit": the forfeit charged when the period ended, None until
-      forfeits are charged.
+    - "forfeit": the forfeit charged when the period ended, None if none
+      has been.
 
     Charges are the award's usage (utils.get_award_usage_hours, in node-hours
     converted to the award's units with the project template's factor).
@@ -261,6 +273,12 @@ def progress(managed_project, today: datetime.date) -> dict | None:
         return hours * scale
 
     award_spend = charged(end=today)
+    forfeits = {
+        forfeit.period_from: float(forfeit.amount)
+        for forfeit in models.AwardForfeit.objects.filter(
+            managed_project=managed_project
+        )
+    }
     result_periods = []
     first = periods(raw, end_date)
     # The days before the first period are uncontrolled, and count towards
@@ -321,7 +339,7 @@ def progress(managed_project, today: datetime.date) -> dict | None:
                     if cap is not None and cumulative_spend is not None
                     else None
                 ),
-                "forfeit": None,
+                "forfeit": forfeits.get(start),
             }
         )
 
@@ -362,3 +380,233 @@ def withheld_credits(managed_project, today: datetime.date) -> float:
     if withheld <= 0:
         return 0.0
     return withheld / _award_scale(managed_project, result["units"])
+
+
+def _forfeit_carrier(project):
+    """The one allocation of a project its forfeits are added to: a project
+    with more than one would otherwise be charged each forfeit on each."""
+    return (
+        models.Allocation.objects.filter(project=project, is_active=True)
+        .order_by("pk")
+        .first()
+    )
+
+
+def _cumulative_minimum(raw, until: datetime.date) -> float:
+    """The sum of the minimums of the periods starting on or before until."""
+    total = 0.0
+    for period in periods(raw):
+        if period["from"] <= until and period["minimum"]:
+            total += _amount(period["minimum"])
+    return total
+
+
+def _hours_in(report, windows, start, end) -> float:
+    """A report's usage on the days of windows within start..end."""
+    if report is None:
+        return 0.0
+    hours = 0.0
+    for window_start, window_end in windows:
+        clipped = utils._clip_window_to_range(window_start, window_end, start, end)
+        if clipped is not None:
+            hours += float(
+                report.filter(openportal.DateRange(*clipped)).total_usage.hours
+            )
+    return hours
+
+
+def _charged_hours(managed_project, project, report, resource, month, to) -> float:
+    """What the award has been charged up to and including ``to``, in
+    node-hours: its cached usage, with this allocation's report for the
+    month taken from the fresh ``report`` rather than the cache."""
+    hours = utils.get_award_usage_hours(managed_project, range_end=to)
+    windows = [
+        (start, end)
+        for _, start, end in utils._get_managed_project_attachment_windows(
+            managed_project, project, from_award_start=True
+        )
+    ]
+    cached = models.CachedProjectUsageReport.objects.filter(
+        year=month.start_date.year,
+        month=month.start_date.month,
+        project_identifier=str(report.project),
+        resource=resource,
+    ).first()
+    stale = _hours_in(
+        cached.get_report() if cached else None, windows, month.start_date, to
+    )
+    fresh = _hours_in(report, windows, month.start_date, to)
+    return hours - stale + fresh
+
+
+def _charge_forfeit(managed_project, allocation, report, resource, month, period):
+    """Work out the forfeit for a period that has ended, and record it."""
+    raw = managed_project.details["spend_profile"]
+    award = managed_project.get_details().allocation
+    units = str(award.units) if award is not None else ""
+    scale = _award_scale(managed_project, units) if units else 1.0
+    to = period["to"]
+
+    charged = (
+        _charged_hours(managed_project, allocation.project, report, resource, month, to)
+        * scale
+    )
+    minimums = _cumulative_minimum(raw, period["from"])
+    amount = decimal.Decimal(str(max(0.0, minimums - charged))).quantize(
+        decimal.Decimal("0.0001")
+    )
+    hours = (amount / decimal.Decimal(str(scale))).quantize(decimal.Decimal("0.0001"))
+
+    forfeit = models.AwardForfeit.objects.create(
+        managed_project=managed_project,
+        project=allocation.project,
+        project_identifier=str(report.project),
+        period_from=period["from"],
+        date=to,
+        amount=amount,
+        units=units,
+        hours=hours,
+        working={
+            "period": {
+                "from": period["from"].isoformat(),
+                "to": to.isoformat(),
+                "minimum": period["minimum"],
+                "maximum": period["maximum"],
+            },
+            "cumulative_minimum": minimums,
+            "cumulative_charges": charged,
+            "scale": scale,
+            "charged_on": today().isoformat(),
+        },
+    )
+    models.ManagedProjectAuditEntry.record(
+        managed_project,
+        models.ManagedProjectAuditEventType.FORFEIT_CHARGED,
+        note=(
+            f"Spend profile period {period['from']} to {to} ended: minimums so far "
+            f"{minimums:g} {units}, charged so far {charged:g} {units}, so a "
+            f"forfeit of {amount} {units} is charged on {to}."
+        ),
+    )
+    return forfeit
+
+
+def _local_group(allocation, report) -> str:
+    group = (
+        models.Association.objects.filter(allocation=allocation)
+        .exclude(groupname="")
+        .exclude(groupname=None)
+        .values_list("groupname", flat=True)
+        .first()
+    )
+    return group or str(report.project).split(".")[0]
+
+
+def _add_forfeit_day(report, forfeit, group):
+    usage = openportal.Usage.from_hours(float(forfeit.hours))
+    day = openportal.DailyProjectUsageReport()
+    day.add_usage(FORFEIT_USER, usage)
+    day.add_component_usage(FORFEIT_COMPONENT, FORFEIT_USER, usage)
+    # The day stays as complete as the cluster says it is. Merging into a
+    # day already there leaves it incomplete even when both are complete,
+    # so its completeness is put back.
+    was_complete = (
+        forfeit.date in report.dates and report.get_report(forfeit.date).is_complete
+    )
+    if forfeit.date not in report.dates:
+        day.set_complete()
+    report.add_report(forfeit.date, day)
+    if was_complete:
+        report.set_day_complete(forfeit.date)
+    report.add_mapping(
+        openportal.UserMapping(
+            f"{FORFEIT_USER}.{report.project}:{FORFEIT_USER}:{group}"
+        )
+    )
+
+
+def _hold_incomplete(report, date):
+    """Keep the month open: an incomplete day makes the report incomplete,
+    so the awarding portal keeps asking until the forfeit is in."""
+    report.add_report(date, openportal.DailyProjectUsageReport())
+
+
+def add_forfeits(allocation, report, month, resource: str):
+    """The month's usage report from the cluster, with the award's forfeits
+    added: as usage by FORFEIT_USER, under the FORFEIT_COMPONENT component, on
+    each period's last day.
+
+    Called on every sync, with each report as it arrives, so the forfeits
+    are counted from then on like any other usage: billed, taken off the
+    credit, cached, shown and reported to the awarding portal.
+
+    - A forfeit already charged to this report (AwardForfeit) is added back,
+      whatever has happened to the award since.
+    - A period of the attached award that ended in this month, before today
+      (UTC), is charged now, if it had a minimum: the minimums so far less
+      everything charged so far, never less than 0, recorded with its working.
+    - If that fails, the month is held incomplete until it succeeds.
+    """
+    if AWARD_SPEND_MINIMUMS not in SUPPORTED_FEATURES:
+        return report
+
+    start, end = month.start_date, month.end_date
+    identifier = str(report.project)
+    group = None
+
+    def add(forfeit):
+        nonlocal group
+        if forfeit.hours > 0:
+            if group is None:
+                group = _local_group(allocation, report)
+            _add_forfeit_day(report, forfeit, group)
+
+    charged = models.AwardForfeit.objects.filter(
+        project_identifier=identifier, date__gte=start, date__lte=end
+    ).order_by("date")
+    known = set()
+    for forfeit in charged:
+        known.add((forfeit.managed_project_id, forfeit.period_from))
+        add(forfeit)
+
+    managed_project = models.ManagedProject.objects.filter(
+        project=allocation.project
+    ).first()
+    if managed_project is None or not (managed_project.details or {}).get(
+        "spend_profile"
+    ):
+        return report
+    carrier = _forfeit_carrier(allocation.project)
+    if carrier is None or carrier.pk != allocation.pk:
+        return report
+
+    now = today()
+    end_date = getattr(managed_project.get_details(), "end_date", None)
+    for period in periods(managed_project.details["spend_profile"], end_date):
+        to = period["to"]
+        if to is None or not (start <= to <= end) or to >= now:
+            continue
+        if not period["minimum"]:
+            continue
+        if (managed_project.pk, period["from"]) in known:
+            continue
+        if models.AwardForfeit.objects.filter(
+            managed_project=managed_project, period_from=period["from"]
+        ).exists():
+            # Charged to another report (the award has moved since).
+            continue
+        try:
+            add(
+                _charge_forfeit(
+                    managed_project, allocation, report, resource, month, period
+                )
+            )
+        except Exception as e:
+            logger.error(
+                "Could not charge the forfeit of %s for the period from %s: %s",
+                managed_project,
+                period["from"],
+                e,
+            )
+            _hold_incomplete(report, to)
+    return report

@@ -705,7 +705,7 @@ class ReconcileHistoricalUsageTest(RemoteBackendFixture):
         self.backend._adjust_project_credits_for_reconciliation = mock.Mock()
 
         resource_patcher = mock.patch(
-            "waldur_openportal.remotebackend.marketplace_models.Resource.objects.get",
+            "waldur_openportal.usage_reconciliation.marketplace_models.Resource.objects.get",
             return_value=self.resource,
         )
         resource_patcher.start()

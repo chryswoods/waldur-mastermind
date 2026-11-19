@@ -38,12 +38,12 @@ Overspend is not double-counted: it is already in the charges, so it
 already reduces what is left under the cap. Unspent cap is not carried
 forward as such; under-spend against a minimum becomes a forfeit (below).
 
-**Minimums** (not yet enforced). On the first day of a new period the site
-charges a forfeit of the sum of the minimums so far, less everything charged
-so far (usage and earlier forfeits), if that is positive. A period with no
-minimum adds nothing to the sum, so no forfeit is charged at its end.
-Spending above a minimum counts towards later periods. The forfeit is dated
-the last day of the period that ended.
+**Minimums.** On the first day of a new period the site charges a forfeit
+of the sum of the minimums so far, less everything charged so far (usage
+and earlier forfeits), if that is positive. A period with no minimum adds
+nothing to the sum, so no forfeit is charged at its end. Spending above a
+minimum counts towards later periods. The forfeit is dated the last day of
+the period that ended.
 
 ## How the site enforces maximums
 
@@ -54,18 +54,55 @@ Instead, `sync_allocation_limits` (every 17 minutes) takes
 credits it lets the project use on the cluster. A new period's cap
 therefore applies within 17 minutes of UTC midnight.
 
+## How the site charges forfeits
+
+A forfeit is usage like any other. `backend.sync_usage` fetches this
+month's and last month's usage report from the cluster, and
+`spend_profiles.add_forfeits()` adds the award's forfeits to it before
+anything else reads it. From then on it is billed, taken off the credit,
+cached, shown and reported to the awarding portal like the rest of the
+report. As OpenPortal's convention says (`site-portal-api.md`, "Reporting a
+forfeit"), it is usage by the user `forfeit`, under the component
+`forfeit`, on the period's last day, in the award's units once the report
+is scaled for the awarding portal. It is not a job.
+
+- **When.** On the first sync after the period's last day (UTC), if the
+  period has a minimum, and the award is on the project then.
+- **Recorded once.** An `AwardForfeit` keeps the amount and how it was
+  worked out (a forfeit of 0 too), with a `forfeit_charged` audit entry.
+  The cluster's report is fetched afresh on every sync, so the record is
+  what puts the same forfeit back into the month's report each time,
+  whether or not the period lines up with the month, and even after the
+  award has moved. Corrections are made to the record.
+- **One allocation.** A project with more than one allocation has its
+  forfeits added to the report of the first (lowest id), so they are
+  counted once.
+- **Completeness.** Adding a forfeit leaves the day as complete as the
+  cluster says. If a forfeit cannot be charged, the month is held
+  incomplete, so the awarding portal keeps asking until it is in.
+- **Reserved name.** No person may have the shortname `forfeit`, and a
+  `forfeit.*` user identifier is never resolved to a person.
+
+## Billing a month after it ends
+
+Usage is billed as it is reported, for the current month. Usage that
+arrives for last month after it ended (the cluster's last hours, or a
+forfeit dated the last day of last month) is billed when that month's
+report is complete: `UsageReconciliationMixin` corrects the month's
+`ComponentUsage` to the report and the project's credit by the change. The
+site and the awarding side share it.
+
 ## Features
 
 A site answers `is_feature_supported` / `get_supported_features` from
-`spend_profiles.SUPPORTED_FEATURES`. It claims `award_spend_maximums` now and
-will claim `award_spend_minimums` only once forfeits are charged and
-reported. The awarding portal records a site's answer on each
-`RemoteProject` (`site_features`), refreshed daily.
+`spend_profiles.SUPPORTED_FEATURES`. It claims `award_spend_maximums` and
+`award_spend_minimums`. The awarding portal records a site's answer on
+each `RemoteProject` (`site_features`), refreshed daily.
 
 ## Progress
 
 `/api/openportal-managed-project-accounting-summary/<project_uuid>/` has a
 `spend_profile` field: each period's dates, controls and status, its spend,
-the cumulative spend and minimums, the cap, the headroom, and (later) the
-forfeit. Amounts are in the award's units, converted from node-hours with
-the project template's factor, as the usage reports are.
+the cumulative spend and minimums, the cap, the headroom, and the forfeit.
+Amounts are in the award's units, converted from node-hours with the
+project template's factor, as the usage reports are.

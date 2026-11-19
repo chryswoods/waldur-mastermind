@@ -2173,6 +2173,12 @@ def resolve_useridentifiers(identifiers: list) -> dict:
     """
     result = {}
     for identifier in identifiers:
+        if str(identifier).startswith("forfeit."):
+            # A spend-profile forfeit's user (spend_profiles.FORFEIT_USER):
+            # never a person, whatever a slug might match.
+            result[identifier] = None
+            continue
+
         association = (
             models.Association.objects.filter(useridentifier=identifier)
             .select_related("user")
