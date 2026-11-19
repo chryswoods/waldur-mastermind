@@ -308,3 +308,101 @@ class SpendProgressApiTest(_AwardWithUsage):
             response = client.get(f"{self.url}{self.project.uuid}/")
         self.assertEqual(response.status_code, 200, response.data)
         self.assertIsNone(response.data["spend_profile"])
+
+
+@needs_spend_profiles
+class WithheldCreditsTest(_AwardWithUsage):
+    def withheld(self, today):
+        with self.usage():
+            return spend_profiles.withheld_credits(self.managed_project, today)
+
+    def test_a_period_with_a_maximum_withholds_the_award_above_its_cap(self):
+        # July's cap: January to March at what they charged, plus two
+        # maximums of 250.
+        before = _days(START, datetime.date(2027, 3, 31)) * HOURS_PER_DAY
+        self.assertAlmostEqual(
+            self.withheld(datetime.date(2027, 8, 15)), 1000 - (before + 500)
+        )
+
+    def test_nothing_is_withheld_outside_a_capped_period(self):
+        for today in (
+            datetime.date(2027, 2, 1),  # before the first period
+            datetime.date(2027, 11, 1),  # a period with no maximum
+            datetime.date(2028, 1, 5),  # after the award
+        ):
+            self.assertEqual(self.withheld(today), 0.0, today)
+
+    def test_nothing_is_withheld_unless_maximums_are_claimed(self):
+        with mock.patch.object(spend_profiles, "SUPPORTED_FEATURES", frozenset()):
+            self.assertEqual(self.withheld(datetime.date(2027, 8, 15)), 0.0)
+
+    def test_withheld_in_credits(self):
+        self.managed_project.project_template = models.ProjectTemplate.objects.create(
+            name="gpu", portal="testportal", allocation_units_mapping={"GPUHR": 4.0}
+        )
+        self.managed_project.details = dict(
+            AWARD,
+            allocation="4000 GPUHR",
+            spend_profile=[{"from": "2027-04-01", "maximum": "1000 GPUHR"}],
+        )
+        self.managed_project.save()
+        before = _days(START, datetime.date(2027, 3, 31)) * HOURS_PER_DAY * 4
+        self.assertAlmostEqual(
+            self.withheld(datetime.date(2027, 5, 1)), (4000 - (before + 1000)) / 4
+        )
+
+
+class LimitSyncWithholdsTest(TestCase):
+    """sync_allocation_limits takes what the profile withholds off the limit,
+    and leaves the project's credits alone."""
+
+    def setUp(self):
+        self.project = structure_fixtures.ProjectFixture().project
+        self.managed_project = models.ManagedProject.objects.create(
+            destination="airr.brics.isambard-ai",
+            identifier="award.airr",
+            project=self.project,
+            details=AWARD,
+        )
+
+    def _sync(self, credit_value, withheld, node_usage=0.0):
+        credit = mock.MagicMock(project=self.project, value=credit_value)
+        credits_qs = mock.MagicMock()
+        credits_qs.__iter__ = mock.Mock(return_value=iter([credit]))
+        allocation = mock.MagicMock(node_usage=node_usage, node_limit=0)
+        allocation.is_added_to_openportal.return_value = True
+        with (
+            mock.patch.object(tasks.config, "ensure_config_loaded", return_value=True),
+            mock.patch.object(
+                tasks.models.OnceTask.objects,
+                "get_or_create",
+                return_value=(mock.MagicMock(last_run=None), True),
+            ),
+            mock.patch.object(
+                tasks.invoice_models.ProjectCredit.objects,
+                "select_related",
+                return_value=credits_qs,
+            ),
+            mock.patch.object(
+                tasks.models.Allocation.objects, "filter", return_value=[allocation]
+            ),
+            mock.patch.object(
+                spend_profiles, "withheld_credits", return_value=withheld
+            ) as withheld_credits,
+        ):
+            tasks.sync_allocation_limits()
+        return allocation, withheld_credits
+
+    def test_the_limit_is_the_cap(self):
+        allocation, withheld_credits = self._sync(800, 320.0)
+        withheld_credits.assert_called_once()
+        self.assertAlmostEqual(allocation.node_limit, 480.0)
+        allocation.get_backend.return_value.set_resource_limits.assert_called_once()
+
+    def test_spend_past_the_cap_stops_the_project(self):
+        allocation, _ = self._sync(800, 320.0, node_usage=500.0)
+        self.assertEqual(allocation.node_limit, 0)
+
+    def test_without_a_cap_the_limit_is_the_credits(self):
+        allocation, _ = self._sync(800, 0.0)
+        self.assertAlmostEqual(allocation.node_limit, 800.0)

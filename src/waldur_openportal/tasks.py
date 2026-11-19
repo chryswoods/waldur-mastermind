@@ -866,6 +866,22 @@ def sync_allocation_limits():
                 )
                 continue
 
+            # An award's spend profile caps what may be spent so far:
+            # the credits stay the award's, the limit is the cap's.
+            managed_project = models.ManagedProject.objects.filter(
+                project=project
+            ).first()
+            if managed_project is not None and credits_available > 0:
+                withheld = spend_profiles.withheld_credits(
+                    managed_project, spend_profiles.today()
+                )
+                if withheld > 0:
+                    logger.debug(
+                        f"Spend profile of {managed_project} withholds "
+                        f"{withheld} of {credits_available} credits"
+                    )
+                    credits_available = max(0.0, credits_available - withheld)
+
             # Calculate the total usage so far this month across OpenPortal allocations
             # for this project - if it exceeds the number of project credits available
             # then we have to set the limits to zero to prevent any more spend

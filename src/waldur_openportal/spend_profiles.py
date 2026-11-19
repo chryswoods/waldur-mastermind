@@ -34,8 +34,9 @@ AWARD_SPEND_MAXIMUMS = "award_spend_maximums"
 
 # What this portal, as a site, does with an award's spend profile: a feature
 # is added here only once it is enforced. Answered to is_feature_supported
-# and get_supported_features.
-SUPPORTED_FEATURES: frozenset[str] = frozenset()
+# and get_supported_features. Maximums are enforced through the limit sync
+# (withheld_credits); minimums are not yet.
+SUPPORTED_FEATURES: frozenset[str] = frozenset({AWARD_SPEND_MAXIMUMS})
 
 
 def today() -> datetime.date:
@@ -205,15 +206,17 @@ def _amount(value) -> float | None:
 
 
 def _award_scale(managed_project, units: str) -> float:
-    """Award units per node-hour of usage, as the project template converts
-    them (ProjectTemplate.convert_to_credits divides by the same factor)."""
+    """Award units per node-hour of usage: the factor the usage reports to
+    the awarding portal are scaled by (board.get_usage_report), and that
+    ProjectTemplate.convert_to_credits divides by. 1 if there is none."""
     template = managed_project.project_template
     if template is None:
         return 1.0
-    scale = (template.allocation_units_mapping or {}).get(units)
-    if scale is None:
+    try:
+        scale = float(template.get_allocation_mapping_for(units))
+    except Exception:
         return 1.0
-    return float(scale) if scale > 0 else 0.0
+    return scale if scale > 0 else 1.0
 
 
 def progress(managed_project, today: datetime.date) -> dict | None:
@@ -328,3 +331,34 @@ def progress(managed_project, today: datetime.date) -> dict | None:
         "spend": award_spend,
         "periods": result_periods,
     }
+
+
+def current_period(result: dict | None) -> dict | None:
+    """The period of a progress() result that today falls in, or None (no
+    profile, before its first period, or after the award has ended)."""
+    for period in (result or {}).get("periods", []):
+        if period["status"] == "current":
+            return period
+    return None
+
+
+def withheld_credits(managed_project, today: datetime.date) -> float:
+    """How far the award's spend profile lowers its limit today, in credits.
+
+    The award's allocation, and so the project's credits, are never changed
+    by a profile: the awarding portal reads the allocation back from them,
+    and their review rules are about the award. What the maximums change is
+    what may be spent now: during a period with a maximum the award behaves
+    as if it were only its cap, so the limit sync takes this much (the award
+    less the cap) off the credits it lets the project use. 0 when no maximum
+    applies today."""
+    if AWARD_SPEND_MAXIMUMS not in SUPPORTED_FEATURES:
+        return 0.0
+    result = progress(managed_project, today)
+    period = current_period(result)
+    if period is None or period["cap"] is None or result["allocation"] is None:
+        return 0.0
+    withheld = result["allocation"] - period["cap"]
+    if withheld <= 0:
+        return 0.0
+    return withheld / _award_scale(managed_project, result["units"])
