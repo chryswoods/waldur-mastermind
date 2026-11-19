@@ -8,6 +8,7 @@ import time
 import openportal
 from celery import shared_task
 from constance import config as constance_config
+from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates, ReviewStates
@@ -692,6 +693,31 @@ def sync_remote_allocation_storage(serialized_allocation):
         return
 
     backend.sync_storage(allocation)
+
+
+@shared_task(name="waldur_openportal.refresh_site_features")
+@run_once_task(takeover_timeout=60 * 60)
+def refresh_site_features():
+    """Ask each site, once per offering, what its portal supports (e.g.
+    award_spend_minimums), and keep the answer on every award sent there.
+    Answers are snapshots: sites upgrade, so this is asked daily. A site that
+    does not answer in time keeps its last answer."""
+    from waldur_openportal.client import OpenPortalClient
+
+    destinations = (
+        models.RemoteProject.objects.exclude(state=models.RemoteProjectState.DELETED)
+        .values_list("destination", flat=True)
+        .distinct()
+    )
+    for destination in destinations:
+        try:
+            features = OpenPortalClient(destination).get_supported_features()
+        except Exception as e:
+            logger.info("Site features for %s not refreshed: %s", destination, e)
+            continue
+        models.RemoteProject.objects.filter(destination=destination).update(
+            site_features=features, site_features_checked_at=timezone.now()
+        )
 
 
 @shared_task(name="waldur_openportal.refresh_remote_projects")

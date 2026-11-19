@@ -1088,6 +1088,41 @@ class SetAllowedDomainsSerializer(rf_serializers.Serializer):
     )
 
 
+class SpendProfileEntrySerializer(rf_serializers.Serializer):
+    """One period of an award's spend profile, as AwardDetails carries it:
+    the controls from ``from`` until the next entry's date (the last until
+    the award ends). A control left out does not apply in that period; an
+    entry with neither means no controls from its date."""
+
+    locals()["from"] = rf_serializers.DateField(
+        help_text="The date these controls apply from."
+    )
+    minimum = rf_serializers.CharField(
+        required=False,
+        allow_null=True,
+        help_text="The least to spend in this period, e.g. '250 NHR', in the "
+        "award's allocation units. Left out: no minimum.",
+    )
+    maximum = rf_serializers.CharField(
+        required=False,
+        allow_null=True,
+        help_text="The most that may be spent in this period, e.g. '250 NHR', "
+        "in the award's allocation units. Left out: no maximum.",
+    )
+
+    def to_representation(self, instance):
+        # As AwardDetails spells an entry: a control not set is left out.
+        data = super().to_representation(instance)
+        return {key: value for key, value in data.items() if value is not None}
+
+
+class SetSpendProfileSerializer(rf_serializers.Serializer):
+    """Replace an award's spend profile. [] removes it, which is allowed only
+    before any of its periods has begun."""
+
+    spend_profile = SpendProfileEntrySerializer(many=True, allow_empty=True)
+
+
 class SetLinksSerializer(rf_serializers.Serializer):
     """
     Update any combination of the four award links in one call.
@@ -1210,6 +1245,21 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
     breakdown = rf_serializers.DictField(
         child=rf_serializers.CharField(), read_only=True
     )
+    spend_profile = SpendProfileEntrySerializer(
+        many=True,
+        read_only=True,
+        allow_null=True,
+        help_text="Dated minimum and/or maximum spends for the award, "
+        "enforced by the site. Null: none set.",
+    )
+    site_features = rf_serializers.ListField(
+        child=rf_serializers.CharField(),
+        read_only=True,
+        allow_null=True,
+        help_text="What the site's portal says it supports for this award's "
+        "offering, e.g. award_spend_minimums and award_spend_maximums. Null: "
+        "not known.",
+    )
 
     resource_uuid = rf_serializers.SerializerMethodField()
     resource_name = rf_serializers.SerializerMethodField()
@@ -1249,6 +1299,10 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
             "membership_control",
             "allowed_domains",
             "breakdown",
+            # Spend controls (always visible)
+            "spend_profile",
+            "site_features",
+            "site_features_checked_at",
             # Privileged
             "last_sent_details",
             "last_confirmed_details",

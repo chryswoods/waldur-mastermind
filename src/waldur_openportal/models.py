@@ -3262,6 +3262,43 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         ),
     )
 
+    # How the award's allocation may be spent over time, sent to the site in
+    # AwardDetails.spend_profile: [{"from": "YYYY-MM-DD", "minimum": "250 NHR",
+    # "maximum": "250 NHR"}, ...], sorted by date. Each entry applies until
+    # the next one's date (the last until the award's end); a control an entry
+    # leaves out does not apply in its period. None: no profile is sent (the
+    # site keeps whatever it holds); []: no profile.
+    spend_profile = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        verbose_name=_("spend profile"),
+        help_text=_(
+            "Dated minimum and/or maximum spends for the award, enforced by "
+            "the site: a list of {from, minimum, maximum}. None: none sent; "
+            "[]: no profile."
+        ),
+    )
+
+    # What the site's portal software says it supports for this award's
+    # offering (get_supported_features), e.g. award_spend_minimums. None:
+    # not known yet, or the site could not be asked.
+    site_features = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        verbose_name=_("site features"),
+        help_text=_(
+            "Features the site's portal reported supporting for this award's "
+            "offering; null if not known."
+        ),
+    )
+    site_features_checked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_("site features checked at"),
+    )
+
     breakdown = models.JSONField(
         default=dict,
         blank=True,
@@ -3500,6 +3537,9 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         # rather than treated as unset.
         if self.allowed_domains is not None:
             extras["allowed_domains"] = self.allowed_domains
+        # As with allowed_domains, [] ("no profile") is sent, not dropped.
+        if self.spend_profile is not None:
+            extras["spend_profile"] = self.spend_profile
         if self.breakdown:
             extras["breakdown"] = self.breakdown
 
