@@ -25,6 +25,7 @@ from . import (
     models,
     project_updates,
     remote_project_service,
+    spend_profiles,
     utils,
 )
 from .board import OpenPortalBoard, _trim_job
@@ -1788,6 +1789,13 @@ def run_job(serialized_job):
         elif command == "get_project" or command == "get_award":
             identifier = openportal.ProjectIdentifier(args[0])
             result = board.get_award(identifier)
+        elif command == "is_feature_supported":
+            # Asked by an awarding portal before relying on, e.g., a spend
+            # profile being enforced here. Answered from what this portal
+            # does; a name it has never heard of is simply not supported.
+            result = args[0] in spend_profiles.SUPPORTED_FEATURES
+        elif command == "get_supported_features":
+            result = sorted(spend_profiles.SUPPORTED_FEATURES)
         elif command == "get_projects":
             identifier = openportal.PortalIdentifier(args[0])
             result = board.get_projects(identifier)

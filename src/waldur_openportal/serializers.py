@@ -17,7 +17,7 @@ from waldur_core.structure.permissions import _has_admin_access
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import serializers as marketplace_serializers
 
-from . import models
+from . import models, spend_profiles
 
 logger = logging.getLogger(__name__)
 
@@ -765,6 +765,50 @@ class AwardDetailsField(rf_serializers.JSONField):
     pass
 
 
+class SpendPeriodProgressSerializer(rf_serializers.Serializer):
+    """One period of an award's spend profile and its spend so far, every
+    amount in the award's allocation units. See spend_profiles.progress."""
+
+    locals()["from"] = rf_serializers.DateField()
+    to = rf_serializers.DateField(allow_null=True)
+    minimum = rf_serializers.CharField(allow_null=True)
+    maximum = rf_serializers.CharField(allow_null=True)
+    status = rf_serializers.ChoiceField(choices=["ended", "current", "upcoming"])
+    spend = rf_serializers.FloatField(
+        allow_null=True,
+        help_text="Charged on the period's days so far; null if not begun.",
+    )
+    cumulative_spend = rf_serializers.FloatField(
+        allow_null=True,
+        help_text="Charged from the award's start to the period's end (or "
+        "today); null if not begun.",
+    )
+    cumulative_minimum = rf_serializers.FloatField(
+        allow_null=True, help_text="The minimums so far; null if none."
+    )
+    cap = rf_serializers.FloatField(
+        allow_null=True,
+        help_text="The most the award may have been charged by the period's "
+        "end: the maximums so far, or the whole award if it has no maximum.",
+    )
+    headroom = rf_serializers.FloatField(
+        allow_null=True,
+        help_text="cap less cumulative_spend; null if not begun.",
+    )
+    forfeit = rf_serializers.FloatField(
+        allow_null=True,
+        help_text="Charged when the period ended for spending less than the "
+        "minimums so far; null if none.",
+    )
+
+
+class SpendProgressSerializer(rf_serializers.Serializer):
+    units = rf_serializers.CharField(allow_null=True)
+    allocation = rf_serializers.FloatField(allow_null=True)
+    spend = rf_serializers.FloatField(help_text="Charged to the award so far.")
+    periods = SpendPeriodProgressSerializer(many=True)
+
+
 class ManagedProjectAccountingSummarySerializer(rf_serializers.Serializer):
     """
     Read-only serializer summarising the OpenPortal award (ManagedProject)
@@ -781,6 +825,12 @@ class ManagedProjectAccountingSummarySerializer(rf_serializers.Serializer):
     allocation_credits = rf_serializers.FloatField(read_only=True, allow_null=True)
     usage_credits = rf_serializers.FloatField(read_only=True)
     remaining_credits = rf_serializers.FloatField(read_only=True, allow_null=True)
+    spend_profile = SpendProgressSerializer(
+        read_only=True,
+        allow_null=True,
+        help_text="The award's spend profile, period by period, with its "
+        "spend so far; null if the award has none.",
+    )
 
     def to_representation(self, project):
         from . import utils as openportal_utils
@@ -808,6 +858,21 @@ class ManagedProjectAccountingSummarySerializer(rf_serializers.Serializer):
             if allocation_credits is not None
             else None
         )
+
+        data["spend_profile"] = None
+        managed_project = models.ManagedProject.objects.filter(project=project).first()
+        if managed_project is not None:
+            try:
+                progress = spend_profiles.progress(
+                    managed_project, spend_profiles.today()
+                )
+            except Exception as e:
+                logger.error(
+                    f"Error computing spend profile progress for project {project}: {e}"
+                )
+                progress = None
+            if progress is not None:
+                data["spend_profile"] = SpendProgressSerializer(progress).data
 
         return data
 

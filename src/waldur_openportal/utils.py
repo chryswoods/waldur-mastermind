@@ -1249,6 +1249,8 @@ def get_remote_project_total_hours(remote_project: "models.RemoteProject") -> fl
 def get_award_usage_hours(
     managed_project: "models.ManagedProject",
     project: structure_models.Project | None = None,
+    range_start: datetime.date | None = None,
+    range_end: datetime.date | None = None,
 ) -> float:
     """
     The node-hours of usage an award has had: for each project it has been
@@ -1264,12 +1266,25 @@ def get_award_usage_hours(
     a project from before the award was attached to it - for example under
     the award it held previously - is not this award's.
 
-    Pass project to count only the usage on that project.
+    Pass project to count only the usage on that project, and range_start
+    and/or range_end (inclusive) to count only the usage on those days.
     """
     windows_by_project = {}
     for attached_project, start, end in _get_managed_project_attachment_windows(
         managed_project, project, from_award_start=True
     ):
+        if range_start is not None or range_end is not None:
+            clipped = _clip_window_to_range(
+                start,
+                end,
+                range_start or start,
+                range_end or end or datetime.date.max,
+            )
+            if clipped is None:
+                continue
+            start, end = clipped
+            if end == datetime.date.max:
+                end = None
         windows_by_project.setdefault(attached_project.id, (attached_project, []))[
             1
         ].append((start, end))

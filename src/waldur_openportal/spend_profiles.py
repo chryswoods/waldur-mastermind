@@ -24,10 +24,23 @@ one a profile cannot be set or read.
 import datetime
 
 import openportal
+from django.utils import timezone
+
+from . import utils
 
 # Feature names a site portal reports through get_supported_features.
 AWARD_SPEND_MINIMUMS = "award_spend_minimums"
 AWARD_SPEND_MAXIMUMS = "award_spend_maximums"
+
+# What this portal, as a site, does with an award's spend profile: a feature
+# is added here only once it is enforced. Answered to is_feature_supported
+# and get_supported_features.
+SUPPORTED_FEATURES: frozenset[str] = frozenset()
+
+
+def today() -> datetime.date:
+    """Today, in UTC: a period's days start at midnight UTC."""
+    return timezone.now().astimezone(datetime.UTC).date()
 
 
 class SpendProfileError(ValueError):
@@ -181,3 +194,137 @@ def validate_change(old_raw, new_raw, today: datetime.date) -> None:
                 f"A new period cannot start in the past ({start}); start it "
                 f"today ({today}) or later."
             )
+
+
+def _amount(value) -> float | None:
+    """An entry's amount ("250 NHR") as a number in the award's units; the
+    units were checked against the award's when the profile was set."""
+    if not value:
+        return None
+    return float(openportal.Allocation.from_string(str(value)).size)
+
+
+def _award_scale(managed_project, units: str) -> float:
+    """Award units per node-hour of usage, as the project template converts
+    them (ProjectTemplate.convert_to_credits divides by the same factor)."""
+    template = managed_project.project_template
+    if template is None:
+        return 1.0
+    scale = (template.allocation_units_mapping or {}).get(units)
+    if scale is None:
+        return 1.0
+    return float(scale) if scale > 0 else 0.0
+
+
+def progress(managed_project, today: datetime.date) -> dict | None:
+    """The award's spend profile, period by period, with its spend so far.
+
+    None if the award has no profile. Otherwise {"units", "allocation",
+    "spend", "periods": [...]}, every amount in the award's units, where each
+    period has:
+
+    - "from", "to" (inclusive), "minimum", "maximum": the profile's entry;
+    - "status": "ended", "current" or "upcoming";
+    - "spend": what was charged on the period's days, up to today;
+    - "cumulative_spend": what was charged from the award's start to the end
+      of the period (or today), the charges the period's controls compare to;
+    - "cumulative_minimum": the minimums so far, None if there are none;
+    - "cap": the limit during the period: the maximums so far, with a period
+      that had no maximum, and the days before the first, counted at what
+      they charged; the whole award if the period has no maximum;
+    - "headroom": cap less cumulative_spend, for a period begun;
+    - "forfeit": the forfeit charged when the period ended, None until
+      forfeits are charged.
+
+    Charges are the award's usage (utils.get_award_usage_hours, in node-hours
+    converted to the award's units with the project template's factor).
+    """
+    details = managed_project.details or {}
+    raw = details.get("spend_profile")
+    if not raw:
+        return None
+
+    award_details = managed_project.get_details()
+    award = getattr(award_details, "allocation", None)
+    units = str(award.units) if award is not None else None
+    award_size = float(award.size) if award is not None else None
+    scale = _award_scale(managed_project, units) if units else 1.0
+    end_date = getattr(award_details, "end_date", None)
+
+    def charged(start=None, end=None) -> float:
+        hours = utils.get_award_usage_hours(
+            managed_project, range_start=start, range_end=end
+        )
+        return hours * scale
+
+    award_spend = charged(end=today)
+    result_periods = []
+    first = periods(raw, end_date)
+    # The days before the first period are uncontrolled, and count towards
+    # later caps at what they charged.
+    counted = charged(end=first[0]["from"] - datetime.timedelta(days=1))
+    cumulative_minimum = None
+
+    for period in first:
+        start, to = period["from"], period["to"]
+        minimum = _amount(period["minimum"])
+        maximum = _amount(period["maximum"])
+        if start > today:
+            status = "upcoming"
+        elif to is not None and to < today:
+            status = "ended"
+        else:
+            status = "current"
+
+        if minimum is not None:
+            cumulative_minimum = (cumulative_minimum or 0.0) + minimum
+
+        if status == "upcoming":
+            spend = None
+            cumulative_spend = None
+        else:
+            last = to if status == "ended" else today
+            spend = charged(start, last)
+            cumulative_spend = charged(end=last)
+
+        if maximum is None:
+            cap = award_size
+        else:
+            cap = counted + maximum
+            if award_size is not None:
+                cap = min(cap, award_size)
+
+        # What the period adds to the caps after it: its maximum, or, with
+        # none, what it charged (an upcoming period without one is unknown,
+        # and every later cap is then the award's or its own maximum's).
+        if maximum is not None:
+            counted += maximum
+        else:
+            counted += spend or 0.0
+
+        result_periods.append(
+            {
+                "from": start,
+                "to": to,
+                "minimum": period["minimum"],
+                "maximum": period["maximum"],
+                "status": status,
+                "spend": spend,
+                "cumulative_spend": cumulative_spend,
+                "cumulative_minimum": cumulative_minimum,
+                "cap": cap,
+                "headroom": (
+                    cap - cumulative_spend
+                    if cap is not None and cumulative_spend is not None
+                    else None
+                ),
+                "forfeit": None,
+            }
+        )
+
+    return {
+        "units": units,
+        "allocation": award_size,
+        "spend": award_spend,
+        "periods": result_periods,
+    }
