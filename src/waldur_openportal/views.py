@@ -1855,10 +1855,14 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         ]
         try:
             entries = spend_profiles.parse(raw)
-            spend_profiles.validate_for_award(entries, remote_project.award_details())
+            award = remote_project.award_details()
+            spend_profiles.validate_for_award(entries, award)
             profile = [spend_profiles.entry_json(entry) for entry in entries]
             spend_profiles.validate_change(
-                remote_project.spend_profile, profile, timezone.now().date()
+                remote_project.spend_profile,
+                profile,
+                spend_profiles.today(),
+                getattr(award, "end_date", None),
             )
         except spend_profiles.SpendProfileError as e:
             raise ValidationError({"spend_profile": str(e)})

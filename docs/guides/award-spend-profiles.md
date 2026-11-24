@@ -16,10 +16,33 @@ minimum and maximum spend. The awarding portal (AIRR) sets it on a
   carries over from an earlier entry. An entry with neither control means
   "no controls from this date".
 - Days start at midnight UTC.
-- A period that has begun is not rewritten. Entries dated today or earlier
-  keep their dates; those whose period has ended keep their controls; new
-  entries start today or later. To end the controls early, add an entry
-  with no controls from today.
+
+## Changing a profile
+
+Only ended periods are history. A period has **ended** when its last day is
+before today: its forfeit has been worked out (possibly 0), and possibly
+charged. It is **current** when it has begun and not ended. The awarding
+portal's `set-spend-profile` (`spend_profiles.validate_change`) allows:
+
+1. changing or clearing the current period's `minimum` and `maximum`;
+2. moving when the current period ends, by moving the next entry's `from`
+   to any date from today;
+3. adding, changing and removing upcoming periods, with `from` today or
+   later;
+4. removing the current period: after an ended period it is sent as
+   `{from}` with no controls, because leaving it out would stretch the
+   ended period; with nothing before it, it may be left out;
+5. removing the whole profile (`[]`) while no period has ended.
+
+It refuses, with a 400 saying why: any change to an ended period (its
+`from`, controls, or leaving it out); moving an ended period's last day
+(the `from` of the entry after it); a new entry dated before today; and
+`[]` once a period has ended. After an award has ended, its last period
+has ended too.
+
+The site uses the controls it holds when they act: a new cap applies at
+the next limit sync, and a period's forfeit is worked out from the
+minimums as they stand when it ends.
 
 ## The rules both portals agree
 

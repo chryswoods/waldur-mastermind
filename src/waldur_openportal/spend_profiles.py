@@ -173,36 +173,63 @@ def periods(raw, end_date=None) -> list[dict]:
     return result
 
 
-def validate_change(old_raw, new_raw, today: datetime.date) -> None:
-    """Refuse a change that rewrites a period already begun.
+def validate_change(old_raw, new_raw, today: datetime.date, end_date=None) -> None:
+    """Refuse a change that rewrites history: only ended periods are fixed.
 
-    Every entry dated today or earlier stays, with its date; one whose period
-    has ended keeps its controls (the current period's may change); and any
-    new entry starts today or later. To end controls early, add an entry with
-    no controls from today rather than removing the profile."""
-    old = {_date(item["from"]): item for item in (old_raw or [])}
+    A period has ended when its last day is before today (UTC): its forfeit
+    has been worked out. It is current when it has begun and not ended. The
+    controls act on the past only when a period ends, so:
+
+    - an ended period keeps its date and controls, and its end: the entry
+      straight after it keeps its date;
+    - the current period's controls may change, and when it ends moves with
+      the next entry's date. After an ended period its date is fixed by the
+      rule above, so to drop its controls it is sent with none; with nothing
+      ended before it, it may be left out;
+    - upcoming periods may be added, changed or removed, and any new entry
+      starts today or later;
+    - [] removes the profile only while no period has ended.
+    """
+    old_periods = periods(old_raw, end_date)
+    new_dates = sorted(_date(item["from"]) for item in (new_raw or []))
     new = {_date(item["from"]): item for item in (new_raw or [])}
-    old_periods = {p["from"]: p for p in periods(old_raw)}
-    for start, item in sorted(old.items()):
-        if start > today:
-            continue
+
+    ended = [p for p in old_periods if p["to"] is not None and p["to"] < today]
+    if ended and not new_dates:
+        raise SpendProfileError(
+            f"The period from {ended[0]['from']} has ended, so the profile "
+            "cannot be removed. To end the controls, add an entry with no "
+            "controls from today."
+        )
+
+    for period in ended:
+        start = period["from"]
         if start not in new:
             raise SpendProfileError(
-                f"The period from {start} has begun, so it cannot be removed. "
-                "To end the controls, add an entry with no controls from today."
+                f"The period from {start} has ended, so it cannot be removed."
             )
-        ended = (
-            old_periods[start]["to"] is not None and old_periods[start]["to"] < today
-        )
-        if ended and (
-            (item.get("minimum") or None) != (new[start].get("minimum") or None)
-            or (item.get("maximum") or None) != (new[start].get("maximum") or None)
-        ):
+        if (period["minimum"] or None) != (new[start].get("minimum") or None) or (
+            period["maximum"] or None
+        ) != (new[start].get("maximum") or None):
             raise SpendProfileError(
                 f"The period from {start} has ended, so its controls cannot change."
             )
-    for start in new:
-        if start not in old and start < today:
+        following = [d for d in new_dates if d > start]
+        next_start = following[0] if following else None
+        old_next = period["to"] + datetime.timedelta(days=1)
+        if next_start != old_next and not (
+            next_start is None and period["to"] == end_date
+        ):
+            raise SpendProfileError(
+                f"The period from {start} has ended on {period['to']}, so the "
+                f"next period must still start on {old_next}. To remove the "
+                f"controls from then, keep an entry from {old_next} with no "
+                "controls."
+            )
+
+    old_dates = {p["from"] for p in old_periods}
+    for start in new_dates:
+        if start not in old_dates and start < today:
             raise SpendProfileError(
                 f"A new period cannot start in the past ({start}); start it "
                 f"today ({today}) or later."

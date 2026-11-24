@@ -72,19 +72,50 @@ class ProfileRulesTest(TestCase):
             ],
         )
 
-    def test_the_current_period_may_change(self):
+    # TODAY is 2027-05-15: January-March has ended, April-June is current,
+    # July onwards is upcoming.
+
+    def test_the_current_periods_controls_may_change_or_clear(self):
         changed = [PROFILE[0], {"from": "2027-04-01", "minimum": "100 NHR"}, PROFILE[2]]
         spend_profiles.validate_change(PROFILE, changed, TODAY)
+        cleared = [PROFILE[0], {"from": "2027-04-01"}, PROFILE[2]]
+        spend_profiles.validate_change(PROFILE, cleared, TODAY)
+
+    def test_when_the_current_period_ends_may_move_to_today_or_later(self):
+        for start in ("2027-05-15", "2027-05-16", "2027-09-01"):
+            moved = [*PROFILE[:2], {"from": start, "maximum": "500 NHR"}]
+            spend_profiles.validate_change(PROFILE, moved, TODAY)
+        with self.assertRaisesMessage(spend_profiles.SpendProfileError, "past"):
+            spend_profiles.validate_change(
+                PROFILE, [*PROFILE[:2], {"from": "2027-05-14"}], TODAY
+            )
 
     def test_an_ended_period_keeps_its_controls(self):
         changed = [{"from": "2027-01-01", "minimum": "100 NHR"}, *PROFILE[1:]]
         with self.assertRaisesMessage(spend_profiles.SpendProfileError, "has ended"):
             spend_profiles.validate_change(PROFILE, changed, TODAY)
+        with self.assertRaisesMessage(spend_profiles.SpendProfileError, "has ended"):
+            spend_profiles.validate_change(PROFILE, PROFILE[1:], TODAY)
 
-    def test_a_begun_period_cannot_be_removed(self):
-        with self.assertRaisesMessage(spend_profiles.SpendProfileError, "has begun"):
-            spend_profiles.validate_change(PROFILE, [PROFILE[0], PROFILE[2]], TODAY)
-        with self.assertRaisesMessage(spend_profiles.SpendProfileError, "has begun"):
+    def test_an_ended_period_keeps_its_end(self):
+        """Leaving out, or moving, the current period after an ended one would
+        move the ended one's last day."""
+        for changed in (
+            [PROFILE[0], PROFILE[2]],
+            [PROFILE[0], {"from": "2027-05-20", "maximum": "250 NHR"}, PROFILE[2]],
+        ):
+            with self.assertRaisesMessage(
+                spend_profiles.SpendProfileError, "must still start on 2027-04-01"
+            ):
+                spend_profiles.validate_change(PROFILE, changed, TODAY)
+
+    def test_the_current_period_may_go_when_nothing_has_ended(self):
+        profile = PROFILE[1:]
+        spend_profiles.validate_change(profile, [PROFILE[2]], TODAY)
+        spend_profiles.validate_change(profile, [], TODAY)
+
+    def test_the_profile_cannot_be_removed_once_a_period_has_ended(self):
+        with self.assertRaisesMessage(spend_profiles.SpendProfileError, "has ended"):
             spend_profiles.validate_change(PROFILE, [], TODAY)
 
     def test_a_new_period_cannot_start_in_the_past(self):
@@ -100,6 +131,14 @@ class ProfileRulesTest(TestCase):
         spend_profiles.validate_change(
             PROFILE, [*PROFILE[:2], {"from": "2027-08-01", "maximum": "100 NHR"}], TODAY
         )
+
+    def test_once_the_award_has_ended_its_last_period_has_too(self):
+        after = datetime.date(2028, 1, 2)
+        end = datetime.date(2027, 12, 31)
+        spend_profiles.validate_change(PROFILE, PROFILE, after, end)
+        changed = [*PROFILE[:2], {"from": "2027-07-01", "maximum": "900 NHR"}]
+        with self.assertRaisesMessage(spend_profiles.SpendProfileError, "has ended"):
+            spend_profiles.validate_change(PROFILE, changed, after, end)
 
 
 class RemoteProjectFixture:
@@ -202,6 +241,24 @@ class SetSpendProfileApiTest(RemoteProjectFixture, test.APITransactionTestCase):
         response = self.post(self.staff, changed)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("has ended", str(response.data))
+
+    def test_the_current_periods_controls_may_change(self, now):
+        self.at(now)
+        self.assertEqual(self.post(self.staff, PROFILE).status_code, 200)
+        self.at(now, TODAY)
+        changed = [PROFILE[0], {"from": "2027-04-01"}, PROFILE[2]]
+        response = self.post(self.staff, changed)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.remote_project.refresh_from_db()
+        self.assertEqual(self.remote_project.spend_profile, changed)
+
+    def test_the_profile_stays_once_a_period_has_ended(self, now):
+        self.at(now)
+        self.assertEqual(self.post(self.staff, PROFILE).status_code, 200)
+        self.at(now, TODAY)
+        response = self.post(self.staff, [])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("cannot be removed", str(response.data))
 
     def test_the_same_profile_again_changes_nothing(self, now):
         self.at(now)
