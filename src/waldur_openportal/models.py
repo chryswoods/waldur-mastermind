@@ -909,6 +909,30 @@ class HistoricalRemoteAllocation(UsageMixin):
         return self.__str__()
 
 
+def usage_unit_name(units) -> str:
+    """The canonical name of an allocation's units as a usage unit (e.g.
+    "node hours" -> "NHR", "gbp" -> "GBP"), or "NHR" if they are not a
+    well-known unit."""
+    try:
+        return openportal.UsageUnit(str(units)).name
+    except Exception:
+        return "NHR"
+
+
+def declare_time_unit(report, time_unit: str = "NHR") -> None:
+    """Declare a report from before units (openportal 0.95) to be in
+    ``time_unit``. Every such report was time, 3600 counts per hour, so a
+    unit that is not time (a currency award) falls back to NHR. A report with
+    a unit is left alone."""
+    if report.unit is not None:
+        return
+    name = usage_unit_name(time_unit)
+    try:
+        report.set_time_unit(name)
+    except ValueError:
+        report.set_time_unit("NHR")
+
+
 class CachedProjectUsageReport(models.Model):
     """
     Caches the full ProjectUsageReport JSON from OpenPortal for a given
@@ -933,8 +957,16 @@ class CachedProjectUsageReport(models.Model):
         unique_together = [("year", "month", "project_identifier", "resource")]
         indexes = [models.Index(fields=["project_identifier"])]
 
-    def get_report(self) -> "openportal.ProjectUsageReport":
-        return openportal.ProjectUsageReport.from_json(json.dumps(self.report))
+    def get_report(self, time_unit: str = "NHR") -> "openportal.ProjectUsageReport":
+        """The cached report. One cached before usage reports carried a unit
+        (openportal 0.95) is declared ``time_unit`` as it is read: every
+        report from before units was time, 3600 counts per hour. On a site
+        that is NHR (the cluster's node-seconds); on an awarding portal it is
+        the award's unit, which the site scaled to. Not written back."""
+        report = openportal.ProjectUsageReport.from_json(json.dumps(self.report))
+        if report.unit is None:
+            declare_time_unit(report, time_unit)
+        return report
 
     def __str__(self):
         status = "complete" if self.is_complete else "incomplete"
@@ -3406,6 +3438,17 @@ class RemoteProject(core_models.UuidMixin, models.Model):
 
     def get_last_confirmed_details(self) -> "openportal.AwardDetails | None":
         return self._load_award_details(self.last_confirmed_details)
+
+    def usage_unit(self) -> str:
+        """The unit the award's usage is reported in: its allocation's units
+        (the site scales its usage to them), or NHR if it has none."""
+        try:
+            allocation = self.award_details().allocation
+        except Exception:
+            allocation = None
+        if allocation is None:
+            return "NHR"
+        return usage_unit_name(allocation.units)
 
     def award_details(self) -> "openportal.AwardDetails":
         """

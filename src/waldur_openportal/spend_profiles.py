@@ -502,8 +502,21 @@ def _local_group(allocation, report) -> str:
     return group or str(report.project).split(".")[0]
 
 
+def _forfeit_usage(report, forfeit):
+    """The forfeit as a Usage in the report's unit: node-hours for a
+    cluster's NHR report, or the award's amount for a report in its unit."""
+    unit = report.unit
+    if unit.name == "NHR":
+        return unit.usage(float(forfeit.hours))
+    if unit.name == models.usage_unit_name(forfeit.units):
+        return unit.usage(float(forfeit.amount))
+    raise ValueError(
+        f"cannot add a forfeit in {forfeit.units} to a report in {unit.name}"
+    )
+
+
 def _add_forfeit_day(report, forfeit, group):
-    usage = openportal.Usage.from_hours(float(forfeit.hours))
+    usage = _forfeit_usage(report, forfeit)
     day = openportal.DailyProjectUsageReport()
     day.add_usage(FORFEIT_USER, usage)
     day.add_component_usage(FORFEIT_COMPONENT, FORFEIT_USER, usage)
@@ -543,6 +556,7 @@ def add_forfeits(allocation, report, month, resource: str):
     if AWARD_SPEND_MINIMUMS not in SUPPORTED_FEATURES:
         return report
 
+    models.declare_time_unit(report, "NHR")
     start, end = month.start_date, month.end_date
     identifier = str(report.project)
     group = None
@@ -552,7 +566,11 @@ def add_forfeits(allocation, report, month, resource: str):
         if forfeit.hours > 0:
             if group is None:
                 group = _local_group(allocation, report)
-            _add_forfeit_day(report, forfeit, group)
+            try:
+                _add_forfeit_day(report, forfeit, group)
+            except Exception as e:
+                logger.error("Could not add %s to its report: %s", forfeit, e)
+                _hold_incomplete(report, forfeit.date)
 
     charged = models.AwardForfeit.objects.filter(
         project_identifier=identifier, date__gte=start, date__lte=end

@@ -1153,12 +1153,16 @@ def get_remote_project_usage_report(
             )
             if overlap is None:
                 continue
-            piece = cached_report.get_report().filter(openportal.DateRange(*overlap))
+            piece = cached_report.get_report(remote_project.usage_unit()).filter(
+                openportal.DateRange(*overlap)
+            )
             piece.remap_project(common)
             pieces.append(piece)
 
     if not pieces:
-        return openportal.ProjectUsageReport(common)
+        return openportal.ProjectUsageReport(
+            common, unit=openportal.UsageUnit(remote_project.usage_unit())
+        )
     if len(pieces) == 1:
         return pieces[0]
     return openportal.ProjectUsageReport.combine(pieces)

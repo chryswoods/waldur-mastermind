@@ -51,10 +51,12 @@ def _month(year, month):
     return openportal.DateRange(start, end)
 
 
-def _cluster_report(month, complete=True):
+def _cluster_report(month, complete=True, unit="NHR"):
     """The month's report as the cluster sends it: alice, 1 NHR a day from
-    USAGE_FROM."""
-    report = openportal.ProjectUsageReport(openportal.ProjectIdentifier(IDENTIFIER))
+    USAGE_FROM. unit=None gives one from an agent before usage units."""
+    report = openportal.ProjectUsageReport(
+        openportal.ProjectIdentifier(IDENTIFIER), unit=openportal.UsageUnit("NHR")
+    )
     day = month.start_date
     while day <= month.end_date:
         daily = openportal.DailyProjectUsageReport()
@@ -64,6 +66,10 @@ def _cluster_report(month, complete=True):
             daily.set_complete()
         report.add_report(day, daily)
         day += datetime.timedelta(days=1)
+    if unit is None:
+        data = json.loads(report.to_json())
+        data.pop("usage_unit", None)
+        report = openportal.ProjectUsageReport.from_json(json.dumps(data))
     return report
 
 
@@ -178,6 +184,17 @@ class ForfeitTest(TestCase):
         self.assertEqual(models.AwardForfeit.objects.count(), 1)
         self.assertFalse(report.get_report(datetime.date(2027, 6, 30)).is_complete)
         self.assertFalse(report.is_complete)
+
+    def test_a_report_from_before_units_is_taken_as_node_hours(self):
+        self.sync_april_to(6)
+        june = _month(2027, 6)
+
+        report = self.sync(
+            june, datetime.date(2027, 7, 1), report=_cluster_report(june, unit=None)
+        )
+
+        self.assertEqual(report.unit.name, "NHR")
+        self.assertAlmostEqual(report.total_usage.hours, 30 + 109)
 
     def test_every_later_report_of_the_month_carries_the_same_forfeit(self):
         self.sync_april_to(6)

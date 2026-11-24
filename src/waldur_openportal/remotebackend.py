@@ -804,6 +804,33 @@ class RemoteOpenPortalBackend(UsageReconciliationMixin, ServiceBackend):
         logger.debug(f"OpenPortal limits for project {project}: {limit}")
         return limit
 
+    @staticmethod
+    def _report_in_award_unit(allocation, report):
+        """The site's report, checked to be in the award's unit, or None.
+
+        A report from before units (openportal 0.95) is declared the award's
+        unit, which is what the site scaled it to. A report in another unit
+        cannot be billed against the award - its figures would mean something
+        else - so it is logged and refused."""
+        remote_project = getattr(allocation, "remote_project", None)
+        unit = remote_project.usage_unit() if remote_project is not None else "NHR"
+        models.declare_time_unit(report, unit)
+        if report.unit.name != unit:
+            logger.error(
+                f"Usage report for {allocation} is in {report.unit.name}, but the "
+                f"award is in {unit} - not counting it"
+            )
+            return None
+        return report
+
+    @staticmethod
+    def _report_amount(report) -> float:
+        """The report's total, as an amount of its unit (node-hours for NHR)."""
+        total = report.total()
+        if total is None:
+            return float(report.total_usage.hours)
+        return float(total.value)
+
     def _update_usage_from_report(
         self,
         allocation,
@@ -826,7 +853,7 @@ class RemoteOpenPortalBackend(UsageReconciliationMixin, ServiceBackend):
         if report.is_complete:
             logger.debug(f"Forced update as usage report for {allocation} is complete")
         else:
-            delta = float(allocation.node_usage) - float(report.total_usage.hours)
+            delta = float(allocation.node_usage) - self._report_amount(report)
 
             # usage is a decimal with 2 d.p. - only changes of more than 0.01 are significant
             if abs(delta) < 0.015:
@@ -841,7 +868,7 @@ class RemoteOpenPortalBackend(UsageReconciliationMixin, ServiceBackend):
 
         if update_current:
             # only update this month's usage if we are updating the current month
-            allocation.node_usage = report.total_usage.hours
+            allocation.node_usage = self._report_amount(report)
             allocation.save(update_fields=["node_usage"])
 
     def sync_usage(self, allocation: models.RemoteAllocation):
@@ -905,15 +932,19 @@ class RemoteOpenPortalBackend(UsageReconciliationMixin, ServiceBackend):
             if is_report_complete:
                 logger.debug(f"Skipping {month} as report is complete")
             else:
-                report = self.client.get_usage_report(project, month)
+                report = self._report_in_award_unit(
+                    allocation, self.client.get_usage_report(project, month)
+                )
                 got_usage_report = True
+                if report is None:
+                    continue
 
                 if report.total_usage.seconds > 0:
                     self._update_usage_from_report(
                         allocation, report, update_current=is_current_month
                     )
 
-                historical_report.node_usage = report.total_usage.hours
+                historical_report.node_usage = self._report_amount(report)
                 historical_report.is_complete = (
                     not is_current_month
                 ) and report.is_complete

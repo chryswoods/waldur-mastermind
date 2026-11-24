@@ -771,6 +771,9 @@ class OpenPortalBackend(UsageReconciliationMixin, ServiceBackend):
                 continue
 
             report = self.client.get_usage_report(project, month)
+            # A cluster agent from before usage units (openportal 0.95) sends
+            # none; its figures were node-seconds, as op-slurm now says.
+            models.declare_time_unit(report, "NHR")
 
             # A spend profile's forfeit is usage like any other: it is added
             # here, to the report as it arrives, and counted from then on.

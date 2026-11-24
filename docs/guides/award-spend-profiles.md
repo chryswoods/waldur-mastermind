@@ -92,6 +92,23 @@ report is complete: `UsageReconciliationMixin` corrects the month's
 `ComponentUsage` to the report and the project's credit by the change. The
 site and the awarding side share it.
 
+## Usage units
+
+Since openportal 0.95 a usage report says which unit its figures are in
+(`usage_unit`). Waldur relies on it like this:
+
+- **Reports from before units** were all time, 3600 counts per hour. One read
+  from the cache (`CachedProjectUsageReport.get_report`) without a unit is
+  declared `NHR` on a site and the award's unit on an awarding portal. It is
+  not written back.
+- **On a site,** a cluster report without a unit (an older agent) is declared
+  `NHR`. The report sent to the awarding portal is built in `NHR` and
+  converted to the award's unit with the project template's factor, so it is
+  labelled as what it is. Forfeits are added in the report's unit.
+- **On an awarding portal,** a site's report is billed as an amount of its
+  unit, which must be the award's. One in another unit is logged and not
+  counted. Currency units are read as amounts, not hours.
+
 ## Features
 
 A site answers `is_feature_supported` / `get_supported_features` from
