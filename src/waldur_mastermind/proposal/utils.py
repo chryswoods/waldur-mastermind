@@ -670,16 +670,15 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
         offering_seen[offering] += 1
         index = offering_seen[offering] if offering_counts[offering] > 1 else None
         with transaction.atomic():
-            # The order carries the resource's name in its attributes, as an
-            # order placed through the API does: a backend that creates its
-            # resource from the order (OpenPortal's, for one) reads it there,
-            # and without it the resource was left Errored. A name given in
-            # the award is kept, for the resource too.
+            name = _allocated_resource_name(project.name, offering.name, index)
+            # An order needs a name in its attributes, as one placed through
+            # the API has: a backend that creates its resource from the order
+            # (OpenPortal's, for one) reads it there, and without it the
+            # resource was left Errored. A name given in the request is kept;
+            # otherwise the order takes the resource's.
             attributes = dict(awarded.attributes or {})
-            name = (attributes.get("name") or "").strip() or _allocated_resource_name(
-                project.name, offering.name, index
-            )
-            attributes["name"] = name
+            if not (attributes.get("name") or "").strip():
+                attributes["name"] = name
             attrs = dict(
                 project=project,
                 offering=offering,

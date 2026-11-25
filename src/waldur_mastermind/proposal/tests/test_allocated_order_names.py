@@ -2,9 +2,9 @@
 
 A backend that creates its resource from the order reads the name from the
 order's attributes, as for an order placed through the API. Award orders had
-none, so OpenPortal allocations were left Errored. The name is the one the
-award gives the resource (see test_allocated_resource_names), or one given
-in the award itself.
+none, so OpenPortal allocations were left Errored. A name given in the
+request is kept; otherwise the order takes the name the award gives the
+resource (see test_allocated_resource_names).
 """
 
 from rest_framework import test
@@ -70,7 +70,9 @@ class AllocatedOrderNameTest(test.APITestCase):
             orders[second.uuid].attributes["name"],
         )
 
-    def test_a_name_given_in_the_award_is_kept(self):
+    def test_a_name_given_in_the_request_is_kept(self):
+        """In the order's attributes, as upstream always kept it; the
+        resource is still named after its project and offering."""
         requested = self.request(
             marketplace_factories.OfferingFactory(name="HPC"),
             attributes={"name": "Our cluster time"},
@@ -79,7 +81,7 @@ class AllocatedOrderNameTest(test.APITestCase):
         order = self.allocate()[requested.uuid]
 
         self.assertEqual(order.attributes["name"], "Our cluster time")
-        self.assertEqual(order.resource.name, "Our cluster time")
+        self.assertEqual(order.resource.name, f"{self.proposal.project.name} - HPC")
 
     def test_an_openportal_allocation_is_created_with_the_name(self):
         """The OpenPortal processor posts the order's name to create its
